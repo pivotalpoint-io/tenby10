@@ -17,6 +17,9 @@ This client is **source-available** under the PivotalPoint Source-Available Lice
 (PPSAL-1.0 — see [LICENSE](LICENSE)) — the full client that runs on your machine is readable and
 auditable; the cloud portal is not part of this repository.
 
+> **Found a vulnerability while auditing?** Please report it **privately** — see
+> [SECURITY.md](SECURITY.md). Don't open a public issue for security problems.
+
 ---
 
 ## TL;DR verdict table

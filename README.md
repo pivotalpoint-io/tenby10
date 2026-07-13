@@ -149,6 +149,12 @@ The repository utilizes GitHub Actions to ensure code quality. On every push and
 
 ---
 
+## 🔐 Security
+
+Found a vulnerability? Please report it **privately** — do not open a public issue. See [SECURITY.md](SECURITY.md) for the reporting process (GitHub private vulnerability reporting or `security@pivotalpoint.io`) and scope.
+
+---
+
 ## 🤝 Contributing
 
 Contributions are welcome! Please read our [CONTRIBUTING.md](CONTRIBUTING.md) to learn about our branch strategy, commit message rules, and software development lifecycle (SDLC) flow.
