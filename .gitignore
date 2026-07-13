@@ -1,0 +1,22 @@
+# Cargo target directory
+**/target/
+**/*.rs.bk
+
+# Icons staging area (populated by scripts/dev.sh or scripts/prod.sh)
+desktop/src-tauri/icons/
+
+# Local tenby10 SQLite databases and screenshots (if placed locally)
+tenby10.db
+screenshots/
+
+# OS metadata
+.DS_Store
+
+# Specs, Decisions, and Reviews (local only, do not commit)
+decisions/
+specs/
+docs/
+ceo_assessment.json
+cpo_review.json
+investor_memo.json
+marketing_review.json

@@ -1,0 +1,6 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "tenby10-dev",
+  "identifier": "io.pivotalpoint.tenby10.dev",
+  "mainBinaryName": "tenby10-dev"
+}

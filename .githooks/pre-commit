@@ -1,0 +1,30 @@
+#!/bin/bash
+set -e
+
+echo "=== Running Pre-Commit Hooks ==="
+
+# 1. Daemon Checks
+echo "Checking daemon formatting..."
+cd daemon
+cargo fmt -- --check
+
+echo "Running daemon clippy..."
+cargo clippy -- -D warnings
+
+echo "Running daemon tests..."
+cargo test
+
+# 2. Desktop Tauri Checks
+echo "Checking desktop formatting..."
+cd ../desktop/src-tauri
+cargo fmt -- --check
+
+echo "Running desktop clippy..."
+cargo clippy -- -D warnings
+
+echo "Running desktop tests..."
+cargo test
+
+cd ../..
+echo "=== All checks passed! ==="
+

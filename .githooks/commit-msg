@@ -1,0 +1,22 @@
+#!/bin/bash
+# Enforce Conventional Commits locally so that PR titles (which derive from commit
+# subjects) pass the "PR Lint" CI gate in .github/workflows/pr-lint.yml.
+# Mirrors CONTRIBUTING.md §2 and the pr-lint title regex exactly.
+set -e
+
+SUBJECT=$(head -n1 "$1")
+
+# Allow git-generated subjects that are not authored feature commits.
+if [[ "$SUBJECT" =~ ^(Merge|Revert|fixup!|squash!|amend!) ]]; then
+  exit 0
+fi
+
+REGEX="^(feat|fix|chore|bug|refactor|test|docs|style|ci|perf)(\(.+\))?: .+$"
+if [[ ! "$SUBJECT" =~ $REGEX ]]; then
+  echo "ERROR: commit subject does not follow Conventional Commits."
+  echo "  Subject:  $SUBJECT"
+  echo "  Required: <type>(<optional-scope>): <description>"
+  echo "  Types:    feat, fix, bug, chore, refactor, test, docs, style, ci, perf"
+  echo "  Example:  feat(ledger): sign slot summaries"
+  exit 1
+fi

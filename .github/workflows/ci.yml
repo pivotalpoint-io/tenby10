@@ -1,0 +1,141 @@
+name: CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+env:
+  CARGO_TERM_COLOR: always
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  daemon-ci:
+    name: Daemon CI
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: daemon
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Stage assets
+      run: |
+        cp desktop/src-tauri/icons_prod/128x128.png daemon/src/logo.png
+        cp desktop/src-tauri/icons_prod/32x32.png daemon/src/favicon.png
+      working-directory: .
+
+    - name: Cache dependencies
+      uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: daemon
+
+    - name: Check Formatting
+      run: cargo fmt -- --check
+
+    - name: Run Clippy
+      run: cargo clippy -- -D warnings
+
+    - name: Run Tests
+      run: cargo test
+
+  daemon-ci-windows:
+    name: Daemon CI (Windows)
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: daemon
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Stage assets
+      shell: bash
+      run: |
+        cp desktop/src-tauri/icons_prod/128x128.png daemon/src/logo.png
+        cp desktop/src-tauri/icons_prod/32x32.png daemon/src/favicon.png
+      working-directory: .
+
+    - name: Cache dependencies
+      uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: daemon
+
+    - name: Check Formatting
+      run: cargo fmt -- --check
+
+    - name: Run Clippy
+      run: cargo clippy -- -D warnings
+
+    - name: Run Tests
+      run: cargo test
+
+  desktop-ci:
+    name: Desktop CI
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: desktop/src-tauri
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Stage assets
+      run: |
+        mkdir -p desktop/src-tauri/icons
+        cp -r desktop/src-tauri/icons_prod/* desktop/src-tauri/icons/
+        cp desktop/src-tauri/icons_prod/32x32.png desktop/src/favicon.png
+        cp desktop/src-tauri/icons_prod/128x128.png daemon/src/logo.png
+        cp desktop/src-tauri/icons_prod/32x32.png daemon/src/favicon.png
+      working-directory: .
+
+    - name: Cache dependencies
+      uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: desktop/src-tauri
+
+    - name: Check Formatting
+      run: cargo fmt -- --check
+
+    - name: Run Clippy
+      run: cargo clippy -- -D warnings
+
+    - name: Run Tests
+      run: cargo test
+
+  desktop-ci-windows:
+    name: Desktop CI (Windows)
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: desktop/src-tauri
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Stage assets
+      shell: bash
+      run: |
+        mkdir -p desktop/src-tauri/icons
+        cp -r desktop/src-tauri/icons_prod/* desktop/src-tauri/icons/
+        cp desktop/src-tauri/icons_prod/32x32.png desktop/src/favicon.png
+        cp desktop/src-tauri/icons_prod/128x128.png daemon/src/logo.png
+        cp desktop/src-tauri/icons_prod/32x32.png daemon/src/favicon.png
+      working-directory: .
+
+    - name: Cache dependencies
+      uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: desktop/src-tauri
+
+    - name: Check Formatting
+      run: cargo fmt -- --check
+
+    - name: Run Clippy
+      run: cargo clippy -- -D warnings
+
+    - name: Run Tests
+      run: cargo test
+

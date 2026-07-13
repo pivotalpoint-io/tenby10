@@ -1,0 +1,296 @@
+name: Notarization Diagnostic
+
+# Standalone, manual-only diagnostic that proves whether our Apple App Store Connect
+# notarization credentials actually work, independent of the release pipeline.
+#
+# It does NOT touch release.yml. It signs a tiny hardened-runtime artifact and submits
+# it to Apple's notary service directly via `xcrun notarytool`, then prints the real
+# result (and, on failure, the full notarytool log JSON with the exact rejection reason).
+#
+# Safety: secret VALUES are never printed. GitHub masks registered secrets in logs, and
+# we additionally disable `set -x` around the few lines that expand secret-derived data
+# so nothing leaks through the xtrace even if masking is imperfect (e.g. multiline secrets).
+
+on:
+  workflow_dispatch:
+    inputs:
+      real_build:
+        description: "Build & notarize a real tauri .app instead of a minimal dummy bundle (much slower)."
+        type: boolean
+        default: false
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  notarize-check:
+    name: Notarize a signed artifact and report
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ---- Optional heavy path: only when real_build=true -------------------------------
+      - name: Setup Node.js
+        if: ${{ inputs.real_build }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: 'npm'
+          cache-dependency-path: desktop/package-lock.json
+
+      - name: Install Rust toolchain
+        if: ${{ inputs.real_build }}
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install desktop dependencies and stage assets
+        if: ${{ inputs.real_build }}
+        run: |
+          set -euxo pipefail
+          npm ci --prefix desktop
+          mkdir -p desktop/src-tauri/icons
+          cp -r desktop/src-tauri/icons_prod/* desktop/src-tauri/icons/
+          cp desktop/src-tauri/icons_prod/32x32.png desktop/src/favicon.png
+          cp desktop/src-tauri/icons_prod/128x128.png daemon/src/logo.png
+          cp desktop/src-tauri/icons_prod/32x32.png daemon/src/favicon.png
+
+      # ---- Diagnostics -------------------------------------------------------------------
+      - name: Report secret presence (never values)
+        env:
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_CONTENT: ${{ secrets.APPLE_API_KEY_CONTENT }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          set -euxo pipefail
+          echo "== Apple credential presence (booleans + lengths only, never values) =="
+          # Disable xtrace while touching secret-derived data so the trace cannot echo it.
+          set +x
+          for name in APPLE_API_ISSUER APPLE_API_KEY APPLE_API_KEY_CONTENT \
+                      APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY; do
+            val="${!name:-}"
+            if [ -n "$val" ]; then
+              printf '  %-28s present: yes   length: %s\n' "$name" "${#val}"
+            else
+              printf '  %-28s present: NO\n' "$name"
+            fi
+          done
+          unset val
+          set -x
+          echo "== Toolchain availability =="
+          xcrun --find notarytool
+          command -v codesign
+          clang --version | head -1
+
+      - name: Prepare App Store Connect API key (AuthKey.p8)
+        env:
+          APPLE_API_KEY_CONTENT: ${{ secrets.APPLE_API_KEY_CONTENT }}
+        run: |
+          set -euxo pipefail
+          AUTH_KEY_PATH="$RUNNER_TEMP/AuthKey.p8"
+          B64_CANDIDATE="$RUNNER_TEMP/authkey_from_b64.p8"
+          RAW_CANDIDATE="$RUNNER_TEMP/authkey_raw.p8"
+
+          # Write both interpretations of APPLE_API_KEY_CONTENT without tracing its contents.
+          # The task requires handling both a base64-encoded .p8 and a raw PEM .p8.
+          set +x
+          printf '%s' "$APPLE_API_KEY_CONTENT" | base64 --decode > "$B64_CANDIDATE" 2> "$RUNNER_TEMP/b64_decode.err" || true
+          printf '%s' "$APPLE_API_KEY_CONTENT" > "$RAW_CANDIDATE"
+          set -x
+
+          if grep -q "BEGIN PRIVATE KEY" "$B64_CANDIDATE"; then
+            cp "$B64_CANDIDATE" "$AUTH_KEY_PATH"
+            echo "AuthKey.p8 source: base64-decoded APPLE_API_KEY_CONTENT"
+          elif grep -q "BEGIN PRIVATE KEY" "$RAW_CANDIDATE"; then
+            cp "$RAW_CANDIDATE" "$AUTH_KEY_PATH"
+            echo "AuthKey.p8 source: raw (already-PEM) APPLE_API_KEY_CONTENT"
+          else
+            echo "::error::APPLE_API_KEY_CONTENT is neither base64-encoded PEM nor raw PEM (no 'BEGIN PRIVATE KEY' found). base64 decode stderr:"
+            cat "$RUNNER_TEMP/b64_decode.err" || true
+            exit 1
+          fi
+
+          chmod 600 "$AUTH_KEY_PATH"
+          # Structural PEM assertions (header + footer + non-trivial size); contents never printed.
+          grep -q -- "-----BEGIN PRIVATE KEY-----" "$AUTH_KEY_PATH"
+          grep -q -- "-----END PRIVATE KEY-----" "$AUTH_KEY_PATH"
+          KEY_BYTES=$(wc -c < "$AUTH_KEY_PATH" | tr -d ' ')
+          test "$KEY_BYTES" -gt 100
+          echo "AuthKey.p8 OK: ${KEY_BYTES} bytes, PEM header/footer present -> $AUTH_KEY_PATH"
+          echo "AUTH_KEY_PATH=$AUTH_KEY_PATH" >> "$GITHUB_ENV"
+
+      - name: Import signing certificate into a temporary keychain
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euxo pipefail
+          KEYCHAIN_PATH="$RUNNER_TEMP/notarize-check.keychain-db"
+          KEYCHAIN_PASSWORD="notarize-check-ephemeral"
+          CERT_PATH="$RUNNER_TEMP/certificate.p12"
+
+          # Decode the base64 .p12 without tracing its contents.
+          set +x
+          printf '%s' "$APPLE_CERTIFICATE" | base64 --decode > "$CERT_PATH"
+          set -x
+          CERT_BYTES=$(wc -c < "$CERT_PATH" | tr -d ' ')
+          test "$CERT_BYTES" -gt 100
+          echo "Decoded certificate.p12: ${CERT_BYTES} bytes"
+
+          # Fresh, ephemeral keychain dedicated to this run.
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          # Import cert+key; -A lets codesign use it within this ephemeral keychain.
+          set +x
+          security import "$CERT_PATH" -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          set -x
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH" > "$RUNNER_TEMP/set-partition.out"
+
+          # Keep the ephemeral keychain searchable alongside the existing (login/system) ones.
+          security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | tr -d '"')
+
+          echo "== Code-signing identities visible after import =="
+          security find-identity -v -p codesigning "$KEYCHAIN_PATH"
+
+          rm -f "$CERT_PATH"
+          echo "KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
+          echo "KEYCHAIN_PASSWORD=$KEYCHAIN_PASSWORD" >> "$GITHUB_ENV"
+
+      - name: Build a real tauri app (real_build only)
+        if: ${{ inputs.real_build }}
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          set -euxo pipefail
+          # Signing identity is picked up from the ephemeral keychain imported above.
+          # No APPLE_API_KEY_PATH is set, so tauri signs but skips its own notarization
+          # (exactly the release.yml behaviour) -- we notarize the result manually below.
+          npm --prefix desktop run tauri build -- --verbose
+
+      - name: Assemble a signed, hardened-runtime artifact
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          REAL_BUILD: ${{ inputs.real_build }}
+        run: |
+          set -euxo pipefail
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          WORK="$RUNNER_TEMP/notarize-work"
+          rm -rf "$WORK"
+          mkdir -p "$WORK"
+
+          if [ "${REAL_BUILD:-false}" = "true" ]; then
+            echo "== Using real tauri .app =="
+            APP_PATH=$(find desktop/src-tauri/target -type d -name '*.app' -path '*bundle/macos*' | head -1)
+            test -n "$APP_PATH"
+            echo "Real app bundle: $APP_PATH"
+            # Re-sign deeply to guarantee hardened runtime + secure timestamp on every Mach-O.
+            set +x
+            codesign --force --options runtime --timestamp --deep \
+              --sign "$APPLE_SIGNING_IDENTITY" "$APP_PATH"
+            set -x
+          else
+            echo "== Building a minimal dummy .app with a real Mach-O executable =="
+            APP_PATH="$WORK/NotarizeCheck.app"
+            mkdir -p "$APP_PATH/Contents/MacOS"
+            # Hardened runtime can only apply to a real Mach-O, so compile a trivial one.
+            printf 'int main(void){return 0;}\n' > "$WORK/main.c"
+            clang -o "$APP_PATH/Contents/MacOS/notarize-check" "$WORK/main.c"
+            file "$APP_PATH/Contents/MacOS/notarize-check"
+            # Info.plist via printf (no leading whitespace before the XML declaration).
+            printf '%s\n' \
+              '<?xml version="1.0" encoding="UTF-8"?>' \
+              '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
+              '<plist version="1.0">' \
+              '<dict>' \
+              '  <key>CFBundleName</key><string>NotarizeCheck</string>' \
+              '  <key>CFBundleDisplayName</key><string>NotarizeCheck</string>' \
+              '  <key>CFBundleIdentifier</key><string>io.pivotalpoint.tenby10.notarizecheck</string>' \
+              '  <key>CFBundleVersion</key><string>1.0</string>' \
+              '  <key>CFBundleShortVersionString</key><string>1.0</string>' \
+              '  <key>CFBundleExecutable</key><string>notarize-check</string>' \
+              '  <key>CFBundlePackageType</key><string>APPL</string>' \
+              '  <key>LSMinimumSystemVersion</key><string>10.13</string>' \
+              '</dict>' \
+              '</plist>' > "$APP_PATH/Contents/Info.plist"
+            # Sign inner executable then the bundle, with hardened runtime + secure timestamp.
+            set +x
+            codesign --force --options runtime --timestamp \
+              --sign "$APPLE_SIGNING_IDENTITY" "$APP_PATH/Contents/MacOS/notarize-check"
+            codesign --force --options runtime --timestamp \
+              --sign "$APPLE_SIGNING_IDENTITY" "$APP_PATH"
+            set -x
+          fi
+
+          echo "== Verifying signature and hardened-runtime flag =="
+          codesign --verify --strict --verbose=2 "$APP_PATH"
+          codesign --display --verbose=4 "$APP_PATH" 2>&1 | grep -Ei 'Authority|TeamIdentifier|flags|Timestamp' || true
+
+          ZIP_PATH="$RUNNER_TEMP/notarize-check.zip"
+          /usr/bin/ditto -c -k --keepParent "$APP_PATH" "$ZIP_PATH"
+          ls -la "$ZIP_PATH"
+          echo "ZIP_PATH=$ZIP_PATH" >> "$GITHUB_ENV"
+
+      - name: Submit to Apple notary service and report
+        env:
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          set -euxo pipefail
+          SUBMIT_LOG="$RUNNER_TEMP/notary-submit.log"
+          LOG_JSON="$RUNNER_TEMP/notary-log.json"
+
+          echo "== Submitting $ZIP_PATH to notarytool (this waits for Apple to finish) =="
+          # set +e so a non-zero notarytool exit does not abort before we fetch the log.
+          # set +x so --key-id / --issuer are not traced (they are masked anyway).
+          set +e
+          set +x
+          xcrun notarytool submit "$ZIP_PATH" \
+            --key "$AUTH_KEY_PATH" \
+            --key-id "$APPLE_API_KEY" \
+            --issuer "$APPLE_API_ISSUER" \
+            --wait --verbose 2>&1 | tee "$SUBMIT_LOG"
+          SUBMIT_EXIT=${PIPESTATUS[0]}
+          set -x
+          set -e
+
+          SUBMISSION_ID=$(grep -Eio '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' "$SUBMIT_LOG" | head -1 || true)
+          FINAL_STATUS=$(grep -Eo 'status: [A-Za-z ]+' "$SUBMIT_LOG" | tail -1 | sed 's/^status: //' | xargs || true)
+          echo "notarytool submit exit code: $SUBMIT_EXIT"
+          echo "submission id: ${SUBMISSION_ID:-<none>}"
+          echo "final status:  ${FINAL_STATUS:-<unknown>}"
+
+          if [ -n "$SUBMISSION_ID" ]; then
+            echo "== Full notarytool log JSON (authoritative rejection reason, if any) =="
+            set +x
+            xcrun notarytool log "$SUBMISSION_ID" \
+              --key "$AUTH_KEY_PATH" \
+              --key-id "$APPLE_API_KEY" \
+              --issuer "$APPLE_API_ISSUER" 2>&1 | tee "$LOG_JSON" || true
+            set -x
+          else
+            echo "No submission id was created -- notarytool failed before submission."
+            echo "Likely causes: invalid key-id, invalid issuer, undecodable AuthKey.p8, or the team is not registered."
+          fi
+
+          {
+            echo "## Notarization diagnostic result"
+            echo ""
+            echo "- submission id: \`${SUBMISSION_ID:-<none>}\`"
+            echo "- notarytool exit code: \`$SUBMIT_EXIT\`"
+            echo "- final status: \`${FINAL_STATUS:-<unknown>}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$FINAL_STATUS" = "Accepted" ] && [ "$SUBMIT_EXIT" -eq 0 ]; then
+            echo "RESULT: PASS -- credentials are valid and the artifact was notarized (Accepted)."
+            echo "- **RESULT: PASS ✅**" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "RESULT: FAIL -- notarization did not reach 'Accepted'. See the notarytool log JSON above."
+            echo "- **RESULT: FAIL ❌** (see the job log for the full notarytool JSON)" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi

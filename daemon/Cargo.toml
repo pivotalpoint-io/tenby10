@@ -1,0 +1,31 @@
+[package]
+name = "daemon"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+rusqlite = { version = "0.40", features = ["bundled"] }
+rdev = { git = "https://github.com/fufesou/rdev" }
+chrono = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+axum = "0.8"
+tokio = { version = "1.37", features = ["full"] }
+tower-http = { version = "0.7", features = ["fs", "cors"] }
+reqwest = { version = "0.13", features = ["json", "blocking"] }
+ed25519-dalek = { version = "3.0", features = ["rand_core"] }
+rand = "0.9"
+base64 = "0.22.1"
+active-win-pos-rs = "0.11.0"
+keyring = { version = "3", features = ["apple-native", "windows-native"] }
+
+# Input-provenance (issue #87/#101). Platform-specific; versions match what rdev
+# already pulls into the lockfile.
+[target.'cfg(target_os = "macos")'.dependencies]
+core-graphics = "0.22"
+core-foundation = "0.9"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+winapi = { version = "0.3", features = ["winuser", "wingdi"] }

@@ -1,0 +1,42 @@
+name: PR Lint
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+jobs:
+  pr-lint:
+    name: PR Title and Body Lint
+    runs-on: ubuntu-latest
+    if: github.actor != 'dependabot[bot]'
+    steps:
+      - name: Check PR Title
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          REGEX="^(feat|fix|chore|bug|refactor|test|docs|style|ci|perf)(\(.+\))?: .+$"
+          if [[ ! "$PR_TITLE" =~ $REGEX ]]; then
+            echo "::error::PR title '$PR_TITLE' does not match the required format."
+            echo "Required prefix: feat, fix, bug, chore, refactor, test, docs, style, ci, perf (followed by optional scope and colon/space)."
+            echo "Example: 'feat: add user authentication' or 'fix(auth): handle null tokens'"
+            exit 1
+          fi
+          echo "PR Title matches convention!"
+
+      - name: Check PR Body Content
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          # 1. Enforce linking to an issue (e.g. closes #N, fixes #N)
+          if ! echo "$PR_BODY" | grep -qiE "(closes|fixes|resolves|closed|fixed|resolved)[[:space:]]+#[0-9]+"; then
+            echo "::error::PR body must link to a GitHub issue. Please include 'closes #N', 'fixes #N', or 'resolves #N'."
+            exit 1
+          fi
+          
+          # 2. Enforce structural section headers (e.g., Summary, Context, or Description)
+          if ! echo "$PR_BODY" | grep -qiE "(summary|context|description|changes|motivation)"; then
+            echo "::error::PR body must include a structural header (e.g., '## Summary', '## Context', or '## Description')."
+            exit 1
+          fi
+          
+          echo "PR Body meets all content requirements!"

@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html>
+<head>
+<style>
+  body { margin: 0; background: transparent; overflow: hidden; }
+  canvas { display: block; width: 1024px; height: 1024px; }
+</style>
+</head>
+<body>
+<canvas id="canvas" width="1024" height="1024"></canvas>
+<script>
+  const canvas = document.getElementById('canvas');
+  const ctx = canvas.getContext('2d');
+  const img = new Image();
+  img.src = 'icon.png';
+  img.onload = () => {
+    // Draw original icon
+    ctx.drawImage(img, 0, 0, 1024, 1024);
+    
+    // Draw Green Banner
+    ctx.save();
+    ctx.translate(1024, 0);
+    ctx.rotate(45 * Math.PI / 180);
+    ctx.fillStyle = '#00FF00'; // Neon Green
+    ctx.fillRect(-300, 100, 600, 100);
+    
+    // Draw DEV text
+    ctx.fillStyle = '#FFFFFF';
+    ctx.font = 'bold 60px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('DEV', 0, 170);
+    ctx.restore();
+    
+    // Signal completion
+    console.log('ICON_DONE');
+  };
+</script>
+</body>
+</html>

@@ -1,0 +1,166 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release Tag (e.g. v0.1.3-beta)'
+        required: true
+        default: 'v0.0.0-dev'
+
+env:
+  CARGO_TERM_COLOR: always
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  daemon-test:
+    name: Daemon Quality Check
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: daemon
+    steps:
+      - uses: actions/checkout@v4
+      - name: Stage assets
+        run: |
+          cp desktop/src-tauri/icons_prod/128x128.png daemon/src/logo.png
+          cp desktop/src-tauri/icons_prod/32x32.png daemon/src/favicon.png
+        working-directory: .
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: daemon
+      - name: Check Formatting
+        run: cargo fmt -- --check
+      - name: Run Clippy
+        run: cargo clippy -- -D warnings
+      - name: Run Tests
+        run: cargo test
+
+  desktop-test:
+    name: Desktop Quality Check
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: desktop/src-tauri
+    steps:
+      - uses: actions/checkout@v4
+      - name: Stage assets
+        run: |
+          mkdir -p desktop/src-tauri/icons
+          cp -r desktop/src-tauri/icons_prod/* desktop/src-tauri/icons/
+          cp desktop/src-tauri/icons_prod/32x32.png desktop/src/favicon.png
+          cp desktop/src-tauri/icons_prod/128x128.png daemon/src/logo.png
+          cp desktop/src-tauri/icons_prod/32x32.png daemon/src/favicon.png
+        working-directory: .
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop/src-tauri
+      - name: Check Formatting
+        run: cargo fmt -- --check
+      - name: Run Clippy
+        run: cargo clippy -- -D warnings
+      - name: Run Tests
+        run: cargo test
+
+  publish:
+    name: Build & Publish Release
+    needs: [daemon-test, desktop-test]
+    strategy:
+      matrix:
+        platform: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.platform }}
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: 'npm'
+          cache-dependency-path: desktop/package-lock.json
+
+      - name: Install Node dependencies
+        run: npm ci
+        working-directory: desktop
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            daemon
+            desktop/src-tauri
+
+      - name: Stage production assets
+        shell: bash
+        run: |
+          mkdir -p desktop/src-tauri/icons
+          cp -r desktop/src-tauri/icons_prod/* desktop/src-tauri/icons/
+          cp desktop/src-tauri/icons_prod/32x32.png desktop/src/favicon.png
+          cp desktop/src-tauri/icons_prod/128x128.png daemon/src/logo.png
+          cp desktop/src-tauri/icons_prod/32x32.png daemon/src/favicon.png
+
+      - name: Sync version from tag
+        shell: bash
+        run: |
+          REF="${{ github.event.inputs.tag || github.ref_name }}"
+          VERSION=${REF#v}
+          # Windows MSI builds require strictly numeric versions (no -dev or -beta suffixes allowed)
+          VERSION=${VERSION%%-*}
+          echo "Syncing project files to version $VERSION"
+          # Update tauri.conf.json
+          jq ".version = \"$VERSION\"" desktop/src-tauri/tauri.conf.json > tmp.json && mv tmp.json desktop/src-tauri/tauri.conf.json
+          # Update package.json
+          jq ".version = \"$VERSION\"" desktop/package.json > tmp.json && mv tmp.json desktop/package.json
+
+      # tauri-bundler notarizes only when APPLE_API_KEY_PATH points to the AuthKey .p8 on
+      # disk; it does not consume APPLE_API_KEY_CONTENT. Materialize the key and export the
+      # path so notarization actually runs. Validated by the Notarization Diagnostic workflow.
+      - name: Prepare App Store Connect API key for notarization
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          APPLE_API_KEY_CONTENT: ${{ secrets.APPLE_API_KEY_CONTENT }}
+        run: |
+          set -euo pipefail
+          KEY_PATH="$RUNNER_TEMP/AuthKey.p8"
+          # APPLE_API_KEY_CONTENT is the raw PEM .p8; also tolerate a base64-encoded value.
+          if printf '%s' "$APPLE_API_KEY_CONTENT" | grep -q 'BEGIN PRIVATE KEY'; then
+            printf '%s' "$APPLE_API_KEY_CONTENT" > "$KEY_PATH"
+          else
+            printf '%s' "$APPLE_API_KEY_CONTENT" | base64 --decode > "$KEY_PATH"
+          fi
+          chmod 600 "$KEY_PATH"
+          grep -q -- '-----BEGIN PRIVATE KEY-----' "$KEY_PATH"
+          echo "APPLE_API_KEY_PATH=$KEY_PATH" >> "$GITHUB_ENV"
+
+      - name: Build and Publish Tauri Desktop App
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_CONTENT: ${{ secrets.APPLE_API_KEY_CONTENT }}
+          APPLE_API_KEY_PATH: ${{ env.APPLE_API_KEY_PATH }}
+        with:
+          tagName: ${{ github.event.inputs.tag || github.ref_name }}
+          releaseName: 'tenby10 ${{ github.event.inputs.tag || github.ref_name }}'
+          releaseBody: 'Release version ${{ github.event.inputs.tag || github.ref_name }}'
+          releaseDraft: false
+          prerelease: false
+          projectPath: desktop
+          args: --verbose

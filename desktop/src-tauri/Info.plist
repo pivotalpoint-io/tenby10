@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Merged into the app bundle's Info.plist by Tauri. These usage-description
+         strings let macOS present a proper prompt for the TCC services tenby10 needs.
+         Without NSInputMonitoringUsageDescription the app cannot prompt for Input
+         Monitoring, which is the permission that gates keyboard/click/scroll capture. -->
+    <key>NSInputMonitoringUsageDescription</key>
+    <string>tenby10 captures keyboard, click and scroll activity to measure focused work time.</string>
+    <key>NSAppleEventsUsageDescription</key>
+    <string>tenby10 asks System Events for the active application and window title to attribute activity.</string>
+</dict>
+</plist>

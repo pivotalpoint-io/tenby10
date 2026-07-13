@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>tenby10 Agent Portal</title>
+  <link rel="stylesheet" href="styles.css" />
+  <link rel="icon" type="image/png" href="favicon.png" />
+  <script type="module" src="/main.js" defer></script>
+</head>
+
+<body>
+  <main class="container">
+    <!-- View 1: Main Dashboard/Metrics View -->
+    <div id="dashboard-view" class="view" style="display: flex;">
+      <header class="header">
+        <div class="header-logo">
+          <img src="favicon.png" alt="tenby10 icon" class="branded-icon" />
+          <span class="logo-text">tenby<span class="logo-accent">10</span></span>
+        </div>
+        <div class="header-actions">
+          <div id="status-badge" class="status-badge active">
+            <span class="status-dot"></span>
+            <span id="status-text">Active</span>
+          </div>
+          <button id="goto-settings-btn" class="icon-btn" title="Settings">⚙️</button>
+        </div>
+      </header>
+      
+      <!-- Permissions Warning Banner -->
+      <div id="permissions-alert-banner" class="alert-banner warning" style="display: none;">
+        <span class="alert-icon">⚠️</span>
+        <span class="alert-message">Permissions required: macOS is blocking activity tracking.</span>
+        <button id="fix-permissions-btn" class="btn btn-sm btn-outline">Fix Permissions</button>
+      </div>
+
+      <!-- Main Focus Card -->
+      <div class="focus-card">
+        <div style="display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 0.5rem 0 1.5rem 0;">
+          <span style="font-size: 0.7rem; text-transform: uppercase; letter-spacing: 2px; color: #6b7280; font-weight: 700; margin-bottom: 0.35rem;">Billable Today</span>
+          <div style="display: flex; align-items: baseline; gap: 0.4rem;">
+            <span id="metric-billable-time-main" style="font-size: 3rem; font-weight: 800; color: #10b981; line-height: 1;">0m</span>
+          </div>
+          <span id="metric-total-slots-sub" style="font-size: 0.85rem; opacity: 0.8; margin-top: 0.6rem; text-transform: uppercase; letter-spacing: 1px; color: #9ca3af; font-weight: 600;">0 Tracked Slots Today</span>
+        </div>
+        
+        <!-- Slot Timeline Vis -->
+        <div class="slot-timeline" id="slot-timeline-container">
+          <!-- JS will populate .slot-block items here -->
+        </div>
+
+        <button id="open-dashboard-btn" class="dashboard-link">View slot details in dashboard ↗</button>
+      </div>
+
+      <!-- Secondary Metrics Grid -->
+      <div class="metrics-grid">
+        <div class="metric-item">
+          <span class="metric-icon">🎯</span>
+          <div class="metric-info">
+            <span class="metric-label">Avg Focus</span>
+            <span id="metric-focus-score" class="metric-value">0%</span>
+          </div>
+        </div>
+        <div class="metric-item">
+          <span class="metric-icon">⏱️</span>
+          <div class="metric-info">
+            <span class="metric-label">Active Time</span>
+            <span id="metric-active-time" class="metric-value">0m</span>
+          </div>
+        </div>
+        <div class="metric-item">
+          <span class="metric-icon">⚡</span>
+          <div class="metric-info">
+            <span class="metric-label">Total Inputs</span>
+            <span id="metric-total-inputs" class="metric-value">0</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Controls -->
+      <div class="controls-section">
+        <button id="toggle-tracking-btn" class="btn btn-primary">
+          <span id="toggle-btn-icon" class="btn-icon">⏸</span> <span id="toggle-btn-text">Pause Tracking</span>
+        </button>
+      </div>
+    </div>
+
+    <!-- View 2: Settings/Enrollment View -->
+    <div id="settings-view" class="view" style="display: none;">
+      <header class="header">
+        <div class="header-logo">
+          <button id="back-to-dashboard-btn" class="icon-btn back-btn" title="Back to Dashboard">←</button>
+          <span class="logo-text">Agent Settings</span>
+        </div>
+        <div class="header-actions">
+          <img src="favicon.png" alt="tenby10 icon" class="branded-icon" />
+        </div>
+      </header>
+
+      <div class="glass-card settings-card">
+        <div class="tabs-nav">
+          <button class="tab-btn active" data-tab="tab-rules">Auditing Rules</button>
+          <button class="tab-btn" data-tab="tab-ai">AI Auditor</button>
+          <button class="tab-btn" data-tab="tab-permissions">Permissions</button>
+          <button class="tab-btn" data-tab="tab-saas">Connect</button>
+        </div>
+
+        <!-- Tab 1: Auditing Rules -->
+        <div id="tab-rules" class="tab-content">
+          <h3>Auditing Filters</h3>
+          <p class="desc">Classify minutes locally using keywords for app names or window titles.</p>
+          
+          <div class="form-group">
+            <label class="input-label" for="rules-productive">Productive Apps (Whitelist)</label>
+            <textarea id="rules-productive" placeholder="vscode, cursor, figma..."></textarea>
+          </div>
+          
+          <div class="form-group">
+            <label class="input-label" for="rules-distracting">Distracting Apps (Blacklist)</label>
+            <textarea id="rules-distracting" placeholder="youtube, netflix, twitter..."></textarea>
+          </div>
+          
+          <div class="form-group">
+            <label class="input-label" for="rules-meeting">Meeting Apps</label>
+            <textarea id="rules-meeting" placeholder="zoom, meet, teams..."></textarea>
+          </div>
+        </div>
+
+        <!-- Tab 3: AI Auditor -->
+        <div id="tab-ai" class="tab-content" style="display: none;">
+          <div class="ai-toggle-header">
+            <h3>AI Auditor (LLM + Filters)</h3>
+            <label class="switch">
+              <input id="ai-engine-toggle" type="checkbox" />
+              <span class="slider round"></span>
+            </label>
+          </div>
+          <p class="desc">Audit slot focus using an LLM. Bypasses LLM during fully idle slots.</p>
+
+          <!-- Dynamic LLM Fields -->
+          <div id="llm-fields" style="display: none; flex-direction: column; gap: 1rem;">
+            <div class="form-group">
+              <label class="input-label" for="ai-provider">LLM Provider</label>
+              <select id="ai-provider">
+                <option value="openai">OpenAI (GPT-4o)</option>
+                <option value="anthropic">Anthropic (Claude 3.5 Sonnet)</option>
+                <option value="gemini">Google Gemini</option>
+              </select>
+            </div>
+
+            <div class="form-group">
+              <label class="input-label" for="ai-api-key">API Key</label>
+              <input id="ai-api-key" type="password" placeholder="sk-... or API Key" autocomplete="off" />
+            </div>
+
+            <div class="form-group">
+              <label class="input-label" for="ai-prompt">System Auditor Prompt</label>
+              <textarea id="ai-prompt" style="height: 120px;"></textarea>
+              <p id="token-estimate" class="token-estimate-text"></p>
+            </div>
+
+            <div class="checkbox-group">
+              <input id="ai-send-screenshots" type="checkbox" />
+              <label for="ai-send-screenshots" class="checkbox-label">Send raw screenshots for analysis</label>
+            </div>
+          </div>
+        </div>
+
+        <!-- Tab 4: Permissions -->
+        <div id="tab-permissions" class="tab-content" style="display: none;">
+          <h3>macOS System Permissions</h3>
+          <p class="desc">tenby10 requires permissions to capture activity metrics and screenshots. Ensure they are enabled in System Settings.</p>
+          
+          <div class="permission-list">
+            <div class="permission-item">
+              <div class="permission-info">
+                <span class="permission-name">Input Monitoring</span>
+                <span class="permission-desc">Required to capture keyboard, click and scroll events. Without this, activity is not tracked even if other permissions are green.</span>
+              </div>
+              <div class="permission-status-wrapper">
+                <span id="perm-input-monitoring-status" class="status-indicator unknown">Checking...</span>
+                <button id="btn-open-input-monitoring" class="btn btn-sm btn-secondary">Grant Access ↗</button>
+              </div>
+            </div>
+
+            <div class="permission-item">
+              <div class="permission-info">
+                <span class="permission-name">Accessibility</span>
+                <span class="permission-desc">Used to read the active window/focus context alongside input activity.</span>
+              </div>
+              <div class="permission-status-wrapper">
+                <span id="perm-accessibility-status" class="status-indicator unknown">Checking...</span>
+                <button id="btn-open-accessibility" class="btn btn-sm btn-secondary">Grant Access ↗</button>
+              </div>
+            </div>
+
+            <div class="permission-item">
+              <div class="permission-info">
+                <span class="permission-name">Screen Recording</span>
+                <span class="permission-desc">Required to take periodic blurred screen captures for validation.</span>
+              </div>
+              <div class="permission-status-wrapper">
+                <span id="perm-screen-recording-status" class="status-indicator unknown">Checking...</span>
+                <button id="btn-open-screen-recording" class="btn btn-sm btn-secondary">Grant Access ↗</button>
+              </div>
+            </div>
+            
+            <div class="permission-item">
+              <div class="permission-info">
+                <span class="permission-name">Automation (System Events)</span>
+                <span class="permission-desc">Required to detect the active frontmost application and window title.</span>
+              </div>
+              <div class="permission-status-wrapper">
+                <span id="perm-automation-status" class="status-indicator unknown">Checking...</span>
+                <button id="btn-open-automation" class="btn btn-sm btn-secondary">Grant Access ↗</button>
+              </div>
+            </div>
+          </div>
+
+          <h3 style="margin-top: 1.2rem;">Live Capture Status</h3>
+          <p class="desc">Ground truth — whether telemetry is actually being captured right now (independent of the permission toggles above, which macOS can report stale).</p>
+          <div class="permission-list">
+            <div class="permission-item">
+              <div class="permission-info">
+                <span class="permission-name">Input capture</span>
+                <span id="health-input-detail" class="permission-desc">Checking…</span>
+              </div>
+              <div class="permission-status-wrapper">
+                <span id="health-input-status" class="status-indicator unknown">Checking...</span>
+              </div>
+            </div>
+            <div class="permission-item">
+              <div class="permission-info">
+                <span class="permission-name">Screen capture</span>
+                <span id="health-screen-detail" class="permission-desc">Checking…</span>
+              </div>
+              <div class="permission-status-wrapper">
+                <span id="health-screen-status" class="status-indicator unknown">Checking...</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Tab 4: Connect this device -->
+        <div id="tab-saas" class="tab-content" style="display: none;">
+          <h3>Connect this device</h3>
+          <p class="desc">Get a pairing code from your tenby10 dashboard, then paste it here to link this device and start sharing verified hours with clients.</p>
+
+          <form id="enroll-form" class="form-group" style="margin-top: 1rem;">
+            <label class="input-label" for="enroll-input">Pairing code</label>
+            <input id="enroll-input" type="text" placeholder="Paste your pairing code" autocomplete="off" spellcheck="false" />
+            <button id="enroll-btn" type="submit" class="btn btn-primary" style="margin-top: 0.75rem;">Link device</button>
+          </form>
+
+          <div id="enrollment-details" style="display: none; flex-direction: column; gap: 0.5rem; margin-top: 1.25rem;">
+            <div style="align-self: flex-start; padding: 0.4rem 0.8rem; border-radius: 999px; background: rgba(16,185,129,0.12); color: #34d399; font-size: 0.8rem; font-weight: 600;">✓ Device linked</div>
+            <p class="desc" style="margin: 0;">Agent ID: <span id="setting-agent-id" style="font-family: monospace; color: #d1d5db;"></span></p>
+            <p class="desc" style="margin: 0; word-break: break-all;">Public key: <span id="setting-public-key" style="font-family: monospace; color: #d1d5db;"></span></p>
+          </div>
+        </div>
+
+        <!-- Validation Error Message Container -->
+        <div id="validation-error" class="error-box" style="display: none; margin-top: 0.8rem; margin-bottom: 0.5rem;"></div>
+
+        <!-- Single Save Settings Button for Rules & AI tabs -->
+        <button id="save-settings-btn" class="btn btn-primary" style="display: none; margin-top: 0.5rem;">
+          Save Settings
+        </button>
+      </div>
+    </div>
+  </main>
+</body>
+</html>
