@@ -261,6 +261,12 @@ impl Database {
             "ALTER TABLE slot_summaries ADD COLUMN config_hash TEXT NOT NULL DEFAULT ''",
             [],
         );
+        // Tracks which effective-config blobs have already been uploaded to the cloud (#62),
+        // so each distinct config is sent once (on change) rather than every sync.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS synced_configs (config_hash TEXT PRIMARY KEY)",
+            [],
+        )?;
 
         Ok(())
     }
@@ -328,6 +334,24 @@ impl Database {
             })
         })?;
         rows.collect()
+    }
+
+    /// Whether an effective-config blob with this hash has already been uploaded (#62).
+    pub fn is_config_uploaded(&self, config_hash: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT 1 FROM synced_configs WHERE config_hash = ?1")?;
+        let mut rows = stmt.query(params![config_hash])?;
+        Ok(rows.next()?.is_some())
+    }
+
+    /// Record that the cloud accepted a config blob, so it is not re-uploaded.
+    pub fn mark_config_uploaded(&self, config_hash: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO synced_configs (config_hash) VALUES (?1)",
+            params![config_hash],
+        )?;
+        Ok(())
     }
 
     /// Mark a slot as uploaded so it is not sent again.
@@ -746,6 +770,32 @@ mod tests {
         assert!(mk(2, "cfgA").contains("cfgA"));
         // v1 rows omit the config hash entirely (back-compat): the arg is ignored.
         assert!(!mk(1, "cfgA").contains("cfgA"));
+    }
+
+    #[test]
+    fn test_v2_canonical_vector_matches_cloud() {
+        // Cross-language alignment vector (#62). The cloud verifier's
+        // canonicalSlotPayload() (cloud/src/lib/ledger.ts) MUST produce this exact
+        // string for the same inputs, or signatures won't verify. The same literal
+        // is asserted in the cloud's ledger.test.ts — keep both in lock-step.
+        let got = canonical_slot_payload(
+            2,
+            1000,
+            80,
+            8,
+            2,
+            100,
+            10,
+            "{}",
+            None,
+            "PARENT",
+            "PUBKEY",
+            "CONFIGHASH",
+        );
+        let expected = "tenby10-slot|v2|PUBKEY|1000|80|8|2|100|10|\
+44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a|\
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855|CONFIGHASH|PARENT";
+        assert_eq!(got, expected);
     }
 
     #[test]
