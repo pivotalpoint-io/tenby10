@@ -4,9 +4,9 @@
 [![License: Source-Available (PPSAL-1.0)](https://img.shields.io/badge/License-Source--Available_(PPSAL--1.0)-purple.svg)](LICENSE)
 [![Platform: macOS](https://img.shields.io/badge/Platform-macOS-lightgrey.svg)](https://apple.com)
 
-**tenby10** is the trust mark for billable hours. When your invoice says *“Verified by tenby10,”* your client knows the hours are real — cryptographically, without anyone's screen being recorded. It's a private, tamper-evident local audit **you** control, so a freelancer going direct can prove their work to a client without spyware and without a platform's cut.
+**tenby10** is a privacy-first, source-available desktop activity tracker. A local background daemon measures your work activity on-device and turns it into a **tamper-evident, cryptographically-signed** record of your time — using only input *counts* and locally blurred screenshots, never raw keystrokes or raw screens.
 
-It runs as a local background daemon that turns your real activity into a signed, hash-chained record of billable hours — using only input *counts* and locally blurred screenshots, never raw keystrokes or raw screens. It also operates on a **Bring Your Own Key (BYOK)** model, letting you use your own private LLM configuration to summarize window titles into structured work notes directly on your machine.
+Everything is stored locally under `~/.tenby10/`. If you enroll a device, only signed 10-minute *summaries* and your scoring configuration are synced — raw keystrokes, screenshots, and window titles never leave your machine (see [AUDIT.md](AUDIT.md)). It also operates on a **Bring Your Own Key (BYOK)** model, letting you use your own private LLM configuration to summarize window titles into structured work notes directly on your machine.
 
 > 🔍 **Don't trust — verify.** This is the full **source-available** client that runs on your machine. Before granting it input and screen access, read the **[Auditor's Guide (AUDIT.md)](AUDIT.md)**: it maps every privacy and fairness claim (no keylogging, no cloud exfiltration, fair scoring rules) to the exact source lines that prove it, and honestly lists where the code doesn't yet match our copy. An AI agent can follow it end-to-end to verify us.
 
@@ -20,7 +20,7 @@ It runs as a local background daemon that turns your real activity into a signed
     - **Environment Overrides**: Use `TENBY10_HOME` to override the base directory and `TENBY10_PORT` to override the dashboard port (default: 5005).
 *   🛡️ **Tamper-Evident Ledger**: Each 10-minute slot summary is SHA-256 hash-chained over its **full** payload, so editing any stored field breaks the chain. Once you enroll, every slot is additionally **Ed25519-signed with your key**, so even a re-computed hash won't verify without that key. On a machine you control this is tamper-*evidence* and self-asserted authorship — not, by itself, third-party proof.
 *   🧠 **BYOK Local AI Scribe**: Connects directly to your own provider (OpenAI, Anthropic, or Gemini) to analyze active logs and generate professional work summaries. 
-*   🟢 **10-Minute Slot Standard**: Records your day in verifiable 10-minute slots — a privacy-preserving, drop-in alternative to the surveillance-based Work Diary that clients already trust.
+*   🟢 **10-Minute Slot Standard**: Records your day in verifiable 10-minute slots, each hash-chained and — once you enroll — signed with your key.
 
 ---
 
