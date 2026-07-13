@@ -80,6 +80,22 @@ body::after {
   margin: 0 auto;
 }
 
+/* Activity dashboard overlay: fills the whole window (outside .container so it
+   ignores the compact max-width) and hosts the isolated dashboard iframe. */
+#activity-view {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  background: #0f111a;
+}
+
+#activity-frame {
+  width: 100%;
+  height: 100%;
+  border: 0;
+  display: block;
+}
+
 /* Views Layout */
 .view {
   width: 100%;

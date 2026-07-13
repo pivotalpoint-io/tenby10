@@ -679,6 +679,157 @@ impl Database {
         }
         Ok(logs)
     }
+
+    /// Fetch the most recent slot summaries (newest first) for the dashboard.
+    pub fn get_recent_slot_summaries(&self, limit: u32) -> Result<Vec<SlotSummaryView>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT slot_start, focus_score, active_segments, idle_segments, total_keystrokes, total_clicks, app_categories, hash, parent_hash, llm_reasoning
+             FROM slot_summaries ORDER BY slot_start DESC LIMIT ?1",
+        )?;
+
+        let rows = stmt.query_map(params![limit], |row| {
+            let categories_str: String = row.get(6)?;
+            let categories_json: serde_json::Value =
+                serde_json::from_str(&categories_str).unwrap_or(serde_json::json!({}));
+
+            Ok(SlotSummaryView {
+                slot_start: row.get(0)?,
+                focus_score: row.get(1)?,
+                active_segments: row.get(2)?,
+                idle_segments: row.get(3)?,
+                total_keystrokes: row.get(4)?,
+                total_clicks: row.get(5)?,
+                app_categories: categories_json,
+                hash: row.get(7)?,
+                parent_hash: row.get(8)?,
+                llm_reasoning: row.get(9).unwrap_or(None),
+            })
+        })?;
+
+        let mut slots = Vec::new();
+        for slot in rows.flatten() {
+            slots.push(slot);
+        }
+        Ok(slots)
+    }
+
+    /// Fetch the minute-by-minute logs for a slot and classify each one into a
+    /// display `state`, mirroring the evaluator used by the aggregation pipeline.
+    pub fn get_slot_minute_details(&self, slot_start: i64) -> Result<Vec<SlotMinuteDetailView>> {
+        let raw = self.get_minute_logs_for_slot(slot_start)?;
+
+        let mut config_path = crate::env::get_app_home();
+        config_path.push("config.json");
+        let config = crate::config::load_config(config_path).unwrap_or_default();
+        let evaluator = crate::evaluator::ActivityEvaluator::new();
+
+        let mut list = Vec::new();
+        for item in raw {
+            let classification =
+                evaluator.evaluate_stored_minute(&crate::evaluator::StoredEvaluationContext {
+                    keystroke_count: item.keystroke_count,
+                    mouse_click_count: item.mouse_click_count,
+                    scroll_event_count: item.scroll_event_count,
+                    active_app: &item.active_app_name,
+                    active_title: &item.active_window_title,
+                    low_entropy: item.low_entropy,
+                    was_recently_active: false,
+                    distracting_apps: &config.distracting_apps,
+                    productive_apps: &config.productive_apps,
+                    meeting_apps: &config.meeting_apps,
+                });
+            let state = match classification {
+                crate::evaluator::ActivityClassification::Active
+                | crate::evaluator::ActivityClassification::PassiveReview => "Productive",
+                crate::evaluator::ActivityClassification::Meeting => "Meeting",
+                crate::evaluator::ActivityClassification::Distracted => "Waste",
+                crate::evaluator::ActivityClassification::Idle => "Inactive",
+                crate::evaluator::ActivityClassification::Tampered => "Tampered",
+            };
+            list.push(SlotMinuteDetailView {
+                timestamp: item.timestamp,
+                keystroke_count: item.keystroke_count,
+                mouse_click_count: item.mouse_click_count,
+                scroll_event_count: item.scroll_event_count,
+                active_app_name: item.active_app_name,
+                active_window_title: item.active_window_title,
+                low_entropy: item.low_entropy,
+                state: state.to_string(),
+            });
+        }
+        Ok(list)
+    }
+
+    /// Build a CSV export of raw minute logs over the given range. `range` is one
+    /// of "24h" (default), "7d", "30d", "all", or "custom" (which uses the
+    /// inclusive `start`/`end` unix timestamps).
+    pub fn export_minute_logs_csv(
+        &self,
+        range: &str,
+        start: Option<i64>,
+        end: Option<i64>,
+    ) -> Result<String> {
+        let conn = self.conn.lock().unwrap();
+
+        let mut sql = "SELECT timestamp, active_app_name, active_window_title, keystroke_count, mouse_click_count, scroll_event_count, mouse_movement_distance, low_entropy, strftime('%Y/%m/%d %H:%M', timestamp, 'unixepoch', 'localtime')
+             FROM minute_logs".to_string();
+
+        match range {
+            "7d" => {
+                sql.push_str(" WHERE timestamp > strftime('%s', 'now') - 604800");
+            }
+            "30d" => {
+                sql.push_str(" WHERE timestamp > strftime('%s', 'now') - 2592000");
+            }
+            "all" => {}
+            "custom" => {
+                let start = start.unwrap_or(0);
+                let end = end.unwrap_or(i64::MAX);
+                sql.push_str(&format!(
+                    " WHERE timestamp >= {} AND timestamp <= {}",
+                    start, end
+                ));
+            }
+            _ => {
+                sql.push_str(" WHERE timestamp > strftime('%s', 'now') - 86400");
+            }
+        }
+
+        sql.push_str(" ORDER BY timestamp ASC");
+
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map([], |row| {
+            let timestamp: i64 = row.get(0)?;
+            let app: String = row.get(1)?;
+            let title: String = row.get(2)?;
+            let keys: i32 = row.get(3)?;
+            let clicks: i32 = row.get(4)?;
+            let scroll: i32 = row.get(5)?;
+            let dist: f64 = row.get(6)?;
+            let low_entropy: bool = row.get(7)?;
+            let datetime: String = row.get(8)?;
+            Ok(format!(
+                "{},\"{}\",\"{}\",{},{},{},{},{},{}",
+                datetime,
+                app.replace('"', "\"\""),
+                title.replace('"', "\"\""),
+                keys,
+                clicks,
+                scroll,
+                dist,
+                low_entropy,
+                timestamp
+            ))
+        })?;
+
+        let mut lines = Vec::new();
+        lines.push(String::from("datetime,app_name,window_title,keystroke_count,mouse_click_count,scroll_event_count,mouse_movement_distance,low_entropy,epoch_timestamp"));
+        for line in rows.flatten() {
+            lines.push(line);
+        }
+        Ok(lines.join("\n"))
+    }
 }
 
 pub struct MinuteLogData {
@@ -689,6 +840,37 @@ pub struct MinuteLogData {
     pub active_app_name: String,
     pub active_window_title: String,
     pub low_entropy: bool,
+}
+
+/// A single 10-minute slot summary as shown in the activity dashboard.
+/// Shared by the native Tauri commands and the (legacy) HTTP dashboard so both
+/// surfaces read identical data from one query.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct SlotSummaryView {
+    pub slot_start: i64,
+    pub focus_score: u32,
+    pub active_segments: u32,
+    pub idle_segments: u32,
+    pub total_keystrokes: u32,
+    pub total_clicks: u32,
+    pub app_categories: serde_json::Value,
+    pub hash: String,
+    pub parent_hash: String,
+    pub llm_reasoning: Option<String>,
+}
+
+/// A minute-by-minute activity row within a slot, with its classified `state`
+/// ("Productive" / "Meeting" / "Waste" / "Inactive" / "Tampered").
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct SlotMinuteDetailView {
+    pub timestamp: i64,
+    pub keystroke_count: u32,
+    pub mouse_click_count: u32,
+    pub scroll_event_count: u32,
+    pub active_app_name: String,
+    pub active_window_title: String,
+    pub low_entropy: bool,
+    pub state: String,
 }
 
 #[cfg(test)]
@@ -994,5 +1176,82 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855|CONFIGHASH|PARE
         assert_eq!(active, 30, "3 logged 10-minute slots == 30 minutes");
         // Focus averages over logged slots only (30 + 40 + 90) / 3 == 53.
         assert_eq!(avg, 53, "focus averages over logged slots, idle excluded");
+    }
+
+    #[test]
+    fn test_get_recent_slot_summaries_shape_and_order() {
+        let db = create_test_db();
+
+        db.insert_slot_summary(
+            1000,
+            30,
+            3,
+            7,
+            50,
+            5,
+            "{\"coding\": 8}",
+            Some("focused work"),
+            "",
+            None,
+        )
+        .unwrap();
+        db.insert_slot_summary(1600, 85, 9, 1, 200, 30, "{\"coding\": 10}", None, "", None)
+            .unwrap();
+
+        let slots = db.get_recent_slot_summaries(1000).unwrap();
+        assert_eq!(slots.len(), 2);
+        // Newest first.
+        assert_eq!(slots[0].slot_start, 1600);
+        assert_eq!(slots[1].slot_start, 1000);
+        // app_categories is parsed into JSON, not a raw string.
+        assert_eq!(slots[1].app_categories["coding"], 8);
+        assert_eq!(slots[1].llm_reasoning.as_deref(), Some("focused work"));
+        // The LIMIT is honoured.
+        assert_eq!(db.get_recent_slot_summaries(1).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_get_slot_minute_details_classifies_state() {
+        let db = create_test_db();
+        let slot_start = 600;
+
+        // A productive minute (keystrokes in a neutral app) ...
+        db.insert_minute_log(slot_start + 60, 120, 5, 2, 300.0, "Code", "main.rs", false)
+            .unwrap();
+        // ... and a fully idle minute (no input at all).
+        db.insert_minute_log(slot_start + 120, 0, 0, 0, 0.0, "Finder", "", false)
+            .unwrap();
+
+        let details = db.get_slot_minute_details(slot_start).unwrap();
+        assert_eq!(
+            details.len(),
+            2,
+            "both minute logs in the window are returned"
+        );
+        // Rows are ordered by timestamp ascending and carry a classified state.
+        assert_eq!(details[0].active_app_name, "Code");
+        assert_eq!(details[0].state, "Productive");
+        assert_eq!(details[1].state, "Inactive");
+    }
+
+    #[test]
+    fn test_export_minute_logs_csv_header_and_rows() {
+        let db = create_test_db();
+        db.insert_minute_log(1000, 10, 2, 1, 42.5, "Code", "a\"b", false)
+            .unwrap();
+
+        let csv = db.export_minute_logs_csv("all", None, None).unwrap();
+        let lines: Vec<&str> = csv.lines().collect();
+        assert!(lines[0].starts_with("datetime,app_name,window_title"));
+        assert_eq!(lines.len(), 2, "header + one data row");
+        // Embedded quotes are CSV-escaped by doubling.
+        assert!(lines[1].contains("\"a\"\"b\""));
+        assert!(lines[1].ends_with(",1000"));
+
+        // A window that excludes the row yields just the header.
+        let empty = db
+            .export_minute_logs_csv("custom", Some(2000), Some(3000))
+            .unwrap();
+        assert_eq!(empty.lines().count(), 1);
     }
 }

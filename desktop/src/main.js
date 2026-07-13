@@ -372,14 +372,53 @@ if (toggleTrackingBtn) {
   });
 }
 
+const activityView = document.getElementById("activity-view");
+const activityFrame = document.getElementById("activity-frame");
+
+async function enterDashboard() {
+  // Lazy-load the dashboard document on first open.
+  if (activityFrame && !activityFrame.getAttribute("src")) {
+    activityFrame.setAttribute("src", "dashboard.html");
+  }
+  dashboardView.style.display = "none";
+  if (settingsView) settingsView.style.display = "none";
+  if (activityView) activityView.style.display = "block";
+  try {
+    await invoke("set_dashboard_mode", { expand: true });
+  } catch (err) {
+    console.error("Failed to size window for dashboard:", err);
+  }
+}
+
+// Exposed globally so the embedded dashboard's "Back" control can call it.
+async function exitDashboard() {
+  if (activityView) activityView.style.display = "none";
+  dashboardView.style.display = "flex";
+  try {
+    await invoke("set_dashboard_mode", { expand: false });
+  } catch (err) {
+    console.error("Failed to restore window size:", err);
+  }
+}
+window.exitDashboard = exitDashboard;
+
+// The dashboard iframe is same-origin but can't reach into this scope directly,
+// so it asks to close via postMessage as well as the window.exitDashboard hook.
+window.addEventListener("message", (event) => {
+  if (event.data && event.data.type === "tenby10-exit-dashboard") {
+    exitDashboard();
+  }
+});
+
+// Esc leaves the dashboard view.
+window.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && activityView && activityView.style.display === "block") {
+    exitDashboard();
+  }
+});
+
 if (openDashboardBtn) {
-  openDashboardBtn.addEventListener("click", async () => {
-    try {
-      await invoke("open_dashboard");
-    } catch (err) {
-      console.error("Failed to open local dashboard:", err);
-    }
-  });
+  openDashboardBtn.addEventListener("click", enterDashboard);
 }
 
 // Enrollment Form Submit
