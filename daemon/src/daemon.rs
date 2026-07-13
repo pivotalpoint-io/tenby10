@@ -652,6 +652,12 @@ pub fn aggregate_slot(db: &Database, config: &crate::config::AgentConfig, slot_s
         })
     };
 
+    // Bind the effective scoring config (auditing rules + AI prompt) into the
+    // signed payload so every score is tied to the rubric that produced it (#62).
+    // Compute both from the same blob so config_hash == sha256(blob), which the cloud verifies.
+    let config_blob = config.effective_config_blob();
+    let config_hash = crate::db::sha256_hex_pub(&config_blob);
+
     let slot_res = db.insert_slot_summary(
         slot_start,
         final_focus_score,
@@ -661,6 +667,7 @@ pub fn aggregate_slot(db: &Database, config: &crate::config::AgentConfig, slot_s
         slot_clicks,
         &app_categories_json,
         final_reasoning.as_deref(),
+        &config_hash,
         signer.as_ref(),
     );
 
@@ -678,7 +685,18 @@ pub fn aggregate_slot(db: &Database, config: &crate::config::AgentConfig, slot_s
 
     // Upload any not-yet-synced signed slots (best-effort; #115). Skips when not enrolled.
     if !config.agent_id.is_empty() {
-        match crate::sync::sync_signed_slots(db, &config.agent_id, &crate::sync::cloud_base_url()) {
+        let base = crate::sync::cloud_base_url();
+        // Send the effective config first so the slots' config_hash resolves server-side (#62).
+        if let Err(e) = crate::sync::upload_config_if_needed(
+            db,
+            &config.agent_id,
+            &base,
+            &config_blob,
+            &config_hash,
+        ) {
+            eprintln!("[Sync] {e}");
+        }
+        match crate::sync::sync_signed_slots(db, &config.agent_id, &base) {
             Ok(n) if n > 0 => println!("[Sync] Uploaded {n} slot(s) to the cloud."),
             Ok(_) => {}
             Err(e) => eprintln!("[Sync] {e}"),

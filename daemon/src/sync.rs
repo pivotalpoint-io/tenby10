@@ -44,6 +44,45 @@ pub async fn enroll_with_cloud(
         .ok_or_else(|| "enrollment response had no agentId".to_string())
 }
 
+/// Upload the effective-config blob to the cloud once per distinct config (#62), so the
+/// verified page can show the rubric behind each score. The config hash is already bound into
+/// the signed slots, so the server authenticates it with `sha256(blob) == config_hash`.
+/// No-op when already uploaded, unenrolled, or the hash is empty.
+pub fn upload_config_if_needed(
+    db: &Database,
+    agent_id: &str,
+    base_url: &str,
+    config_blob: &str,
+    config_hash: &str,
+) -> Result<bool, String> {
+    if agent_id.is_empty() || config_hash.is_empty() {
+        return Ok(false);
+    }
+    if db
+        .is_config_uploaded(config_hash)
+        .map_err(|e| format!("config-sync db read failed: {e}"))?
+    {
+        return Ok(false);
+    }
+
+    let resp = reqwest::blocking::Client::new()
+        .post(format!("{base_url}/api/v1/config"))
+        .json(&serde_json::json!({
+            "agent_id": agent_id,
+            "config_hash": config_hash,
+            "config_blob": config_blob,
+        }))
+        .send()
+        .map_err(|e| format!("config upload request failed: {e}"))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("config upload rejected: HTTP {}", resp.status()));
+    }
+    db.mark_config_uploaded(config_hash)
+        .map_err(|e| format!("could not mark config uploaded: {e}"))?;
+    Ok(true)
+}
+
 /// Upload not-yet-synced signed slots, oldest first, marking each on success. Stops at the
 /// first rejection (the chain must land in order). Returns the number uploaded this call.
 pub fn sync_signed_slots(db: &Database, agent_id: &str, base_url: &str) -> Result<usize, String> {
@@ -72,6 +111,7 @@ pub fn sync_signed_slots(db: &Database, agent_id: &str, base_url: &str) -> Resul
                 "app_categories": slot.app_categories,
             },
             "reasoning_hash": sha256_hex_pub(slot.llm_reasoning.as_deref().unwrap_or("")),
+            "config_hash": slot.config_hash,
             "ledger": { "hash": slot.hash, "parent_hash": slot.parent_hash },
             "signature": slot.signature,
         });

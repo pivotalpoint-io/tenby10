@@ -59,6 +59,52 @@ pub struct AgentConfig {
     pub enforce_synthetic_detection: bool,
 }
 
+/// The scoring configuration that actually determines a slot's score — the
+/// "auditing rules" (app lists + engine + synthetic-detection) and the AI
+/// auditor prompt. Serialized in a fixed field order so the JSON blob is
+/// byte-deterministic; its SHA-256 is bound into every signed slot
+/// (config-in-ledger, #62) and the exact blob is uploaded to the cloud when it
+/// changes. Secrets and identifiers are deliberately excluded.
+#[derive(serde::Serialize)]
+pub struct EffectiveConfig<'a> {
+    pub config_scheme: u32,
+    pub engine_mode: &'a str,
+    pub distracting_apps: &'a str,
+    pub productive_apps: &'a str,
+    pub meeting_apps: &'a str,
+    pub llm_prompt: &'a str,
+    pub enforce_synthetic_detection: bool,
+}
+
+/// Versions the effective-config serialization independently of the ledger scheme.
+pub const EFFECTIVE_CONFIG_SCHEME: u32 = 1;
+
+impl AgentConfig {
+    /// Canonical JSON blob of the effective scoring config (fixed field order,
+    /// no whitespace). This is the exact string uploaded to the cloud, so the
+    /// cloud verifies it with a plain `sha256(bytes) == config_hash` — no
+    /// re-canonicalization on the server.
+    pub fn effective_config_blob(&self) -> String {
+        serde_json::to_string(&EffectiveConfig {
+            config_scheme: EFFECTIVE_CONFIG_SCHEME,
+            engine_mode: &self.engine_mode,
+            distracting_apps: &self.distracting_apps,
+            productive_apps: &self.productive_apps,
+            meeting_apps: &self.meeting_apps,
+            llm_prompt: &self.llm_prompt,
+            enforce_synthetic_detection: self.enforce_synthetic_detection,
+        })
+        .unwrap_or_default()
+    }
+
+    /// SHA-256 (lowercase hex) of [`Self::effective_config_blob`]. Bound into the
+    /// signed slot payload so every score is cryptographically tied to the rubric
+    /// that produced it.
+    pub fn effective_config_hash(&self) -> String {
+        crate::db::sha256_hex_pub(&self.effective_config_blob())
+    }
+}
+
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {

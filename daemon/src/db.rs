@@ -13,7 +13,8 @@ pub const BILLABLE_FOCUS_THRESHOLD: u32 = 40;
 
 /// Version of the slot signing/hashing scheme (ADR 0014). Bumped when the
 /// canonical payload format changes so old rows still verify under their scheme.
-pub const LEDGER_SCHEME_VERSION: u32 = 1;
+/// v2 (#62) binds the effective-config hash into the payload; v1 rows omit it.
+pub const LEDGER_SCHEME_VERSION: u32 = 2;
 
 /// Material needed to self-sign a slot summary (ADR 0014). Sourced from the
 /// enrolled agent's config; both keys are hex-encoded Ed25519. When absent
@@ -39,6 +40,8 @@ pub struct SignedSlot {
     pub parent_hash: String,
     pub signature: String,
     pub scheme_version: u32,
+    /// SHA-256 of the effective-config blob in force for this slot (v2+; "" for v1).
+    pub config_hash: String,
 }
 
 /// SHA-256 of a string as lowercase hex — matches the canonical payload's field folding.
@@ -89,21 +92,42 @@ fn canonical_slot_payload(
     llm_reasoning: Option<&str>,
     parent_hash: &str,
     signing_pubkey: &str,
+    config_hash: &str,
 ) -> String {
-    format!(
-        "tenby10-slot|v{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
-        scheme_version,
-        signing_pubkey,
-        slot_start,
-        focus_score,
-        active_segments,
-        idle_segments,
-        total_keystrokes,
-        total_clicks,
-        sha256_hex(app_categories_json),
-        sha256_hex(llm_reasoning.unwrap_or("")),
-        parent_hash,
-    )
+    // v2 (#62) inserts the effective-config hash before the parent link so every
+    // score is bound to the rubric that produced it. v1 rows keep the old format.
+    if scheme_version >= 2 {
+        format!(
+            "tenby10-slot|v{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+            scheme_version,
+            signing_pubkey,
+            slot_start,
+            focus_score,
+            active_segments,
+            idle_segments,
+            total_keystrokes,
+            total_clicks,
+            sha256_hex(app_categories_json),
+            sha256_hex(llm_reasoning.unwrap_or("")),
+            config_hash,
+            parent_hash,
+        )
+    } else {
+        format!(
+            "tenby10-slot|v{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+            scheme_version,
+            signing_pubkey,
+            slot_start,
+            focus_score,
+            active_segments,
+            idle_segments,
+            total_keystrokes,
+            total_clicks,
+            sha256_hex(app_categories_json),
+            sha256_hex(llm_reasoning.unwrap_or("")),
+            parent_hash,
+        )
+    }
 }
 
 /// Verify an Ed25519 slot signature. `Ok(true)`/`Ok(false)` on a well-formed
@@ -204,7 +228,8 @@ impl Database {
                 llm_reasoning TEXT,
                 signature TEXT,
                 signing_pubkey TEXT,
-                scheme_version INTEGER NOT NULL DEFAULT 1
+                scheme_version INTEGER NOT NULL DEFAULT 1,
+                config_hash TEXT NOT NULL DEFAULT ''
             )",
             [],
         )?;
@@ -233,6 +258,17 @@ impl Database {
             "ALTER TABLE slot_summaries ADD COLUMN synced INTEGER NOT NULL DEFAULT 0",
             [],
         );
+        // Config-in-ledger (#62): effective-config hash bound into v2 signed payloads.
+        let _ = conn.execute(
+            "ALTER TABLE slot_summaries ADD COLUMN config_hash TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        // Tracks which effective-config blobs have already been uploaded to the cloud (#62),
+        // so each distinct config is sent once (on change) rather than every sync.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS synced_configs (config_hash TEXT PRIMARY KEY)",
+            [],
+        )?;
 
         Ok(())
     }
@@ -277,7 +313,7 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT slot_start, focus_score, active_segments, idle_segments, total_keystrokes, \
-             total_clicks, app_categories, llm_reasoning, hash, parent_hash, signature, scheme_version \
+             total_clicks, app_categories, llm_reasoning, hash, parent_hash, signature, scheme_version, config_hash \
              FROM slot_summaries \
              WHERE signature IS NOT NULL AND synced = 0 \
              ORDER BY slot_start ASC LIMIT ?1",
@@ -296,9 +332,28 @@ impl Database {
                 parent_hash: r.get(9)?,
                 signature: r.get(10)?,
                 scheme_version: r.get(11)?,
+                config_hash: r.get(12)?,
             })
         })?;
         rows.collect()
+    }
+
+    /// Whether an effective-config blob with this hash has already been uploaded (#62).
+    pub fn is_config_uploaded(&self, config_hash: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT 1 FROM synced_configs WHERE config_hash = ?1")?;
+        let mut rows = stmt.query(params![config_hash])?;
+        Ok(rows.next()?.is_some())
+    }
+
+    /// Record that the cloud accepted a config blob, so it is not re-uploaded.
+    pub fn mark_config_uploaded(&self, config_hash: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO synced_configs (config_hash) VALUES (?1)",
+            params![config_hash],
+        )?;
+        Ok(())
     }
 
     /// Mark a slot as uploaded so it is not sent again.
@@ -338,6 +393,7 @@ impl Database {
         total_clicks: u32,
         app_categories_json: &str,
         llm_reasoning: Option<&str>,
+        config_hash: &str,
         signer: Option<&SlotSigner>,
     ) -> Result<()> {
         let parent_hash = self.get_latest_slot_hash()?;
@@ -356,6 +412,7 @@ impl Database {
             llm_reasoning,
             &parent_hash,
             signing_pubkey,
+            config_hash,
         );
 
         let hash = sha256_hex(&payload);
@@ -374,8 +431,8 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT OR REPLACE INTO slot_summaries (
-                slot_start, focus_score, active_segments, idle_segments, total_keystrokes, total_clicks, app_categories, hash, parent_hash, llm_reasoning, signature, signing_pubkey, scheme_version
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                slot_start, focus_score, active_segments, idle_segments, total_keystrokes, total_clicks, app_categories, hash, parent_hash, llm_reasoning, signature, signing_pubkey, scheme_version, config_hash
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 slot_start,
                 focus_score,
@@ -389,7 +446,8 @@ impl Database {
                 llm_reasoning,
                 signature,
                 stored_pubkey,
-                LEDGER_SCHEME_VERSION
+                LEDGER_SCHEME_VERSION,
+                config_hash
             ],
         )?;
         Ok(())
@@ -484,7 +542,7 @@ impl Database {
     pub fn verify_ledger_integrity(&self, expected_pubkey: &str) -> Result<Result<(), String>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT slot_start, focus_score, active_segments, idle_segments, total_keystrokes, total_clicks, app_categories, hash, parent_hash, llm_reasoning, signature, signing_pubkey, scheme_version
+            "SELECT slot_start, focus_score, active_segments, idle_segments, total_keystrokes, total_clicks, app_categories, hash, parent_hash, llm_reasoning, signature, signing_pubkey, scheme_version, config_hash
              FROM slot_summaries ORDER BY slot_start ASC",
         )?;
         let mut rows = stmt.query([])?;
@@ -505,6 +563,7 @@ impl Database {
             let signature: Option<String> = row.get(10)?;
             let signing_pubkey: Option<String> = row.get(11)?;
             let scheme_version: u32 = row.get(12).unwrap_or(1);
+            let config_hash: String = row.get(13).unwrap_or_default();
 
             // 1. Verify parent_hash links correctly
             if parent_hash != expected_parent_hash {
@@ -528,6 +587,7 @@ impl Database {
                 llm_reasoning.as_deref(),
                 &parent_hash,
                 row_pubkey,
+                &config_hash,
             );
             let computed_hash = sha256_hex(&payload);
 
@@ -659,6 +719,7 @@ mod tests {
             20,
             "{\"coding\": 10}",
             Some("Good"),
+            "",
             None,
         )
         .unwrap();
@@ -671,6 +732,7 @@ mod tests {
             30,
             "{\"coding\": 10}",
             Some("Great"),
+            "",
             None,
         )
         .unwrap();
@@ -698,12 +760,53 @@ mod tests {
     }
 
     #[test]
+    fn test_v2_payload_binds_config_hash() {
+        let mk = |scheme: u32, cfg: &str| {
+            canonical_slot_payload(
+                scheme, 1000, 80, 8, 2, 100, 10, "{}", None, "parent", "pub", cfg,
+            )
+        };
+        // v2 folds the config hash into the signed payload, so changing it changes
+        // the bytes that are hashed and signed.
+        assert_ne!(mk(2, "cfgA"), mk(2, "cfgB"));
+        assert!(mk(2, "cfgA").contains("cfgA"));
+        // v1 rows omit the config hash entirely (back-compat): the arg is ignored.
+        assert!(!mk(1, "cfgA").contains("cfgA"));
+    }
+
+    #[test]
+    fn test_v2_canonical_vector_matches_cloud() {
+        // Cross-language alignment vector (#62). The cloud verifier's
+        // canonicalSlotPayload() (cloud/src/lib/ledger.ts) MUST produce this exact
+        // string for the same inputs, or signatures won't verify. The same literal
+        // is asserted in the cloud's ledger.test.ts — keep both in lock-step.
+        let got = canonical_slot_payload(
+            2,
+            1000,
+            80,
+            8,
+            2,
+            100,
+            10,
+            "{}",
+            None,
+            "PARENT",
+            "PUBKEY",
+            "CONFIGHASH",
+        );
+        let expected = "tenby10-slot|v2|PUBKEY|1000|80|8|2|100|10|\
+44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a|\
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855|CONFIGHASH|PARENT";
+        assert_eq!(got, expected);
+    }
+
+    #[test]
     fn test_unsigned_row_recompute_is_not_detected() {
         // Honest limitation (ADR 0014): with no signature, an attacker who
         // recomputes the hash after editing defeats a purely-local chain. This
         // test locks that intended scope so we don't over-claim.
         let db = create_test_db();
-        db.insert_slot_summary(1000, 50, 5, 5, 10, 2, "{}", None, None)
+        db.insert_slot_summary(1000, 50, 5, 5, 10, 2, "{}", None, "", None)
             .unwrap();
 
         let forged = canonical_slot_payload(
@@ -718,6 +821,7 @@ mod tests {
             None,
             "", // parent_hash of first row
             "", // unsigned
+            "", // config_hash
         );
         let forged_hash = sha256_hex(&forged);
         db.conn
@@ -744,9 +848,9 @@ mod tests {
             private_key: &keys.private_key,
         };
 
-        db.insert_slot_summary(1000, 80, 8, 2, 100, 10, "{}", Some("r"), Some(&signer))
+        db.insert_slot_summary(1000, 80, 8, 2, 100, 10, "{}", Some("r"), "", Some(&signer))
             .unwrap();
-        db.insert_slot_summary(1600, 90, 9, 1, 120, 12, "{}", None, Some(&signer))
+        db.insert_slot_summary(1600, 90, 9, 1, 120, 12, "{}", None, "", Some(&signer))
             .unwrap();
 
         // Valid signatures verify against the enrolled key.
@@ -777,7 +881,7 @@ mod tests {
             public_key: &keys.public_key,
             private_key: &keys.private_key,
         };
-        db.insert_slot_summary(1000, 50, 5, 5, 10, 2, "{}", None, Some(&signer))
+        db.insert_slot_summary(1000, 50, 5, 5, 10, 2, "{}", None, "", Some(&signer))
             .unwrap();
 
         // Attacker inflates focus and recomputes a matching hash (leaving the
@@ -794,6 +898,7 @@ mod tests {
             None,
             "",
             &keys.public_key,
+            "",
         );
         let forged_hash = sha256_hex(&forged);
         db.conn
@@ -835,6 +940,7 @@ mod tests {
             2,
             "{}",
             None,
+            "",
             None,
         )
         .unwrap();
@@ -848,14 +954,26 @@ mod tests {
             5,
             "{}",
             None,
+            "",
             None,
         )
         .unwrap();
         // Green slot: well above the gate -> billable.
-        db.insert_slot_summary(today_midnight + 1200, 90, 9, 1, 200, 30, "{}", None, None)
-            .unwrap();
+        db.insert_slot_summary(
+            today_midnight + 1200,
+            90,
+            9,
+            1,
+            200,
+            30,
+            "{}",
+            None,
+            "",
+            None,
+        )
+        .unwrap();
         // Fully-idle slot (focus_score 0): NOT logged, excluded from every aggregate.
-        db.insert_slot_summary(today_midnight + 1800, 0, 0, 10, 0, 0, "{}", None, None)
+        db.insert_slot_summary(today_midnight + 1800, 0, 0, 10, 0, 0, "{}", None, "", None)
             .unwrap();
 
         let (avg, active, _k, _c, scores, logged_slots, billable_slots) =
