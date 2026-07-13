@@ -3,8 +3,10 @@
 **Audience:** any human or AI agent auditing the tenby10 desktop client before trusting it with
 OS-level input and screen access.
 
-**Claim under audit:** *"tenby10 is not a keylogger, does not capture anything sensitive, keeps
-everything local, and scores your focus by fair, inspectable rules."*
+**Claim under audit:** *"tenby10 is not a keylogger, does not capture anything sensitive, keeps your
+raw activity on your machine, and scores your focus by fair, inspectable rules."* When you enroll and
+share a link, signed 10-minute *summaries* and your scoring configuration are uploaded — never raw
+keystrokes, screenshots, or window titles (§2).
 
 This guide maps each of those claims to the exact source that proves (or, honestly, does **not** yet
 prove) it. Every reference is `file:line` and is meant to be opened and read directly — do not take
@@ -21,20 +23,21 @@ auditable; the cloud portal is not part of this repository.
 
 | # | Claim | Status | Primary evidence |
 |---|-------|--------|------------------|
-| 1 | No key **content** is captured (not a keylogger) | ✅ Verified in code | [daemon.rs:88](daemon/src/daemon.rs#L88) — `KeyPress(_)` discards the key value |
-| 2 | Only counts/metadata are stored per minute | ✅ Verified | [daemon.rs:235](daemon/src/daemon.rs#L235), [db.rs schema](daemon/src/db.rs) |
-| 3 | Raw screenshots never touch disk; only blurred JPEGs saved | ✅ Verified | [screen.rs:47-66](daemon/src/screen.rs#L47) |
-| 4 | Nothing is sent to a tenby10 cloud server | ✅ Verified (no such code exists yet) | No sync/HTTP-egress module in `daemon/src` |
-| 5 | The only outbound network is your **own** BYOK LLM, opt-in | ✅ Verified | [llm.rs](daemon/src/llm.rs), gated by [daemon.rs:432](daemon/src/daemon.rs#L432) |
+| 1 | No key **content** is captured (not a keylogger) | ✅ Verified in code | [daemon.rs:145](daemon/src/daemon.rs#L145) — `KeyPress(_)` discards the key value |
+| 2 | Only counts/metadata are stored per minute | ✅ Verified | [daemon.rs:334](daemon/src/daemon.rs#L334), [db.rs schema](daemon/src/db.rs) |
+| 3 | Raw screenshots never touch disk; only blurred JPEGs saved | ✅ Verified | [screen.rs:27-54](daemon/src/screen.rs#L27) |
+| 4 | Raw keystrokes, screenshots & window titles never leave the machine | ✅ Verified | Only signed slot *summaries* + your scoring config upload, and only once enrolled — [sync.rs](daemon/src/sync.rs) |
+| 5 | Cloud sync (when enrolled) is category/count summaries + hashes + config; your BYOK LLM is the only other egress | ✅ Verified | [sync.rs](daemon/src/sync.rs); LLM in [llm.rs](daemon/src/llm.rs), gated by [daemon.rs:570](daemon/src/daemon.rs#L570) |
 | 6 | Screenshots are never uploaded anywhere | ✅ Verified (stronger than claimed) | No image is attached to any LLM call — see Gap G1 |
 | 7 | Focus-scoring rules are deterministic and inspectable | ✅ Verified | [evaluator.rs](daemon/src/evaluator.rs), [entropy.rs](daemon/src/entropy.rs) |
 | 8 | Local logs are tamper-evident (full-payload hash chain) + self-signed when enrolled | ✅ Verified | [db.rs `insert_slot_summary`/`verify_ledger_integrity`](daemon/src/db.rs) |
 | — | Secrets stored in OS keychain | ✅ Verified | [config.rs `save_config`/`load_config`](daemon/src/config.rs) — `private_key` & `llm_api_key` kept in the OS keychain via the `keyring` crate |
 | — | Local dashboard makes no third-party calls | ✅ Verified | [dashboard.rs](daemon/src/dashboard.rs) — Outfit font embedded as a data URI; no CDN `<link>` |
 
-Bottom line: the core privacy claims — **no keylogging, no cloud exfiltration, local-only raw
-data** — hold up against the code. One honest gap remains between marketing copy and code (G1 below);
-it does not leak your keystrokes or raw screen, but it should be closed so the code matches what we say.
+Bottom line: the core privacy claims — **no keylogging, and your raw keystrokes, screenshots, and
+window titles never leave the machine** — hold up against the code. When you enroll and sync, signed
+10-minute *summaries* and your scoring configuration are uploaded to the cloud (§2); raw activity is
+not. One honest gap between marketing copy and code remains (G1 below).
 
 ---
 
@@ -44,22 +47,22 @@ it does not leak your keystrokes or raw screen, but it should be closed so the c
 `KeyPress(_)` — the underscore **discards** the actual key/character. All it does is `+1` a counter
 and record the *timing gap* between presses (for bot detection), never *what* was typed.
 
-- [daemon.rs:87-98](daemon/src/daemon.rs#L87) — `KeyPress(_)` → increment `keystroke_count`, push
+- [daemon.rs:145-155](daemon/src/daemon.rs#L145) — `KeyPress(_)` → increment `keystroke_count`, push
   the inter-key interval in ms. The keycode is pattern-matched away.
-- [daemon.rs:99-103](daemon/src/daemon.rs#L99) — mouse buttons and scroll are counted the same way
+- [daemon.rs:156-161](daemon/src/daemon.rs#L156) — mouse buttons and scroll are counted the same way
   (counts only).
-- [daemon.rs:105-118](daemon/src/daemon.rs#L105) — mouse *movement* stores `(x, y, timestamp)` for
+- [daemon.rs:162-175](daemon/src/daemon.rs#L162) — mouse *movement* stores `(x, y, timestamp)` for
   entropy analysis. This is cursor coordinates, not content.
-- A **second, listen-only** macOS tap in [provenance.rs](daemon/src/provenance.rs) (issue #87) reads
-  only the `kCGEventSourceStateID` field — whether an event came from real hardware vs. software
-  injection — and counts synthetic vs. genuine events. It never reads the key value either, and passes
-  every event through unchanged.
+- A **second, listen-only** tap in [provenance.rs](daemon/src/provenance.rs) (issue #87) — on macOS a
+  `CGEventTap` reading only `kCGEventSourceStateID`, on Windows low-level hooks reading only the
+  injected-event flag — classifies each event as real-hardware vs. software-injected and counts them.
+  It never reads the key value either, and passes every event through unchanged.
 
 An auditor should confirm there is **no** branch anywhere that reads the key value. Grep recipe in
 [How to verify](#how-to-verify).
 
 ### What a minute log actually contains
-Written once per 60s at [daemon.rs:235-244](daemon/src/daemon.rs#L235):
+Written once per 60s at [daemon.rs:334-343](daemon/src/daemon.rs#L334):
 
 | Field | Example | Sensitive? |
 |-------|---------|-----------|
@@ -73,40 +76,50 @@ Written once per 60s at [daemon.rs:235-244](daemon/src/daemon.rs#L235):
 | `low_entropy` | `false` | no |
 
 The one genuinely sensitive field is `active_window_title` (it can contain document names, email
-subjects, URLs). It is captured via [daemon.rs:56-73](daemon/src/daemon.rs#L56) (`active-win-pos-rs`)
-and stored **locally**. It only ever leaves the machine if you turn on BYOK LLM scoring (§2).
+subjects, URLs). It is captured via [daemon.rs:104-121](daemon/src/daemon.rs#L104) (`active-win-pos-rs`)
+and stored **locally**. It only ever leaves the machine if you turn on BYOK LLM scoring (§2); it is
+**never** part of the signed summary uploaded to the cloud.
 
 ---
 
 ## 2. What leaves your machine (network egress inventory)
 
-The daemon's dependencies that can make network calls are `reqwest` (LLM) and `axum`/`tower-http`
-(the *inbound* localhost dashboard server). There is **no** module that syncs telemetry to a tenby10
-cloud. The complete list of outbound calls:
+Nothing leaves the machine until you **enroll** and sync. The complete list of outbound calls:
 
-1. **Your own LLM provider — opt-in, BYOK.** [llm.rs](daemon/src/llm.rs) posts directly to
+1. **tenby10 cloud sync — only when enrolled.** Once you pair a device,
+   [sync.rs](daemon/src/sync.rs) uploads to the tenby10 cloud (`cloud_base_url()`,
+   [sync.rs:16](daemon/src/sync.rs#L16), default `https://tenby10.pivotalpoint.io`). This is reached
+   only when `config.agent_id` is set (guarded in [daemon.rs](daemon/src/daemon.rs)). Three things go
+   up, and nothing else:
+   - **Signed slot summaries** (`sync_signed_slots`, `POST /api/v1/slots`): per 10-minute slot — a
+     focus score, active/idle segment counts, keystroke/click **counts**, app-category **counts**, a
+     SHA-256 **hash** of the LLM reasoning (not the text), the effective-config hash, and the
+     hash-chain link + Ed25519 signature.
+   - **Enrollment** (`enroll_with_cloud`, [sync.rs:22](daemon/src/sync.rs#L22), `POST /api/v1/enroll`):
+     your pairing token and **public** key. The private key is generated locally and never leaves the
+     keychain.
+   - **Scoring config, on change** (`upload_config_if_needed`, `POST /api/v1/config`): the effective
+     config — your auditing rules (app lists, engine mode, synthetic-detection flag) and the AI auditor
+     prompt — so a relying party can see which rubric produced each score (#62).
+
+   **Never sent:** raw keystrokes, screenshot bytes, or window titles.
+
+2. **Your own LLM provider — opt-in, BYOK.** [llm.rs](daemon/src/llm.rs) posts directly to
    `api.openai.com` ([llm.rs:35](daemon/src/llm.rs#L35)), `api.anthropic.com`
    ([llm.rs:78](daemon/src/llm.rs#L78)), or `generativelanguage.googleapis.com`
-   ([llm.rs:132](daemon/src/llm.rs#L132)) using *your* API key. This path is reached **only** when:
-   - `engine_mode == "llm"` ([daemon.rs:432](daemon/src/daemon.rs#L432)), **and**
-   - a provider **and** key are configured ([llm.rs:152-155](daemon/src/llm.rs#L152) returns `None`
-     otherwise — default config ships empty, so the default is off).
-
-   When active, the payload is the activity text (app names, **window titles**, key/click counts) —
-   built at [daemon.rs:440-449](daemon/src/daemon.rs#L440). No screenshot bytes are included (§ Gap G1).
-
-2. **Enrollment is localhost-only and mocked.** The desktop "enroll" command posts to
-   `http://127.0.0.1:{port}/api/enroll` — the daemon's own Axum server, not a remote host — and key
-   generation happens locally with `ed25519-dalek`
-   ([desktop/src-tauri/src/lib.rs:74-93](desktop/src-tauri/src/lib.rs#L74)). No cloud enrollment
-   endpoint is contacted.
+   ([llm.rs:132](daemon/src/llm.rs#L132)) using *your* API key — this goes to your provider, not to
+   tenby10. Reached **only** when `engine_mode == "llm"`
+   ([daemon.rs:570](daemon/src/daemon.rs#L570)) **and** a provider + key are configured
+   ([llm.rs:152-155](daemon/src/llm.rs#L152) returns `None` otherwise — default config ships empty, so
+   the default is off). The payload is the activity text (app names, **window titles**, key/click
+   counts) — built at [daemon.rs:577-587](daemon/src/daemon.rs#L577). No screenshot bytes (§ Gap G1).
 
 3. **Dashboard webfont — self-hosted.** The dashboard font is embedded as a `data:` URI
    ([dashboard.rs](daemon/src/dashboard.rs)); opening the local dashboard makes **no** third-party
    requests.
 
-The privacy-safe aggregated cloud payload described in the engineering spec (§5.3) is **not yet
-implemented** in this repo — there is no code that uploads focus scores anywhere.
+What the cloud receives is category- and count-level summaries plus hashes and your config — never the
+raw keystrokes, screens, or window titles behind them.
 
 ---
 
@@ -114,16 +127,18 @@ implemented** in this repo — there is no code that uploads focus scores anywhe
 
 One screenshot per 10-minute slot, blurred in memory, raw bytes dropped before anything is written.
 
-- [screen.rs:20-45](daemon/src/screen.rs#L20) — captures via the macOS `screencapture` tool to
-  stdout. If permission is denied, it generates a gray placeholder (never silently retries).
-- [screen.rs:49-54](daemon/src/screen.rs#L49) — `imageops::blur(&raw_img, 20.0)` then
-  **`drop(raw_img)`** to purge the raw buffer.
-- [screen.rs:59-66](daemon/src/screen.rs#L59) — only the blurred image is saved, as JPEG, to
+- **macOS** ([screen.rs:61-83](daemon/src/screen.rs#L61)) captures via the `screencapture` tool to
+  stdout; **Windows** ([screen.rs:89-168](daemon/src/screen.rs#L89)) via a GDI `BitBlt`. On failure it
+  **returns an error** — it does *not* fabricate a placeholder. (An earlier version substituted a gray
+  800×600 image and reported success; that was removed so a denied grant surfaces honestly and
+  `screen_capture_ok` flips false — see [daemon.rs:262-270](daemon/src/daemon.rs#L262).)
+- [screen.rs:33](daemon/src/screen.rs#L33) — `imageops::blur(&raw_img, 20.0)`, then
+  **`drop(raw_img)`** ([screen.rs:36](daemon/src/screen.rs#L36)) purges the raw buffer.
+- [screen.rs:41-47](daemon/src/screen.rs#L41) — only the blurred image is saved, as JPEG, to
   `~/.tenby10/screenshots/slot_<ts>.jpg`.
 
-The raw, unblurred image is never passed to `save`. Note: screen capture is currently
-**macOS-only** (shells out to `screencapture`); there is no Windows/Linux capture path in
-[screen.rs](daemon/src/screen.rs) yet.
+The raw, unblurred image is never passed to `save`. Capture is **macOS + Windows**; there is no Linux
+capture path yet ([screen.rs:171](daemon/src/screen.rs#L171) returns an error on other platforms).
 
 ---
 
@@ -132,14 +147,14 @@ The raw, unblurred image is never passed to `save`. Note: screen capture is curr
 All classification is isolated in one pure module so it can be read and unit-tested without the
 capture loop ([decisions/0002](../decisions/0002-activity-evaluation-engine.md)). A minute is sorted
 into exactly one state by a fixed priority order in
-[evaluator.rs:53-113](daemon/src/evaluator.rs#L53):
+[evaluator.rs:114-167](daemon/src/evaluator.rs#L114):
 
 1. **Anti-cheat first** — mouse jiggler or keyboard macro → `Tampered`
-   ([evaluator.rs:54-60](daemon/src/evaluator.rs#L54)).
+   ([evaluator.rs:115-121](daemon/src/evaluator.rs#L115)).
 2. **Distraction** — active app/title matches your `distracting_apps` list → `Distracted`
-   ([evaluator.rs:62-76](daemon/src/evaluator.rs#L62)).
+   ([evaluator.rs:123-137](daemon/src/evaluator.rs#L123)).
 3. **Active** — any keystroke, click, or scroll → `Active`
-   ([evaluator.rs:78-83](daemon/src/evaluator.rs#L78)).
+   ([evaluator.rs:139-144](daemon/src/evaluator.rs#L139)).
 4. **Meeting** — no input but the active window is a genuine meeting → `Meeting`
    (`is_meeting_context` in [evaluator.rs](daemon/src/evaluator.rs)). Matching is hardened (#97): a
    **native meeting app** by application name, a **whole-word** title keyword (so "Meeting notes" is
@@ -151,7 +166,7 @@ into exactly one state by a fixed priority order in
    `aggregate_slot` in [daemon.rs](daemon/src/daemon.rs)). The bound also holds in LLM mode: demoted
    minutes are removed from the ceiling the LLM score may claim (`meeting_creditable_ceiling`).
 5. **Passive review** — no input but a `productive_apps` app *and* you were recently active →
-   `PassiveReview` ([evaluator.rs:97-109](daemon/src/evaluator.rs#L97)).
+   `PassiveReview` ([evaluator.rs:151-163](daemon/src/evaluator.rs#L151)).
 6. **Idle** otherwise.
 
 The lists (`distracting_apps`, `productive_apps`, `meeting_apps`) are **user-configurable** and live
@@ -172,15 +187,15 @@ and bias toward never flagging a real person:
 
 **Scoring is deterministic and forgiving of thinking time:**
 - Fixed 10-minute denominator so you can't game a 100% off one active minute
-  ([daemon.rs:424](daemon/src/daemon.rs#L424), [decisions/0006](../decisions/0006-focus-score-fixed-denominator.md)).
+  ([daemon.rs:562](daemon/src/daemon.rs#L562), [decisions/0006](../decisions/0006-focus-score-fixed-denominator.md)).
 - 5-minute delayed "idle forgiveness" for reading/thinking pauses at slot boundaries
-  ([daemon.rs:369-421](daemon/src/daemon.rs#L369), [decisions/0011](../decisions/0011-contextual-idle-forgiveness.md)).
+  ([daemon.rs:503-559](daemon/src/daemon.rs#L503), [decisions/0011](../decisions/0011-contextual-idle-forgiveness.md)).
 
 **The rules are locked by tests** — read these to see the intended behavior as executable spec:
-- [evaluator.rs:175-294](daemon/src/evaluator.rs#L175) — active / passive / idle / distraction / jiggler.
-- [entropy.rs:136-181](daemon/src/entropy.rs#L136) — human vs macro keyboard, human vs jiggler mouse.
-- [daemon.rs:546-811](daemon/src/daemon.rs#L546) — full-slot aggregation, partial-slot ADR-0006,
-  idle-forgiveness approved/rejected.
+- [evaluator.rs:226-459](daemon/src/evaluator.rs#L226) — active / passive / idle / distraction / jiggler.
+- [entropy.rs:204-390](daemon/src/entropy.rs#L204) — human vs macro keyboard, human vs jiggler mouse.
+- [daemon.rs:714-1331](daemon/src/daemon.rs#L714) — full-slot aggregation, partial-slot ADR-0006,
+  idle-forgiveness approved/rejected, and the v2 config-hash binding.
 
 Run them with `cd daemon && cargo test`.
 
@@ -191,9 +206,13 @@ Run them with `cd daemon && cargo test`.
 - Everything lives under `~/.tenby10/` (or `~/.tenby10_dev/` in debug); overridable via
   `TENBY10_HOME` — see [env.rs](daemon/src/env.rs).
 - Slot summaries are hash-chained with SHA-256 over a **canonical payload covering every stored
-  field** (score, segments, keystrokes, clicks, app categories, LLM reasoning, parent link) —
-  `canonical_slot_payload` in [db.rs](daemon/src/db.rs). Hand-editing *any* field of the SQLite file
-  breaks the chain; `verify_ledger_integrity` re-derives and compares it.
+  field** (score, segments, keystrokes, clicks, app categories, LLM reasoning hash, **effective-config
+  hash**, parent link) — `canonical_slot_payload` in [db.rs](daemon/src/db.rs). Hand-editing *any* field
+  of the SQLite file breaks the chain; `verify_ledger_integrity` re-derives and compares it.
+- **The scoring rubric is bound in (v2, #62).** The payload includes a SHA-256 of the effective config
+  (your auditing rules + AI auditor prompt), so a score can't be silently divorced from the rules that
+  produced it. The exact config is uploaded on change so a relying party can inspect it. Locked by
+  `test_v2_payload_binds_config_hash` and the cross-language vector `test_v2_canonical_vector_matches_cloud`.
 - Once you enroll, each slot is also **Ed25519-signed with your key** (private key in the OS
   keychain). This closes the obvious hole in a bare hash chain: an attacker who edits a row and then
   re-computes its hash to hide the edit still cannot produce a valid signature without your key, so
@@ -215,7 +234,7 @@ real mismatches to close:
 - **G1 — Screenshots are never actually sent to any LLM, even with the toggle on.** The
   `send_screenshots` flag ([config.rs:51](daemon/src/config.rs#L51), default `false`) is only
   interpolated into the LLM system prompt as text
-  ([daemon.rs:462-476](daemon/src/daemon.rs#L462)); no image bytes are attached in
+  ([daemon.rs:600-614](daemon/src/daemon.rs#L600)); no image bytes are attached in
   [llm.rs](daemon/src/llm.rs). So the multimodal path from
   [decisions/0005](../decisions/0005-byok-screenshot-llm-transmission.md) is **not wired up**.
   *Privacy-positive today*, but the toggle is misleading — it implies a data flow that doesn't exist.
@@ -238,11 +257,14 @@ Run these from the `client/` directory. Each is designed to *fail loudly* if a c
 #    Any match binding the key (e.g. `KeyPress(key)`) is a red flag to inspect.
 grep -rn "KeyPress" daemon/src/
 
-# 2. Full outbound-network inventory. Expect ONLY llm.rs (BYOK) — the dashboard font is now inlined.
+# 2. Full outbound-network inventory. Expect llm.rs (your BYOK provider) and sync.rs (tenby10 cloud
+#    sync, only when enrolled). The dashboard font is inlined, so the dashboard makes no requests.
 grep -rniE "reqwest|\.post\(|\.get\(|https?://" daemon/src/
 
-# 3. No tenby10 cloud sync endpoint anywhere in the client.
-grep -rniE "sync|/api/v1|ingest|upload|telemetry.*(post|send)" daemon/src/
+# 3. What the cloud sync actually sends: inspect the upload payloads. Confirm they carry only counts,
+#    category counts, hashes (reasoning_hash, config_hash), the config blob, and signatures — never
+#    raw keystrokes, screenshot bytes, or window titles.
+grep -n "json!" daemon/src/sync.rs
 
 # 4. Raw screenshot is dropped, never saved: `drop(raw_img)` before any `.save`.
 grep -n "drop(raw_img)\|save_with_format\|imageops::blur" daemon/src/screen.rs
