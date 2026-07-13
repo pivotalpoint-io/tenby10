@@ -72,6 +72,7 @@ pub fn sync_signed_slots(db: &Database, agent_id: &str, base_url: &str) -> Resul
                 "app_categories": slot.app_categories,
             },
             "reasoning_hash": sha256_hex_pub(slot.llm_reasoning.as_deref().unwrap_or("")),
+            "config_hash": slot.config_hash,
             "ledger": { "hash": slot.hash, "parent_hash": slot.parent_hash },
             "signature": slot.signature,
         });

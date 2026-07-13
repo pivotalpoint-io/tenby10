@@ -652,6 +652,10 @@ pub fn aggregate_slot(db: &Database, config: &crate::config::AgentConfig, slot_s
         })
     };
 
+    // Bind the effective scoring config (auditing rules + AI prompt) into the
+    // signed payload so every score is tied to the rubric that produced it (#62).
+    let config_hash = config.effective_config_hash();
+
     let slot_res = db.insert_slot_summary(
         slot_start,
         final_focus_score,
@@ -661,6 +665,7 @@ pub fn aggregate_slot(db: &Database, config: &crate::config::AgentConfig, slot_s
         slot_clicks,
         &app_categories_json,
         final_reasoning.as_deref(),
+        &config_hash,
         signer.as_ref(),
     );
 
