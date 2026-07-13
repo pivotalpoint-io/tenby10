@@ -26,6 +26,8 @@ permissions:
 jobs:
   notarize-check:
     name: Notarize a signed artifact and report
+    # Apple signing/notarization secrets live in the "Production" environment.
+    environment: Production
     runs-on: macos-latest
     timeout-minutes: 30
     steps:

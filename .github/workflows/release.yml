@@ -69,6 +69,8 @@ jobs:
 
   publish:
     name: Build & Publish Release
+    # Apple signing/notarization secrets live in the "Production" environment.
+    environment: Production
     needs: [daemon-test, desktop-test]
     strategy:
       matrix:
