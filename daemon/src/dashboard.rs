@@ -15,25 +15,6 @@ use crate::db::Database;
 
 // Icon will be included and encoded at runtime
 
-#[derive(Serialize, Deserialize)]
-struct DashboardData {
-    slots: Vec<SlotData>,
-}
-
-#[derive(Serialize, Deserialize)]
-struct SlotData {
-    slot_start: i64,
-    focus_score: u32,
-    active_segments: u32,
-    idle_segments: u32,
-    total_keystrokes: u32,
-    total_clicks: u32,
-    app_categories: serde_json::Value,
-    hash: String,
-    parent_hash: String,
-    llm_reasoning: Option<String>,
-}
-
 /// Start the Axum web server on a background thread.
 pub fn start_dashboard_server(db: Arc<Database>, port: u16) {
     let db_state = Arc::clone(&db);
@@ -83,42 +64,10 @@ pub fn start_dashboard_server(db: Arc<Database>, port: u16) {
 /// Handler to fetch slot summaries from SQLite.
 async fn get_dashboard_data(State(db): State<Arc<Database>>) -> impl IntoResponse {
     // We run the blocking SQLite queries in a spawn_blocking call
-    let data_res = tokio::task::spawn_blocking(move || {
-        let conn = db.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT slot_start, focus_score, active_segments, idle_segments, total_keystrokes, total_clicks, app_categories, hash, parent_hash, llm_reasoning 
-             FROM slot_summaries ORDER BY slot_start DESC LIMIT 1000"
-        )?;
-
-        let rows = stmt.query_map([], |row| {
-            let categories_str: String = row.get(6)?;
-            let categories_json: serde_json::Value = serde_json::from_str(&categories_str)
-                .unwrap_or(serde_json::json!({}));
-
-            Ok(SlotData {
-                slot_start: row.get(0)?,
-                focus_score: row.get(1)?,
-                active_segments: row.get(2)?,
-                idle_segments: row.get(3)?,
-                total_keystrokes: row.get(4)?,
-                total_clicks: row.get(5)?,
-                app_categories: categories_json,
-                hash: row.get(7)?,
-                parent_hash: row.get(8)?,
-                llm_reasoning: row.get(9).unwrap_or(None),
-            })
-        })?;
-
-        let mut slots = Vec::new();
-        for slot in rows.flatten() {
-            slots.push(slot);
-        }
-        Ok::<Vec<SlotData>, rusqlite::Error>(slots)
-    })
-    .await;
+    let data_res = tokio::task::spawn_blocking(move || db.get_recent_slot_summaries(1000)).await;
 
     match data_res {
-        Ok(Ok(slots)) => Json(DashboardData { slots }).into_response(),
+        Ok(Ok(slots)) => Json(serde_json::json!({ "slots": slots })).into_response(),
         _ => (
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             "Error querying database",
@@ -132,80 +81,13 @@ struct SlotDetailsQuery {
     start: i64,
 }
 
-#[derive(Serialize)]
-struct MinuteLogDetail {
-    timestamp: i64,
-    keystroke_count: u32,
-    mouse_click_count: u32,
-    scroll_event_count: u32,
-    mouse_movement_distance: f64,
-    active_app_name: String,
-    active_window_title: String,
-    low_entropy: bool,
-    state: String,
-}
-
 async fn get_slot_details(
     State(db): State<Arc<Database>>,
     axum::extract::Query(params): axum::extract::Query<SlotDetailsQuery>,
 ) -> impl IntoResponse {
     let slot_start = params.start;
-    let details_res = tokio::task::spawn_blocking(move || {
-        let conn = db.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT timestamp, keystroke_count, mouse_click_count, scroll_event_count, mouse_movement_distance, active_app_name, active_window_title, low_entropy 
-             FROM minute_logs 
-             WHERE timestamp >= ?1 AND timestamp < ?2 
-             ORDER BY timestamp ASC"
-        )?;
-
-        let rows = stmt.query_map([slot_start, slot_start + 600], |row| {
-            let low_entropy_int: i32 = row.get(7)?;
-            Ok(MinuteLogDetail {
-                timestamp: row.get(0)?,
-                keystroke_count: row.get(1)?,
-                mouse_click_count: row.get(2)?,
-                scroll_event_count: row.get(3)?,
-                mouse_movement_distance: row.get(4)?,
-                active_app_name: row.get(5)?,
-                active_window_title: row.get(6)?,
-                low_entropy: low_entropy_int != 0,
-                state: String::new(),
-            })
-        })?;
-
-        let mut config_path = crate::env::get_app_home();
-        config_path.push("config.json");
-        let config = crate::config::load_config(config_path).unwrap_or_default();
-        let evaluator = crate::evaluator::ActivityEvaluator::new();
-
-        let mut list = Vec::new();
-        for mut item in rows.flatten() {
-            let classification = evaluator.evaluate_stored_minute(&crate::evaluator::StoredEvaluationContext {
-                keystroke_count: item.keystroke_count,
-                mouse_click_count: item.mouse_click_count,
-                scroll_event_count: item.scroll_event_count,
-                active_app: &item.active_app_name,
-                active_title: &item.active_window_title,
-                low_entropy: item.low_entropy,
-                was_recently_active: false,
-                distracting_apps: &config.distracting_apps,
-                productive_apps: &config.productive_apps,
-                meeting_apps: &config.meeting_apps,
-            });
-            let state_str = match classification {
-                crate::evaluator::ActivityClassification::Active | crate::evaluator::ActivityClassification::PassiveReview => "Productive",
-                crate::evaluator::ActivityClassification::Meeting => "Meeting",
-                crate::evaluator::ActivityClassification::Distracted => "Waste",
-                crate::evaluator::ActivityClassification::Idle => "Inactive",
-                crate::evaluator::ActivityClassification::Tampered => "Tampered",
-            };
-            item.state = state_str.to_string();
-            list.push(item);
-        }
-        Ok::<Vec<MinuteLogDetail>, rusqlite::Error>(list)
-    })
-    .await;
+    let details_res =
+        tokio::task::spawn_blocking(move || db.get_slot_minute_details(slot_start)).await;
 
     match details_res {
         Ok(Ok(details)) => Json(details).into_response(),
@@ -247,46 +129,7 @@ async fn export_csv(
     let range_str = params.range.unwrap_or_else(|| "24h".to_string());
 
     let rows_res = tokio::task::spawn_blocking(move || {
-        let conn = db.conn.lock().unwrap();
-
-        let mut sql = "SELECT timestamp, active_app_name, active_window_title, keystroke_count, mouse_click_count, scroll_event_count, mouse_movement_distance, low_entropy, strftime('%Y/%m/%d %H:%M', timestamp, 'unixepoch', 'localtime')
-             FROM minute_logs".to_string();
-
-        match range_str.as_str() {
-            "7d" => { sql.push_str(" WHERE timestamp > strftime('%s', 'now') - 604800"); }
-            "30d" => { sql.push_str(" WHERE timestamp > strftime('%s', 'now') - 2592000"); }
-            "all" => {}
-            "custom" => {
-                let start = params.start.unwrap_or(0);
-                let end = params.end.unwrap_or(i64::MAX);
-                sql.push_str(&format!(" WHERE timestamp >= {} AND timestamp <= {}", start, end));
-            }
-            _ => { sql.push_str(" WHERE timestamp > strftime('%s', 'now') - 86400"); }
-        }
-
-        sql.push_str(" ORDER BY timestamp ASC");
-
-        let mut stmt = conn.prepare(&sql)?;
-
-        let rows = stmt.query_map([], |row| {
-            let timestamp: i64 = row.get(0)?;
-            let app: String = row.get(1)?;
-            let title: String = row.get(2)?;
-            let keys: i32 = row.get(3)?;
-            let clicks: i32 = row.get(4)?;
-            let scroll: i32 = row.get(5)?;
-            let dist: f64 = row.get(6)?;
-            let low_entropy: bool = row.get(7)?;
-            let datetime: String = row.get(8)?;
-            Ok(format!("{},\"{}\",\"{}\",{},{},{},{},{},{}", datetime, app.replace("\"", "\"\""), title.replace("\"", "\"\""), keys, clicks, scroll, dist, low_entropy, timestamp))
-        })?;
-
-        let mut lines = Vec::new();
-        lines.push(String::from("datetime,app_name,window_title,keystroke_count,mouse_click_count,scroll_event_count,mouse_movement_distance,low_entropy,epoch_timestamp"));
-        for line in rows.flatten() {
-            lines.push(line);
-        }
-        Ok::<String, rusqlite::Error>(lines.join("\n"))
+        db.export_minute_logs_csv(&range_str, params.start, params.end)
     })
     .await;
 

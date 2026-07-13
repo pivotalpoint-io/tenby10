@@ -269,5 +269,13 @@
       </div>
     </div>
   </main>
+
+  <!-- Activity dashboard: full-window in-app view (screenshots, slot details, CSV
+       export). Hosted in an isolated iframe so its stylesheet can't collide with
+       the settings UI. Shown in place of the metrics home — never a separate
+       window, never a browser. The src is set lazily on first open. -->
+  <div id="activity-view" style="display: none;">
+    <iframe id="activity-frame" title="Activity Dashboard"></iframe>
+  </div>
 </body>
 </html>

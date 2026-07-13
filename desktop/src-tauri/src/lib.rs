@@ -2,7 +2,6 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::thread;
 use tauri::{Emitter, Manager};
-use tauri_plugin_opener::OpenerExt;
 
 struct TrayState {
     toggle_item: tauri::menu::MenuItem<tauri::Wry>,
@@ -166,17 +165,128 @@ async fn get_today_metrics(
     })
 }
 
+/// Resize the main window when entering/leaving the in-window activity dashboard.
+/// The dashboard renders as a view *inside* the existing window (no browser, no
+/// second OS window); it just needs more room than the compact metrics home. When
+/// `expand` is true the window grows to fit the 24×6 slot grid; on exit it snaps
+/// back to the compact size and re-centers.
 #[tauri::command]
-async fn open_dashboard(app: tauri::AppHandle) -> Result<(), String> {
-    let app_home = daemon::env::get_app_home();
-    let mut config_path = app_home.clone();
-    config_path.push("config.json");
-    let config = daemon::config::load_config(config_path).unwrap_or_default();
-    let port = daemon::env::get_app_port(&config);
+async fn set_dashboard_mode(app: tauri::AppHandle, expand: bool) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window("main") {
+        let size = if expand {
+            tauri::LogicalSize::new(1200.0, 840.0)
+        } else {
+            tauri::LogicalSize::new(800.0, 600.0)
+        };
+        window
+            .set_size(tauri::Size::Logical(size))
+            .map_err(|e| e.to_string())?;
+        let _ = window.center();
+    }
+    Ok(())
+}
 
-    app.opener()
-        .open_path(format!("http://127.0.0.1:{}", port), None::<&str>)
-        .map_err(|e| e.to_string())
+/// Recent slot summaries for the dashboard (newest first).
+#[tauri::command]
+async fn dashboard_slots(
+    db: tauri::State<'_, Arc<daemon::db::Database>>,
+) -> Result<Vec<daemon::db::SlotSummaryView>, String> {
+    let db_clone = db.inner().clone();
+    tokio::task::spawn_blocking(move || db_clone.get_recent_slot_summaries(1000))
+        .await
+        .map_err(|e| format!("Task join error: {}", e))?
+        .map_err(|e| format!("Database error: {}", e))
+}
+
+/// Slot windows that have raw minute logs but no aggregated summary yet
+/// (i.e. the slot is still in progress / pending evaluation).
+#[tauri::command]
+async fn dashboard_pending_slots(
+    db: tauri::State<'_, Arc<daemon::db::Database>>,
+) -> Result<Vec<i64>, String> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let current_slot_start = now - (now % 600);
+
+    let db_clone = db.inner().clone();
+    tokio::task::spawn_blocking(move || db_clone.get_unaggregated_slots(current_slot_start))
+        .await
+        .map_err(|e| format!("Task join error: {}", e))?
+        .map_err(|e| format!("Database error: {}", e))
+}
+
+/// Classified minute-by-minute activity for a single 10-minute slot.
+#[tauri::command]
+async fn dashboard_slot_details(
+    db: tauri::State<'_, Arc<daemon::db::Database>>,
+    start: i64,
+) -> Result<Vec<daemon::db::SlotMinuteDetailView>, String> {
+    let db_clone = db.inner().clone();
+    tokio::task::spawn_blocking(move || db_clone.get_slot_minute_details(start))
+        .await
+        .map_err(|e| format!("Task join error: {}", e))?
+        .map_err(|e| format!("Database error: {}", e))
+}
+
+/// Return the blurred slot screenshot as a `data:` URL, or `None` if none was
+/// saved. Bytes are read from the local sandbox and inlined, so the view never
+/// reaches over HTTP for screen captures.
+#[tauri::command]
+async fn dashboard_screenshot(slot_start: i64) -> Result<Option<String>, String> {
+    let mut path = daemon::env::get_app_home();
+    path.push("screenshots");
+    path.push(format!("slot_{}.jpg", slot_start));
+
+    match tokio::task::spawn_blocking(move || std::fs::read(&path))
+        .await
+        .map_err(|e| format!("Task join error: {}", e))?
+    {
+        Ok(bytes) => {
+            use base64::{engine::general_purpose, Engine as _};
+            let b64 = general_purpose::STANDARD.encode(bytes);
+            Ok(Some(format!("data:image/jpeg;base64,{}", b64)))
+        }
+        // A missing file is the common case (no capture for that slot), not an error.
+        Err(_) => Ok(None),
+    }
+}
+
+/// Export minute logs as CSV via a native save dialog. Returns the saved path,
+/// or `None` if the user cancelled the dialog.
+#[tauri::command]
+async fn export_dashboard_csv(
+    app: tauri::AppHandle,
+    db: tauri::State<'_, Arc<daemon::db::Database>>,
+    range: String,
+    start: Option<i64>,
+    end: Option<i64>,
+) -> Result<Option<String>, String> {
+    let range_for_name = range.clone();
+    let db_clone = db.inner().clone();
+    let csv =
+        tokio::task::spawn_blocking(move || db_clone.export_minute_logs_csv(&range, start, end))
+            .await
+            .map_err(|e| format!("Task join error: {}", e))?
+            .map_err(|e| format!("Database error: {}", e))?;
+
+    use tauri_plugin_dialog::DialogExt;
+    let file_path = app
+        .dialog()
+        .file()
+        .add_filter("CSV", &["csv"])
+        .set_file_name(format!("tenby10_logs_{}.csv", range_for_name))
+        .blocking_save_file();
+
+    let Some(file_path) = file_path else {
+        // User cancelled the save dialog.
+        return Ok(None);
+    };
+
+    let path = file_path.into_path().map_err(|e| e.to_string())?;
+    std::fs::write(&path, csv).map_err(|e| e.to_string())?;
+    Ok(Some(path.to_string_lossy().to_string()))
 }
 
 #[tauri::command]
@@ -303,6 +413,7 @@ pub fn run() {
     // Start Tauri GUI app
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .manage(state.clone())
         .manage(db.clone())
         .invoke_handler(tauri::generate_handler![
@@ -310,7 +421,12 @@ pub fn run() {
             toggle_tracking,
             get_agent_status,
             get_today_metrics,
-            open_dashboard,
+            set_dashboard_mode,
+            dashboard_slots,
+            dashboard_pending_slots,
+            dashboard_slot_details,
+            dashboard_screenshot,
+            export_dashboard_csv,
             get_agent_config,
             save_agent_config,
             check_permissions,
