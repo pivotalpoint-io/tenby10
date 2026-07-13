@@ -62,7 +62,10 @@ The codebase is structured as a lightweight monorepo containing two core compone
 
 *   **In-Memory Screen Blurring**: The daemon captures the active screen once per 10-minute slot. The raw image buffer is immediately processed in-memory using a 20px Gaussian blur. Only the blurred low-resolution JPEG (~13 KB) is written to the disk. The raw screenshot is immediately discarded from memory and **never** hits the persistent storage.
 *   **Negligible Footprint**: Telemetry metrics consume under **700 KB per active workday** (~80 KB SQLite DB + ~624 KB blurred screenshots), translating to less than 170 MB of disk usage per year. No background database fragmentation or CPU spikes are caused by automated deletion/vacuum cycles.
-*   **Zero Portal Data Exposure**: The agent never streams raw screenshots, window titles, or keystroke characters to any central SaaS server. LLM evaluation prompts connect directly from your machine to your configured model endpoint.
+*   **On-device by default — you decide what leaves**: Nothing is uploaded until *you* choose to share verifiable reports (by enrolling a device). The split is deliberate:
+    - **Always stays on your machine**: raw keystrokes (only *counts* are kept — never the keys), the screen (blurred in memory; only a low-res blurred JPEG is saved), window titles, and the full activity database under `~/.tenby10/`.
+    - **Leaves only when you share a report**: signed 10-minute *summaries* (focus score, active/idle and input **counts**, app-category counts, a **hash** of any AI note) plus your scoring configuration — enough for a recipient to see the numbers and which rules produced them. Raw keystrokes, screenshots, and window titles are **never** uploaded.
+    - **Your own AI, opt-in and separate**: if you enable BYOK LLM scoring, activity text (including window titles) goes directly to *your* provider using *your* key — to your provider, never to tenby10.
 
 ---
 
