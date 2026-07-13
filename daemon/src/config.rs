@@ -1,6 +1,6 @@
 use ed25519_dalek::SigningKey;
 use keyring::Entry;
-use rand::RngCore;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
@@ -230,11 +230,12 @@ pub fn save_config(config_path: PathBuf, config: &AgentConfig) -> Result<(), Str
 
 /// Generate new cryptographic keys and return updated AgentConfig.
 pub fn generate_enrollment_keys(enrollment_token: &str) -> AgentConfig {
-    // ed25519-dalek 3.0 and rand 0.9 pull different `rand_core` versions, so no
+    // ed25519-dalek 3.0 and rand 0.10 pull different `rand_core` versions, so no
     // rand RNG satisfies `SigningKey::generate`'s `CryptoRng` bound directly.
     // Instead fill the 32-byte secret from the thread CSPRNG (auto-seeded from
-    // the OS, cryptographically secure, and infallible `RngCore` in rand 0.9 —
-    // unlike the now-fallible `OsRng`) and build the key from those bytes.
+    // the OS, cryptographically secure, and infallible via the `Rng` trait's
+    // `fill_bytes` — unlike the now-fallible `OsRng`) and build the key from
+    // those bytes.
     let mut secret_bytes = [0u8; 32];
     rand::rng().fill_bytes(&mut secret_bytes);
     let signing_key = SigningKey::from_bytes(&secret_bytes);
