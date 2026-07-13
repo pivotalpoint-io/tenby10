@@ -66,7 +66,9 @@ fn from_hex(s: &str) -> Option<Vec<u8>> {
 fn sha256_hex(data: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data.as_bytes());
-    format!("{:x}", hasher.finalize())
+    // sha2 0.11 returns a `hybrid-array` `Array` from `finalize()`, which no
+    // longer implements `LowerHex`; hex-encode the bytes directly instead.
+    to_hex_bytes(&hasher.finalize())
 }
 
 /// Deterministic byte-string that is both hashed (chain link) and signed for a
