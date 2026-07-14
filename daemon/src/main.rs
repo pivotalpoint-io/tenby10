@@ -120,23 +120,18 @@ fn reseal_and_sync(
         return 0;
     }
 
-    // The local "config uploaded" markers can lie (nothing had ever synced), so force a re-send.
-    if let Err(err) = db.forget_uploaded_configs() {
-        eprintln!("WARN: could not clear config-upload markers: {err}");
+    // Each resealed slot carries its own config_hash; sync backfills whichever configs the cloud
+    // is missing via the 428 retry (#80), so no config pre-upload here. Persist the current config
+    // blob so slots scored under it (the common case) can be backfilled even if they predate the
+    // local config-blob store.
+    if let Err(err) = db.store_config_blob(
+        &config.effective_config_hash(),
+        &config.effective_config_blob(),
+    ) {
+        eprintln!("WARN: could not persist current config blob: {err}");
     }
 
     let base = daemon::sync::cloud_base_url();
-    if let Err(err) = daemon::sync::upload_config_if_needed(
-        &db,
-        &config.agent_id,
-        &base,
-        &config.effective_config_blob(),
-        &config.effective_config_hash(),
-    ) {
-        eprintln!("ERROR: config upload failed: {err}");
-        return 1;
-    }
-
     match daemon::sync::sync_signed_slots(&db, &config.agent_id, &base) {
         Ok(uploaded) => {
             println!("Uploaded {uploaded} slot(s) to {base}.");

@@ -657,6 +657,11 @@ pub fn aggregate_slot(db: &Database, config: &crate::config::AgentConfig, slot_s
     // Compute both from the same blob so config_hash == sha256(blob), which the cloud verifies.
     let config_blob = config.effective_config_blob();
     let config_hash = crate::db::sha256_hex_pub(&config_blob);
+    // Persist the blob keyed by hash so this slot (or an old one in the backlog) can be backfilled
+    // to the cloud on demand later, even after the config changes (#80).
+    if let Err(e) = db.store_config_blob(&config_hash, &config_blob) {
+        eprintln!("[Config] could not persist config blob: {e}");
+    }
 
     let slot_res = db.insert_slot_summary(
         slot_start,
@@ -683,19 +688,12 @@ pub fn aggregate_slot(db: &Database, config: &crate::config::AgentConfig, slot_s
         );
     }
 
-    // Upload any not-yet-synced signed slots (best-effort; #115). Skips when not enrolled.
+    // Upload any not-yet-synced signed slots (best-effort; #115). Skips when not enrolled. Each
+    // slot carries its config_hash; if the cloud doesn't yet have that config it rejects the slot,
+    // and sync backfills the config from the local store before retrying (#80) — no speculative
+    // pre-upload, no local "already sent" cache to go stale.
     if !config.agent_id.is_empty() {
         let base = crate::sync::cloud_base_url();
-        // Send the effective config first so the slots' config_hash resolves server-side (#62).
-        if let Err(e) = crate::sync::upload_config_if_needed(
-            db,
-            &config.agent_id,
-            &base,
-            &config_blob,
-            &config_hash,
-        ) {
-            eprintln!("[Sync] {e}");
-        }
         match crate::sync::sync_signed_slots(db, &config.agent_id, &base) {
             Ok(n) if n > 0 => println!("[Sync] Uploaded {n} slot(s) to the cloud."),
             Ok(_) => {}
