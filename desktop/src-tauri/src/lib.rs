@@ -92,8 +92,14 @@ fn perform_toggle_tracking(app: &tauri::AppHandle) -> Result<bool, String> {
 /// the pairing token + public key for the cloud agent id, and stores it.
 #[tauri::command]
 async fn enroll_agent(token: String) -> Result<String, String> {
-    // 1. Generate the local keypair (private key kept on-device).
-    let mut config = daemon::config::generate_enrollment_keys(&token);
+    let app_home = daemon::env::get_app_home();
+    let mut config_path = app_home.clone();
+    config_path.push("config.json");
+
+    // 1. Reuse the device's existing keypair on re-pair (first pair generates one). Rotating the
+    //    key would orphan slots already signed under the old key, since the cloud validates
+    //    signatures against the agent's registered key.
+    let mut config = daemon::config::config_for_enrollment(config_path.clone(), &token);
 
     // 2. Exchange the token + public key for the cloud agent id.
     let base = daemon::sync::cloud_base_url();
@@ -101,9 +107,6 @@ async fn enroll_agent(token: String) -> Result<String, String> {
     config.agent_id = agent_id;
 
     // 3. Save config locally in ~/.tenby10/config.json.
-    let app_home = daemon::env::get_app_home();
-    let mut config_path = app_home.clone();
-    config_path.push("config.json");
     daemon::config::save_config(config_path, &config)
         .map_err(|err| format!("Failed to save local configuration: {}", err))?;
 

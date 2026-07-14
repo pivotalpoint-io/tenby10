@@ -311,6 +311,22 @@ pub fn generate_enrollment_keys(enrollment_token: &str) -> AgentConfig {
     }
 }
 
+/// Build the config to enroll with, reusing the device's existing keypair when one is already
+/// stored (a re-pair). The cloud validates slot signatures against the agent's registered key,
+/// so rotating the key on every re-pair would orphan the signed ledger; keeping one stable
+/// signing identity across re-pairs avoids that. A fresh keypair is generated only on first
+/// enrollment (no key stored yet). The caller fills `agent_id` from the enrollment response.
+pub fn config_for_enrollment(config_path: PathBuf, enrollment_token: &str) -> AgentConfig {
+    match load_config(config_path) {
+        Ok(existing) if !existing.private_key.is_empty() && !existing.public_key.is_empty() => {
+            let mut config = existing;
+            config.enrollment_token = enrollment_token.to_string();
+            config
+        }
+        _ => generate_enrollment_keys(enrollment_token),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -442,6 +458,54 @@ mod tests {
         );
         // Non-secret fields survive the migration.
         assert!(on_disk.contains("agent_legacy"));
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_config_for_enrollment_reuses_existing_keypair() {
+        use_mock_keychain();
+        let path = temp_config_path();
+
+        // An already-enrolled device. Keys are written inline so the reused values come from the
+        // file (the legacy-plaintext path takes precedence over the shared mock keychain slot),
+        // keeping the test deterministic under parallel runs.
+        let existing = r#"{
+            "agent_id": "agent_old",
+            "enrollment_token": "first_token",
+            "public_key": "aabbccdd_pub",
+            "private_key": "aabbccdd_priv"
+        }"#;
+        fs::write(&path, existing).unwrap();
+
+        // Re-pair with a new token: the stored keypair must be reused, only the token refreshed.
+        let repair = config_for_enrollment(path.clone(), "second_token");
+        assert_eq!(
+            repair.public_key, "aabbccdd_pub",
+            "public key must be reused"
+        );
+        assert_eq!(
+            repair.private_key, "aabbccdd_priv",
+            "private key must be reused"
+        );
+        assert_eq!(
+            repair.enrollment_token, "second_token",
+            "token should be updated"
+        );
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_config_for_enrollment_generates_when_no_key_stored() {
+        use_mock_keychain();
+        let path = temp_config_path();
+
+        // No config on disk yet (first-ever pair) → a fresh keypair is minted.
+        let config = config_for_enrollment(path.clone(), "tok");
+        assert!(!config.public_key.is_empty());
+        assert!(!config.private_key.is_empty());
+        assert_eq!(config.enrollment_token, "tok");
 
         let _ = fs::remove_file(&path);
     }
