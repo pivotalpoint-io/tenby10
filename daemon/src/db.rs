@@ -313,10 +313,11 @@ impl Database {
             "ALTER TABLE slot_summaries ADD COLUMN config_hash TEXT NOT NULL DEFAULT ''",
             [],
         );
-        // Tracks which effective-config blobs have already been uploaded to the cloud (#62),
-        // so each distinct config is sent once (on change) rather than every sync.
+        // The effective-config blob for every hash we've scored a slot under, so any slot can be
+        // backfilled to the cloud on demand — even after the config later changes (#80). The cloud
+        // rejects a slot whose config it lacks; we look the blob up here and upload it, then retry.
         conn.execute(
-            "CREATE TABLE IF NOT EXISTS synced_configs (config_hash TEXT PRIMARY KEY)",
+            "CREATE TABLE IF NOT EXISTS config_blobs (config_hash TEXT PRIMARY KEY, blob TEXT NOT NULL)",
             [],
         )?;
 
@@ -388,31 +389,27 @@ impl Database {
         rows.collect()
     }
 
-    /// Whether an effective-config blob with this hash has already been uploaded (#62).
-    pub fn is_config_uploaded(&self, config_hash: &str) -> Result<bool> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT 1 FROM synced_configs WHERE config_hash = ?1")?;
-        let mut rows = stmt.query(params![config_hash])?;
-        Ok(rows.next()?.is_some())
-    }
-
-    /// Record that the cloud accepted a config blob, so it is not re-uploaded.
-    pub fn mark_config_uploaded(&self, config_hash: &str) -> Result<()> {
+    /// Persist the effective-config blob for a hash so any slot referencing it can be backfilled to
+    /// the cloud on demand, even after the config later changes (#80). Idempotent; keyed by the
+    /// content hash, so re-storing the same (hash, blob) is a no-op.
+    pub fn store_config_blob(&self, config_hash: &str, blob: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT OR IGNORE INTO synced_configs (config_hash) VALUES (?1)",
-            params![config_hash],
+            "INSERT OR IGNORE INTO config_blobs (config_hash, blob) VALUES (?1, ?2)",
+            params![config_hash, blob],
         )?;
         Ok(())
     }
 
-    /// Drop every "config uploaded" marker so the next sync re-sends the effective config. Used
-    /// by [`Self::reseal_from`], where the local markers can claim a config was uploaded that the
-    /// cloud never actually received (nothing had ever synced).
-    pub fn forget_uploaded_configs(&self) -> Result<()> {
+    /// The stored effective-config blob for a hash, or `None` if we never scored a slot under it.
+    pub fn get_config_blob(&self, config_hash: &str) -> Result<Option<String>> {
         let conn = self.conn.lock().unwrap();
-        conn.execute("DELETE FROM synced_configs", [])?;
-        Ok(())
+        let mut stmt = conn.prepare("SELECT blob FROM config_blobs WHERE config_hash = ?1")?;
+        let mut rows = stmt.query(params![config_hash])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(row.get(0)?)),
+            None => Ok(None),
+        }
     }
 
     /// One-shot recovery (#19): re-base the ledger suffix `slot_start >= from` into a fresh chain
@@ -1010,14 +1007,20 @@ pub struct SlotMinuteDetailView {
 mod tests {
     use super::*;
     use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::sync::atomic::{AtomicU64, Ordering};
 
+    /// A unique test-DB path per call: process id + a monotonic counter. A nanosecond timestamp
+    /// (the previous scheme) could collide under parallel test execution — two tests then shared
+    /// one SQLite file and one test's slots leaked into another's, flaking `reseal_from` counts.
     fn create_test_db() -> Database {
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path = PathBuf::from(format!("/tmp/tenby10_test_{}.db", timestamp));
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let unique = format!(
+            "{}_{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        let path = PathBuf::from(format!("/tmp/tenby10_test_{unique}.db"));
+        let _ = std::fs::remove_file(&path); // clear any stale file (pid reuse across runs)
         Database::new(path).unwrap()
     }
 
@@ -1279,6 +1282,27 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855|CONFIGHASH|PARE
                 c.name
             );
         }
+    }
+
+    #[test]
+    fn test_config_blob_store_roundtrip() {
+        let db = create_test_db();
+        // Unknown hash -> None (the cloud would 428, and there'd be nothing to backfill).
+        assert_eq!(db.get_config_blob("deadbeef").unwrap(), None);
+
+        let blob = "{\"config_scheme\":2,\"aggregation_version\":1}";
+        db.store_config_blob("deadbeef", blob).unwrap();
+        assert_eq!(
+            db.get_config_blob("deadbeef").unwrap().as_deref(),
+            Some(blob)
+        );
+
+        // Idempotent: re-storing the same hash keeps the blob and does not error.
+        db.store_config_blob("deadbeef", blob).unwrap();
+        assert_eq!(
+            db.get_config_blob("deadbeef").unwrap().as_deref(),
+            Some(blob)
+        );
     }
 
     #[test]
