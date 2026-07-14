@@ -1007,14 +1007,20 @@ pub struct SlotMinuteDetailView {
 mod tests {
     use super::*;
     use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::sync::atomic::{AtomicU64, Ordering};
 
+    /// A unique test-DB path per call: process id + a monotonic counter. A nanosecond timestamp
+    /// (the previous scheme) could collide under parallel test execution — two tests then shared
+    /// one SQLite file and one test's slots leaked into another's, flaking `reseal_from` counts.
     fn create_test_db() -> Database {
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path = PathBuf::from(format!("/tmp/tenby10_test_{}.db", timestamp));
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let unique = format!(
+            "{}_{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        let path = PathBuf::from(format!("/tmp/tenby10_test_{unique}.db"));
+        let _ = std::fs::remove_file(&path); // clear any stale file (pid reuse across runs)
         Database::new(path).unwrap()
     }
 
