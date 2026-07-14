@@ -1,0 +1,31 @@
+{
+  "aggregation_version": 1,
+  "note": "Golden vectors for ADR 0017 aggregation semantics v1. Mirrored byte-for-byte between tenby10-cloud (src/lib/aggregation.ts) and the client repo (daemon/src/db.rs, test_aggregation_vectors). v1 = logged: focus>0; billable: focus>=40; focus_avg: mean over logged; minutes: count*10.",
+  "cases": [
+    {
+      "name": "empty — no slots",
+      "focus_scores": [],
+      "expected": { "logged": 0, "billable": 0, "focus_avg": 0, "billable_minutes": 0 }
+    },
+    {
+      "name": "all idle — every focus 0 is dropped",
+      "focus_scores": [0, 0, 0],
+      "expected": { "logged": 0, "billable": 0, "focus_avg": 0, "billable_minutes": 0 }
+    },
+    {
+      "name": "gate boundary — 39 does not bill, 40 does",
+      "focus_scores": [39, 40],
+      "expected": { "logged": 2, "billable": 1, "focus_avg": 40, "billable_minutes": 10 }
+    },
+    {
+      "name": "mixed with idle — idle dropped from logged and average",
+      "focus_scores": [0, 10, 40, 70, 100],
+      "expected": { "logged": 4, "billable": 3, "focus_avg": 55, "billable_minutes": 30 }
+    },
+    {
+      "name": "realistic — one idle, four billable of six logged",
+      "focus_scores": [0, 10, 40, 70, 30, 40, 70],
+      "expected": { "logged": 6, "billable": 4, "focus_avg": 43, "billable_minutes": 40 }
+    }
+  ]
+}

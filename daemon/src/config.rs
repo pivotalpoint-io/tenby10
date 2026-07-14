@@ -68,6 +68,10 @@ pub struct AgentConfig {
 #[derive(serde::Serialize)]
 pub struct EffectiveConfig<'a> {
     pub config_scheme: u32,
+    /// Which aggregation-semantics version scores/aggregates these slots (ADR 0017). Lets any
+    /// out-of-process consumer (the cloud verifier) interpret the derived numbers — billable,
+    /// logged, focus % — under the exact rules that produced them, instead of guessing.
+    pub aggregation_version: u32,
     pub engine_mode: &'a str,
     pub distracting_apps: &'a str,
     pub productive_apps: &'a str,
@@ -77,7 +81,12 @@ pub struct EffectiveConfig<'a> {
 }
 
 /// Versions the effective-config serialization independently of the ledger scheme.
-pub const EFFECTIVE_CONFIG_SCHEME: u32 = 1;
+/// Scheme 2 (ADR 0017) adds `aggregation_version`; scheme-1 blobs are read as aggregation v1.
+pub const EFFECTIVE_CONFIG_SCHEME: u32 = 2;
+
+/// Aggregation-semantics version these slots are scored/aggregated under (ADR 0017). Bump only
+/// alongside a new `aggregate_v*` in `db.rs` and a new golden vector — never edit v1 in place.
+pub const AGGREGATION_VERSION: u32 = 1;
 
 impl AgentConfig {
     /// Canonical JSON blob of the effective scoring config (fixed field order,
@@ -87,6 +96,7 @@ impl AgentConfig {
     pub fn effective_config_blob(&self) -> String {
         serde_json::to_string(&EffectiveConfig {
             config_scheme: EFFECTIVE_CONFIG_SCHEME,
+            aggregation_version: AGGREGATION_VERSION,
             engine_mode: &self.engine_mode,
             distracting_apps: &self.distracting_apps,
             productive_apps: &self.productive_apps,

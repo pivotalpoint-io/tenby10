@@ -9,6 +9,15 @@ use daemon::db::Database;
 async fn main() {
     let args: Vec<String> = env::args().collect();
     let is_verify = args.iter().any(|arg| arg == "--verify" || arg == "-v");
+    // `--reseal <from_unix>`: one-shot recovery of an orphaned pre-sync ledger (#19).
+    let reseal_from = args
+        .iter()
+        .position(|a| a == "--reseal")
+        .and_then(|i| args.get(i + 1))
+        .map(|v| {
+            v.parse::<i64>()
+                .expect("--reseal needs a unix timestamp argument")
+        });
 
     let app_home = daemon::env::get_app_home();
     let mut db_path = app_home.clone();
@@ -17,6 +26,13 @@ async fn main() {
     let mut config_path = app_home.clone();
     config_path.push("config.json");
     let config = daemon::config::load_config(config_path).unwrap_or_default();
+
+    if let Some(from) = reseal_from {
+        // Run the whole recovery on a plain thread: the sync path uses blocking HTTP, which must
+        // not run inside the async runtime.
+        let handle = std::thread::spawn(move || reseal_and_sync(db_path, config, from));
+        std::process::exit(handle.join().expect("reseal thread panicked"));
+    }
 
     if is_verify {
         println!("Verifying database integrity at {:?}...", db_path);
@@ -56,4 +72,82 @@ async fn main() {
 
     // Start the main loop (this blocks and runs indefinitely)
     start_daemon_loop(db, state);
+}
+
+/// One-shot `--reseal` recovery (#19): re-chain + re-sign the ledger suffix `>= from` under the
+/// current key, force the effective config to re-upload, then sync. Returns a process exit code.
+fn reseal_and_sync(
+    db_path: std::path::PathBuf,
+    config: daemon::config::AgentConfig,
+    from: i64,
+) -> i32 {
+    use daemon::db::SlotSigner;
+
+    if config.agent_id.is_empty() {
+        eprintln!("ERROR: not enrolled — nothing to reseal to.");
+        return 2;
+    }
+    if config.public_key.is_empty() || config.private_key.is_empty() {
+        eprintln!("ERROR: no signing key in config/keychain — cannot re-sign.");
+        return 2;
+    }
+
+    let db = match Database::new(db_path) {
+        Ok(db) => db,
+        Err(err) => {
+            eprintln!("ERROR: failed to open database: {err}");
+            return 2;
+        }
+    };
+
+    let signer = SlotSigner {
+        public_key: &config.public_key,
+        private_key: &config.private_key,
+    };
+    let n = match db.reseal_from(from, &signer) {
+        Ok(n) => n,
+        Err(err) => {
+            eprintln!("ERROR: reseal failed: {err}");
+            return 2;
+        }
+    };
+    println!(
+        "Resealed {n} slot(s) from {from} under key {}.",
+        config.public_key
+    );
+    if n == 0 {
+        println!("No slots in range — nothing to upload.");
+        return 0;
+    }
+
+    // The local "config uploaded" markers can lie (nothing had ever synced), so force a re-send.
+    if let Err(err) = db.forget_uploaded_configs() {
+        eprintln!("WARN: could not clear config-upload markers: {err}");
+    }
+
+    let base = daemon::sync::cloud_base_url();
+    if let Err(err) = daemon::sync::upload_config_if_needed(
+        &db,
+        &config.agent_id,
+        &base,
+        &config.effective_config_blob(),
+        &config.effective_config_hash(),
+    ) {
+        eprintln!("ERROR: config upload failed: {err}");
+        return 1;
+    }
+
+    match daemon::sync::sync_signed_slots(&db, &config.agent_id, &base) {
+        Ok(uploaded) => {
+            println!("Uploaded {uploaded} slot(s) to {base}.");
+            if let Ok(head) = db.get_latest_slot_hash() {
+                println!("Ledger head is now 0x{}", head.get(..8).unwrap_or(&head));
+            }
+            0
+        }
+        Err(err) => {
+            eprintln!("ERROR: slot sync failed: {err}");
+            1
+        }
+    }
 }

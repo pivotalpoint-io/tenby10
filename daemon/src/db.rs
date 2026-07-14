@@ -11,6 +11,42 @@ use std::sync::Mutex;
 /// green/orange/red band boundary.
 pub const BILLABLE_FOCUS_THRESHOLD: u32 = 40;
 
+/// Aggregation semantics **v1** (ADR 0017 = ADR 0012 + ADR 0013), as a pure function over
+/// per-slot focus scores so it is the single, golden-vector-tested definition. The cloud verifier
+/// mirrors this exactly (`tenby10-cloud/src/lib/aggregation.ts`) and both CIs assert the same
+/// fixture, so the two can't silently drift.
+///   - logged  = slots with `focus_score > 0` (fully-idle dropped)
+///   - billable = logged slots with `focus_score >= 40`
+///   - focus_avg = mean focus over logged slots
+///   - billable_minutes = billable × 10 (ADR 0007)
+#[derive(Debug, PartialEq, Eq)]
+pub struct AggregatesV1 {
+    pub logged: u32,
+    pub billable: u32,
+    pub focus_avg: u32,
+    pub billable_minutes: u32,
+}
+
+pub fn aggregate_v1(focus_scores: &[u32]) -> AggregatesV1 {
+    let logged: Vec<u32> = focus_scores.iter().copied().filter(|&f| f > 0).collect();
+    let logged_count = logged.len() as u32;
+    let billable = logged
+        .iter()
+        .filter(|&&f| f >= BILLABLE_FOCUS_THRESHOLD)
+        .count() as u32;
+    let focus_avg = if logged_count > 0 {
+        (logged.iter().map(|&f| f as f64).sum::<f64>() / logged_count as f64).round() as u32
+    } else {
+        0
+    };
+    AggregatesV1 {
+        logged: logged_count,
+        billable,
+        focus_avg,
+        billable_minutes: billable * 10,
+    }
+}
+
 /// Version of the slot signing/hashing scheme (ADR 0014). Bumped when the
 /// canonical payload format changes so old rows still verify under their scheme.
 /// v2 (#62) binds the effective-config hash into the payload; v1 rows omit it.
@@ -42,6 +78,20 @@ pub struct SignedSlot {
     pub scheme_version: u32,
     /// SHA-256 of the effective-config blob in force for this slot (v2+; "" for v1).
     pub config_hash: String,
+}
+
+/// The signable fields of a stored slot, read back for re-chaining in [`Database::reseal_from`].
+struct StoredSlotRow {
+    slot_start: i64,
+    focus_score: u32,
+    active_segments: u32,
+    idle_segments: u32,
+    total_keystrokes: u32,
+    total_clicks: u32,
+    app_categories: String,
+    llm_reasoning: Option<String>,
+    config_hash: String,
+    scheme_version: u32,
 }
 
 /// SHA-256 of a string as lowercase hex — matches the canonical payload's field folding.
@@ -356,6 +406,106 @@ impl Database {
         Ok(())
     }
 
+    /// Drop every "config uploaded" marker so the next sync re-sends the effective config. Used
+    /// by [`Self::reseal_from`], where the local markers can claim a config was uploaded that the
+    /// cloud never actually received (nothing had ever synced).
+    pub fn forget_uploaded_configs(&self) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM synced_configs", [])?;
+        Ok(())
+    }
+
+    /// One-shot recovery (#19): re-base the ledger suffix `slot_start >= from` into a fresh chain
+    /// under the current key so it can finally sync, and neutralize the orphaned prefix.
+    ///
+    /// Why this exists: slots captured before enrollment (unsigned) or under a rotated key leave a
+    /// chain that doesn't start at genesis and/or isn't signed by the agent's registered key. The
+    /// cloud requires a contiguous chain from `parent_hash=""` under that key, and the client
+    /// uploads oldest-first and stops at the first rejection — so the whole ledger is stuck.
+    ///
+    /// What it does, in one transaction:
+    ///   1. Marks every slot *before* `from` as `synced` so the orphaned prefix can't block the
+    ///      oldest-first sync (those slots are abandoned, never uploaded).
+    ///   2. Re-chains the `>= from` window in `slot_start` order: the first slot gets
+    ///      `parent_hash=""`, every slot is re-hashed with `signer`'s public key folded into the
+    ///      canonical payload (matching [`canonical_slot_payload`]) and re-signed, and `synced`
+    ///      is reset to 0 so the normal sync sends them.
+    ///
+    /// The stored metrics/timestamps are untouched — only the chain links, signature, and signing
+    /// key are rewritten. Returns the number of slots resealed. **Only safe before the current key
+    /// has ever successfully synced**, since it rewrites history the cloud would otherwise pin.
+    pub fn reseal_from(&self, from: i64, signer: &SlotSigner) -> Result<usize> {
+        let sk_bytes: [u8; 32] = from_hex(signer.private_key)
+            .and_then(|b| b.try_into().ok())
+            .ok_or_else(|| {
+                rusqlite::Error::InvalidParameterName("signer private_key is not 32 bytes".into())
+            })?;
+        let sk = SigningKey::from_bytes(&sk_bytes);
+
+        let conn = self.conn.lock().unwrap();
+        conn.execute_batch("BEGIN")?;
+
+        // 1. Abandon the orphaned prefix so it can never poison the oldest-first sync.
+        conn.execute(
+            "UPDATE slot_summaries SET synced = 1 WHERE slot_start < ?1",
+            params![from],
+        )?;
+
+        // 2. Load the window in chain order, then re-chain + re-sign it from genesis.
+        let rows: Vec<StoredSlotRow> = {
+            let mut stmt = conn.prepare(
+                "SELECT slot_start, focus_score, active_segments, idle_segments, total_keystrokes,
+                        total_clicks, app_categories, llm_reasoning, config_hash, scheme_version
+                 FROM slot_summaries WHERE slot_start >= ?1 ORDER BY slot_start ASC",
+            )?;
+            let mapped = stmt.query_map(params![from], |r| {
+                Ok(StoredSlotRow {
+                    slot_start: r.get(0)?,
+                    focus_score: r.get(1)?,
+                    active_segments: r.get(2)?,
+                    idle_segments: r.get(3)?,
+                    total_keystrokes: r.get(4)?,
+                    total_clicks: r.get(5)?,
+                    app_categories: r.get(6)?,
+                    llm_reasoning: r.get(7)?,
+                    config_hash: r.get(8)?,
+                    scheme_version: r.get(9)?,
+                })
+            })?;
+            mapped.collect::<Result<_>>()?
+        };
+
+        let mut parent = String::new();
+        for row in &rows {
+            let payload = canonical_slot_payload(
+                row.scheme_version,
+                row.slot_start,
+                row.focus_score,
+                row.active_segments,
+                row.idle_segments,
+                row.total_keystrokes,
+                row.total_clicks,
+                &row.app_categories,
+                row.llm_reasoning.as_deref(),
+                &parent,
+                signer.public_key,
+                &row.config_hash,
+            );
+            let hash = sha256_hex(&payload);
+            let signature = to_hex_bytes(&sk.sign(payload.as_bytes()).to_bytes());
+            conn.execute(
+                "UPDATE slot_summaries
+                 SET hash = ?1, parent_hash = ?2, signature = ?3, signing_pubkey = ?4, synced = 0
+                 WHERE slot_start = ?5",
+                params![hash, parent, signature, signer.public_key, row.slot_start],
+            )?;
+            parent = hash;
+        }
+
+        conn.execute_batch("COMMIT")?;
+        Ok(rows.len())
+    }
+
     /// Mark a slot as uploaded so it is not sent again.
     pub fn mark_slot_synced(&self, slot_start: i64) -> Result<()> {
         let conn = self.conn.lock().unwrap();
@@ -474,54 +624,37 @@ impl Database {
 
         let mut rows = stmt.query(params![start_of_day_timestamp])?;
 
-        let mut sum_focus = 0.0;
+        // Total inputs count activity from every slot, logged or not. The logged / billable /
+        // focus definitions all come from the shared v1 aggregator, so they can't drift from the
+        // cloud verifier or the golden vectors (ADR 0017).
         let mut keystrokes = 0;
         let mut clicks = 0;
-        let mut logged_scores = Vec::new();
-        let mut billable_count = 0;
+        let mut all_focus = Vec::new();
 
         while let Some(row) = rows.next()? {
             let focus_score: u32 = row.get(0)?;
             let k: u32 = row.get(1)?;
             let c: u32 = row.get(2)?;
-
-            // Total inputs count activity from every slot, logged or not.
             keystrokes += k;
             clicks += c;
-
-            // A slot is "logged" only if it holds at least one productive minute
-            // (focus_score > 0). Fully-idle slots are dropped so that every headline
-            // number reconstructs by counting 10-minute slots.
-            if focus_score == 0 {
-                continue;
-            }
-
-            sum_focus += focus_score as f64;
-            logged_scores.push(focus_score);
-            // A slot bills only if it cleared the focus gate (ADR 0012).
-            if focus_score >= BILLABLE_FOCUS_THRESHOLD {
-                billable_count += 1;
-            }
+            all_focus.push(focus_score);
         }
 
-        let logged_count = logged_scores.len() as u32;
-        let avg_focus = if logged_count > 0 {
-            (sum_focus / (logged_count as f64)).round() as u32
-        } else {
-            0
-        };
-        // Slot-granular active time (the ADR 0012 unit): one logged 10-minute slot
-        // contributes 10 minutes, so `active_minutes / 10 == logged_count`.
-        let active_mins = logged_count * 10;
+        let agg = aggregate_v1(&all_focus);
+        // Per-slot focus values for logged (focus > 0) slots — the timeline/histogram input.
+        let logged_scores: Vec<u32> = all_focus.into_iter().filter(|&f| f > 0).collect();
+        // Slot-granular active time (ADR 0013): one logged 10-minute slot contributes 10 minutes,
+        // so `active_minutes / 10 == logged_count`.
+        let active_mins = agg.logged * 10;
 
         Ok((
-            avg_focus,
+            agg.focus_avg,
             active_mins,
             keystrokes,
             clicks,
             logged_scores,
-            logged_count,
-            billable_count,
+            agg.logged,
+            agg.billable,
         ))
     }
 
@@ -1100,6 +1233,55 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855|CONFIGHASH|PARE
     }
 
     #[test]
+    fn test_aggregation_vectors() {
+        // Golden vectors (ADR 0017), mirrored byte-for-byte in tenby10-cloud
+        // (src/lib/__fixtures__/aggregation-vectors.v1.json). Both CIs assert the same fixture, so
+        // any drift between the Rust and TS implementations of v1 turns one of them red — the
+        // guard rail the #78/#81 mismatches lacked.
+        #[derive(serde::Deserialize)]
+        struct Expected {
+            logged: u32,
+            billable: u32,
+            focus_avg: u32,
+            billable_minutes: u32,
+        }
+        #[derive(serde::Deserialize)]
+        struct Case {
+            name: String,
+            focus_scores: Vec<u32>,
+            expected: Expected,
+        }
+        #[derive(serde::Deserialize)]
+        struct Vectors {
+            aggregation_version: u32,
+            cases: Vec<Case>,
+        }
+
+        let raw = include_str!("testdata/aggregation-vectors.v1.json");
+        let v: Vectors = serde_json::from_str(raw).expect("golden fixture parses");
+        assert_eq!(v.aggregation_version, crate::config::AGGREGATION_VERSION);
+        for c in v.cases {
+            let got = aggregate_v1(&c.focus_scores);
+            assert_eq!(got.logged, c.expected.logged, "logged mismatch: {}", c.name);
+            assert_eq!(
+                got.billable, c.expected.billable,
+                "billable mismatch: {}",
+                c.name
+            );
+            assert_eq!(
+                got.focus_avg, c.expected.focus_avg,
+                "focus_avg mismatch: {}",
+                c.name
+            );
+            assert_eq!(
+                got.billable_minutes, c.expected.billable_minutes,
+                "billable_minutes mismatch: {}",
+                c.name
+            );
+        }
+    }
+
+    #[test]
     fn test_billable_slots_gate() {
         let db = create_test_db();
 
@@ -1253,5 +1435,144 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855|CONFIGHASH|PARE
             .export_minute_logs_csv("custom", Some(2000), Some(3000))
             .unwrap();
         assert_eq!(empty.lines().count(), 1);
+    }
+
+    /// Read a stored slot's chain columns for assertions: (parent_hash, hash, signature, pubkey, synced).
+    fn slot_chain_cols(db: &Database, slot_start: i64) -> (String, String, String, String, i64) {
+        let conn = db.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT parent_hash, hash, signature, signing_pubkey, synced FROM slot_summaries WHERE slot_start = ?1",
+            params![slot_start],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                    r.get::<_, Option<String>>(3)?.unwrap_or_default(), r.get(4)?)),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_reseal_from_genesis_rechains_and_resigns_whole_ledger() {
+        let db = create_test_db();
+        let old = crate::config::generate_enrollment_keys("old");
+        let old_signer = SlotSigner {
+            public_key: &old.public_key,
+            private_key: &old.private_key,
+        };
+        // A chain signed under the OLD key (as after a re-pair that rotated the key).
+        db.insert_slot_summary(
+            1000,
+            80,
+            8,
+            2,
+            100,
+            10,
+            "{\"coding\":10}",
+            Some("a"),
+            "cfg",
+            Some(&old_signer),
+        )
+        .unwrap();
+        db.insert_slot_summary(
+            1600,
+            90,
+            9,
+            1,
+            120,
+            12,
+            "{\"coding\":10}",
+            Some("b"),
+            "cfg",
+            Some(&old_signer),
+        )
+        .unwrap();
+
+        let new = crate::config::generate_enrollment_keys("new");
+        let new_signer = SlotSigner {
+            public_key: &new.public_key,
+            private_key: &new.private_key,
+        };
+        // Reseal everything (from 0) under the new key: the whole ledger must now verify for it.
+        let n = db.reseal_from(0, &new_signer).unwrap();
+        assert_eq!(n, 2);
+        assert!(
+            db.verify_ledger_integrity(&new.public_key).unwrap().is_ok(),
+            "resealed ledger must verify under the new key"
+        );
+        assert!(
+            db.verify_ledger_integrity(&old.public_key)
+                .unwrap()
+                .is_err(),
+            "it must no longer verify under the old key"
+        );
+        // First slot is genesis; both are unsynced and signed by the new key.
+        let (p0, h0, _, k0, s0) = slot_chain_cols(&db, 1000);
+        let (p1, _, _, k1, s1) = slot_chain_cols(&db, 1600);
+        assert_eq!(p0, "", "first slot re-based to genesis");
+        assert_eq!(p1, h0, "chain links forward");
+        assert_eq!(k0, new.public_key);
+        assert_eq!(k1, new.public_key);
+        assert_eq!(
+            (s0, s1),
+            (0, 0),
+            "resealed slots are marked unsynced for upload"
+        );
+    }
+
+    #[test]
+    fn test_reseal_from_window_skips_and_neutralizes_prefix() {
+        let db = create_test_db();
+        let key = crate::config::generate_enrollment_keys("k");
+        let signer = SlotSigner {
+            public_key: &key.public_key,
+            private_key: &key.private_key,
+        };
+        // Orphaned prefix (unsigned) + an in-window suffix.
+        db.insert_slot_summary(1000, 50, 5, 5, 10, 1, "{}", None, "cfg", None)
+            .unwrap();
+        db.insert_slot_summary(1600, 60, 6, 4, 20, 2, "{}", None, "cfg", None)
+            .unwrap();
+        db.insert_slot_summary(2000, 80, 8, 2, 30, 3, "{}", None, "cfg", None)
+            .unwrap();
+        db.insert_slot_summary(2600, 90, 9, 1, 40, 4, "{}", None, "cfg", None)
+            .unwrap();
+
+        let n = db.reseal_from(2000, &signer).unwrap();
+        assert_eq!(n, 2, "only the window is resealed");
+
+        // Prefix is abandoned (marked synced so it can't block the oldest-first sync).
+        assert_eq!(slot_chain_cols(&db, 1000).4, 1);
+        assert_eq!(slot_chain_cols(&db, 1600).4, 1);
+
+        // Window is a fresh genesis chain, signed and valid under the current key.
+        let (p2000, h2000, sig2000, k2000, s2000) = slot_chain_cols(&db, 2000);
+        let (p2600, _, _, _, s2600) = slot_chain_cols(&db, 2600);
+        assert_eq!(p2000, "", "window starts at genesis");
+        assert_eq!(p2600, h2000, "window chains forward");
+        assert_eq!(k2000, key.public_key);
+        assert_eq!((s2000, s2600), (0, 0));
+
+        // The re-signature is authentic: hash == sha256(canonical) and the signature verifies.
+        let canonical = canonical_slot_payload(
+            LEDGER_SCHEME_VERSION,
+            2000,
+            80,
+            8,
+            2,
+            30,
+            3,
+            "{}",
+            None,
+            &p2000,
+            &key.public_key,
+            "cfg",
+        );
+        assert_eq!(
+            sha256_hex(&canonical),
+            h2000,
+            "hash recomputes from the resealed canonical"
+        );
+        assert!(
+            verify_slot_signature(&canonical, &sig2000, &key.public_key).unwrap(),
+            "resealed signature verifies under the current key"
+        );
     }
 }
