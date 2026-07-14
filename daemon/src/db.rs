@@ -11,6 +11,42 @@ use std::sync::Mutex;
 /// green/orange/red band boundary.
 pub const BILLABLE_FOCUS_THRESHOLD: u32 = 40;
 
+/// Aggregation semantics **v1** (ADR 0017 = ADR 0012 + ADR 0013), as a pure function over
+/// per-slot focus scores so it is the single, golden-vector-tested definition. The cloud verifier
+/// mirrors this exactly (`tenby10-cloud/src/lib/aggregation.ts`) and both CIs assert the same
+/// fixture, so the two can't silently drift.
+///   - logged  = slots with `focus_score > 0` (fully-idle dropped)
+///   - billable = logged slots with `focus_score >= 40`
+///   - focus_avg = mean focus over logged slots
+///   - billable_minutes = billable × 10 (ADR 0007)
+#[derive(Debug, PartialEq, Eq)]
+pub struct AggregatesV1 {
+    pub logged: u32,
+    pub billable: u32,
+    pub focus_avg: u32,
+    pub billable_minutes: u32,
+}
+
+pub fn aggregate_v1(focus_scores: &[u32]) -> AggregatesV1 {
+    let logged: Vec<u32> = focus_scores.iter().copied().filter(|&f| f > 0).collect();
+    let logged_count = logged.len() as u32;
+    let billable = logged
+        .iter()
+        .filter(|&&f| f >= BILLABLE_FOCUS_THRESHOLD)
+        .count() as u32;
+    let focus_avg = if logged_count > 0 {
+        (logged.iter().map(|&f| f as f64).sum::<f64>() / logged_count as f64).round() as u32
+    } else {
+        0
+    };
+    AggregatesV1 {
+        logged: logged_count,
+        billable,
+        focus_avg,
+        billable_minutes: billable * 10,
+    }
+}
+
 /// Version of the slot signing/hashing scheme (ADR 0014). Bumped when the
 /// canonical payload format changes so old rows still verify under their scheme.
 /// v2 (#62) binds the effective-config hash into the payload; v1 rows omit it.
@@ -588,54 +624,37 @@ impl Database {
 
         let mut rows = stmt.query(params![start_of_day_timestamp])?;
 
-        let mut sum_focus = 0.0;
+        // Total inputs count activity from every slot, logged or not. The logged / billable /
+        // focus definitions all come from the shared v1 aggregator, so they can't drift from the
+        // cloud verifier or the golden vectors (ADR 0017).
         let mut keystrokes = 0;
         let mut clicks = 0;
-        let mut logged_scores = Vec::new();
-        let mut billable_count = 0;
+        let mut all_focus = Vec::new();
 
         while let Some(row) = rows.next()? {
             let focus_score: u32 = row.get(0)?;
             let k: u32 = row.get(1)?;
             let c: u32 = row.get(2)?;
-
-            // Total inputs count activity from every slot, logged or not.
             keystrokes += k;
             clicks += c;
-
-            // A slot is "logged" only if it holds at least one productive minute
-            // (focus_score > 0). Fully-idle slots are dropped so that every headline
-            // number reconstructs by counting 10-minute slots.
-            if focus_score == 0 {
-                continue;
-            }
-
-            sum_focus += focus_score as f64;
-            logged_scores.push(focus_score);
-            // A slot bills only if it cleared the focus gate (ADR 0012).
-            if focus_score >= BILLABLE_FOCUS_THRESHOLD {
-                billable_count += 1;
-            }
+            all_focus.push(focus_score);
         }
 
-        let logged_count = logged_scores.len() as u32;
-        let avg_focus = if logged_count > 0 {
-            (sum_focus / (logged_count as f64)).round() as u32
-        } else {
-            0
-        };
-        // Slot-granular active time (the ADR 0012 unit): one logged 10-minute slot
-        // contributes 10 minutes, so `active_minutes / 10 == logged_count`.
-        let active_mins = logged_count * 10;
+        let agg = aggregate_v1(&all_focus);
+        // Per-slot focus values for logged (focus > 0) slots — the timeline/histogram input.
+        let logged_scores: Vec<u32> = all_focus.into_iter().filter(|&f| f > 0).collect();
+        // Slot-granular active time (ADR 0013): one logged 10-minute slot contributes 10 minutes,
+        // so `active_minutes / 10 == logged_count`.
+        let active_mins = agg.logged * 10;
 
         Ok((
-            avg_focus,
+            agg.focus_avg,
             active_mins,
             keystrokes,
             clicks,
             logged_scores,
-            logged_count,
-            billable_count,
+            agg.logged,
+            agg.billable,
         ))
     }
 
@@ -1211,6 +1230,55 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855|CONFIGHASH|PARE
             result.is_err(),
             "signature must reject a re-hashed but un-re-signed row"
         );
+    }
+
+    #[test]
+    fn test_aggregation_vectors() {
+        // Golden vectors (ADR 0017), mirrored byte-for-byte in tenby10-cloud
+        // (src/lib/__fixtures__/aggregation-vectors.v1.json). Both CIs assert the same fixture, so
+        // any drift between the Rust and TS implementations of v1 turns one of them red — the
+        // guard rail the #78/#81 mismatches lacked.
+        #[derive(serde::Deserialize)]
+        struct Expected {
+            logged: u32,
+            billable: u32,
+            focus_avg: u32,
+            billable_minutes: u32,
+        }
+        #[derive(serde::Deserialize)]
+        struct Case {
+            name: String,
+            focus_scores: Vec<u32>,
+            expected: Expected,
+        }
+        #[derive(serde::Deserialize)]
+        struct Vectors {
+            aggregation_version: u32,
+            cases: Vec<Case>,
+        }
+
+        let raw = include_str!("testdata/aggregation-vectors.v1.json");
+        let v: Vectors = serde_json::from_str(raw).expect("golden fixture parses");
+        assert_eq!(v.aggregation_version, crate::config::AGGREGATION_VERSION);
+        for c in v.cases {
+            let got = aggregate_v1(&c.focus_scores);
+            assert_eq!(got.logged, c.expected.logged, "logged mismatch: {}", c.name);
+            assert_eq!(
+                got.billable, c.expected.billable,
+                "billable mismatch: {}",
+                c.name
+            );
+            assert_eq!(
+                got.focus_avg, c.expected.focus_avg,
+                "focus_avg mismatch: {}",
+                c.name
+            );
+            assert_eq!(
+                got.billable_minutes, c.expected.billable_minutes,
+                "billable_minutes mismatch: {}",
+                c.name
+            );
+        }
     }
 
     #[test]
