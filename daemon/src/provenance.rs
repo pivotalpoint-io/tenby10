@@ -68,6 +68,7 @@ pub fn start_provenance_monitor() {
     use core_foundation::runloop::{CFRunLoop, kCFRunLoopDefaultMode};
     use core_graphics::event::{
         CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement, CGEventType,
+        CallbackResult,
     };
 
     std::thread::spawn(|| {
@@ -98,7 +99,7 @@ pub fn start_provenance_monitor() {
                 } else {
                     GENUINE_EVENTS.fetch_add(1, Ordering::Relaxed);
                 }
-                None // listen-only: pass the event through unchanged
+                CallbackResult::Keep // listen-only: pass the event through unchanged
             },
         );
 
@@ -113,7 +114,7 @@ pub fn start_provenance_monitor() {
             }
         };
 
-        let source = match tap.mach_port.create_runloop_source(0) {
+        let source = match tap.mach_port().create_runloop_source(0) {
             Ok(source) => source,
             Err(()) => {
                 eprintln!("[Provenance] Could not create the run-loop source; detection disabled.");
