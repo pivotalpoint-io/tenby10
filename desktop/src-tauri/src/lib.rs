@@ -326,12 +326,22 @@ async fn get_capture_health(
     let last_ms = state.last_input_event_ms.load(Ordering::Relaxed);
     let input_idle_ms = if last_ms == 0 { -1 } else { now_ms - last_ms };
 
+    // Re-derive screen health from a real capture attempt instead of reading a flag
+    // that otherwise only moves at 10-minute slot boundaries (issue #6). The probe
+    // is internally throttled, so polling this command every 10s is cheap; it
+    // spawns a capture, so it runs on the blocking pool rather than the UI thread.
+    let probe_state = state.inner().clone();
+    let screen_capture_ok =
+        tauri::async_runtime::spawn_blocking(move || probe_state.refresh_screen_capture_health())
+            .await
+            .map_err(|err| format!("Capture health probe failed to run: {}", err))?;
+
     Ok(CaptureHealth {
         input_listener_alive: state.input_listener_alive.load(Ordering::Relaxed),
         // Consider input "recently seen" if an event arrived in the last 5 seconds.
         input_recently_seen: (0..=5_000).contains(&input_idle_ms),
         input_idle_ms,
-        screen_capture_ok: state.screen_capture_ok.load(Ordering::Relaxed),
+        screen_capture_ok,
     })
 }
 

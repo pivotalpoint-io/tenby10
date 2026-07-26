@@ -454,11 +454,26 @@ listen("tracking-status-changed", (event) => {
 async function checkPermissionsStatus() {
   try {
     const status = await invoke("check_permissions");
-    
+
+    // macOS caches the Screen Recording preflight: CGPreflightScreenCaptureAccess
+    // keeps returning true after the grant is revoked. Cross-check it against
+    // ground truth (a real capture attempt) so a stale-green permission can never
+    // read as "Granted" while capture is actually failing (issue #6).
+    let screenRecordingGranted = status.screen_recording;
+    if (screenRecordingGranted) {
+      try {
+        const health = await invoke("get_capture_health");
+        if (!health.screen_capture_ok) screenRecordingGranted = "stale";
+      } catch {
+        // Health unavailable — leave the preflight answer as-is rather than
+        // inventing a failure.
+      }
+    }
+
     // Update individual status tags
     updatePermissionStatusUI("perm-input-monitoring-status", status.input_monitoring);
     updatePermissionStatusUI("perm-accessibility-status", status.accessibility);
-    updatePermissionStatusUI("perm-screen-recording-status", status.screen_recording);
+    updatePermissionStatusUI("perm-screen-recording-status", screenRecordingGranted);
     updatePermissionStatusUI("perm-automation-status", status.automation);
 
     // Hide permissions tab completely if the OS doesn't require explicit permissions (Windows/Linux)
@@ -474,7 +489,9 @@ async function checkPermissionsStatus() {
       if (!status.requires_permissions) {
         alertBanner.style.display = "none";
       } else {
-        const anyMissing = !status.input_monitoring || !status.accessibility || !status.screen_recording || !status.automation;
+        // `screenRecordingGranted !== true` also catches the stale-green case, so a
+        // machine that is silently not capturing still raises the banner.
+        const anyMissing = !status.input_monitoring || !status.accessibility || screenRecordingGranted !== true || !status.automation;
         alertBanner.style.display = anyMissing ? "flex" : "none";
       }
     }
@@ -514,11 +531,11 @@ async function checkCaptureHealth() {
       if (health.screen_capture_ok) {
         screenStatus.innerText = "Capturing";
         screenStatus.className = "status-indicator granted";
-        screenDetail.innerText = "Last screenshot was a real capture.";
+        screenDetail.innerText = "A real capture succeeded — checked live, not just at the 10-minute slot boundary.";
       } else {
         screenStatus.innerText = "Not capturing";
         screenStatus.className = "status-indicator denied";
-        screenDetail.innerText = "Last screenshot attempt failed — grant Screen Recording and restart tenby10. (Shows once the first slot completes.)";
+        screenDetail.innerText = "A capture attempt just failed — grant Screen Recording, then fully quit and relaunch tenby10.";
       }
     }
   } catch (err) {
@@ -526,15 +543,23 @@ async function checkCaptureHealth() {
   }
 }
 
+// `isGranted` is a boolean, or the string "stale" for a permission the OS reports
+// as granted while a real capture attempt just failed (issue #6).
 function updatePermissionStatusUI(elementId, isGranted) {
   const el = document.getElementById(elementId);
   if (!el) return;
-  if (isGranted) {
+  if (isGranted === "stale") {
+    el.innerText = "Not capturing";
+    el.className = "status-indicator denied";
+    el.title = "macOS reports this permission as granted, but capture is failing right now. Re-grant Screen Recording, then fully quit and relaunch tenby10.";
+  } else if (isGranted) {
     el.innerText = "Granted";
     el.className = "status-indicator granted";
+    el.title = "";
   } else {
     el.innerText = "Denied";
     el.className = "status-indicator denied";
+    el.title = "";
   }
 }
 
