@@ -27,5 +27,5 @@ daemon = { path = "../../daemon" }
 tokio = { version = "1.37", features = ["full"] }
 reqwest = { version = "0.13", features = ["json"] }
 fs2 = "0.4.3"
-base64 = "0.22"
+base64 = "0.23"
 
