@@ -36,6 +36,7 @@ auditable; the cloud portal is not part of this repository.
 | 8 | Local logs are tamper-evident (full-payload hash chain) + self-signed when enrolled | ✅ Verified | [db.rs `insert_slot_summary`/`verify_ledger_integrity`](daemon/src/db.rs) |
 | — | Secrets stored in OS keychain | ✅ Verified | [config.rs `save_config`/`load_config`](daemon/src/config.rs) — `private_key` & `llm_api_key` kept in the OS keychain via the `keyring` crate |
 | — | Local dashboard makes no third-party calls | ✅ Verified | [dashboard.rs](daemon/src/dashboard.rs) — Outfit font embedded as a data URI; no CDN `<link>` |
+| — | The installed app opens **no listening port** | ✅ Verified | The dashboard renders in-app over Tauri IPC. The loopback HTTP server is a debug-only escape hatch for the standalone `daemon` binary, off unless `TENBY10_DEBUG_HTTP` is set — [env.rs `debug_http_enabled`](daemon/src/env.rs) |
 
 Bottom line: the core privacy claims — **no keylogging, and your raw keystrokes, screenshots, and
 window titles never leave the machine** — hold up against the code. When you enroll and sync, signed

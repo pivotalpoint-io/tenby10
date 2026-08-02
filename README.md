@@ -17,7 +17,7 @@ Everything is stored locally under `~/.tenby10/`. If you enroll a device, only s
 *   ⏱️ **Passive, Zero-Friction Tracking**: The background daemon automatically logs active application and window states. Includes a convenient Pause/Resume toggle switch in the system tray and settings UI to control when tracking is active.
 *   🔒 **Local-First & Sandbox Storage**: All minute logs, configuration files, and screen captures are stored strictly on your machine under `~/.tenby10/`.
     - **Development Mode**: When running from source in debug mode, the app automatically isolates itself to `~/.tenby10_dev/`.
-    - **Environment Overrides**: Use `TENBY10_HOME` to override the base directory and `TENBY10_PORT` to override the dashboard port (default: 5005).
+    - **Environment Overrides**: Use `TENBY10_HOME` to override the base directory. `TENBY10_DEBUG_HTTP` opts the standalone daemon into a loopback debug server (off by default), and `TENBY10_PORT` sets its port (default: 5005).
 *   🛡️ **Tamper-Evident Ledger**: Each 10-minute slot summary is SHA-256 hash-chained over its **full** payload, so editing any stored field breaks the chain. Once you enroll, every slot is additionally **Ed25519-signed with your key**, so even a re-computed hash won't verify without that key. On a machine you control this is tamper-*evidence* and self-asserted authorship — not, by itself, third-party proof.
 *   🧠 **BYOK Local AI Scribe**: Connects directly to your own provider (OpenAI, Anthropic, or Gemini) to analyze active logs and generate professional work summaries. 
 *   🟢 **10-Minute Slot Standard**: Records your day in verifiable 10-minute slots, each hash-chained and — once you enroll — signed with your key.
@@ -43,17 +43,17 @@ The codebase is structured as a lightweight monorepo containing two core compone
                   │   - Screen Blur Capture (10m slot random)    │
                   │   - Local DB & Cryptographic Ledger          │
                   └──────────────┬───────────────────────────────┘
-                                 │ Serves localhost:5005
+                                 │ Tauri IPC (no network)
                                  ▼
                   ┌──────────────────────────────────────────────┐
-                  │             Analytics Dashboard              │
-                  │   - HTML5 / CSS3 local dashboard UI          │
+                  │      Analytics Dashboard (in-app view)       │
+                  │   - Renders inside the app window            │
                   │   - Interactive focus entropy graphs         │
                   │   - Blurred timeline screen browser          │
                   └──────────────────────────────────────────────┘
 ```
 
-1.  **Background Daemon (`/daemon`)**: A background service written in Rust that handles global OS input hooks, scrapes active window titles at a 10s interval, processes Gaussian blurred screenshots, maintains the local SQLite database (`tenby10.db`), and exposes a local Axum HTTP server at `localhost:5005`.
+1.  **Background Daemon (`/daemon`)**: A background service written in Rust that handles global OS input hooks, scrapes active window titles at a 10s interval, processes Gaussian blurred screenshots, and maintains the local SQLite database (`tenby10.db`). **The installed app opens no network port** — the dashboard reads from the daemon over Tauri IPC. A loopback HTTP server exists in the codebase purely as a debugging escape hatch for the standalone `daemon` binary, and stays off unless `TENBY10_DEBUG_HTTP` is explicitly set.
 2.  **Desktop GUI (`/desktop`)**: A native desktop wrapper built using **Tauri (v2)** with a frosted glassmorphism settings interface, enabling cryptographic key enrollment and configuration management.
 
 ---
@@ -90,8 +90,13 @@ cd daemon
 # Build daemon binaries
 cargo build --release
 
-# Run daemon manually (spawns the Axum local dashboard server on http://localhost:5005)
+# Run daemon manually (opens no network port)
 cargo run
+
+# Optional: also start the loopback debug dashboard for triage. It is
+# unauthenticated — anything that can reach loopback on this machine can read the
+# blurred screenshots and activity CSV it serves — so leave it off by default.
+TENBY10_DEBUG_HTTP=1 cargo run   # then open http://localhost:5005
 ```
 
 ### 2. Build and Run the Tauri Desktop App

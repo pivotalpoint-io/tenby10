@@ -63,3 +63,52 @@ pub fn get_app_port(config: &AgentConfig) -> u16 {
 
     if is_dev() { 5006 } else { 5005 }
 }
+
+/// Whether the debug HTTP dashboard server may start (#40).
+///
+/// Off unless `TENBY10_DEBUG_HTTP` is set to a truthy value, so a normal run — and
+/// every installed app — opens no listening port. The server is a triage escape
+/// hatch only; the real dashboard renders in-app over Tauri IPC.
+pub fn debug_http_enabled() -> bool {
+    debug_http_enabled_from(env::var("TENBY10_DEBUG_HTTP").ok().as_deref())
+}
+
+/// Pure form of [`debug_http_enabled`], so the default-off behaviour is testable
+/// without mutating process environment from tests.
+fn debug_http_enabled_from(value: Option<&str>) -> bool {
+    match value {
+        Some(val) => {
+            let val = val.trim().to_ascii_lowercase();
+            // Treat an explicitly falsey value as off, so `TENBY10_DEBUG_HTTP=0`
+            // does what it looks like rather than enabling via mere presence.
+            !val.is_empty() && val != "0" && val != "false" && val != "no"
+        }
+        None => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_debug_http_is_off_unless_explicitly_enabled() {
+        // The default install must open no port (#40).
+        assert!(!debug_http_enabled_from(None), "unset -> off");
+        assert!(!debug_http_enabled_from(Some("")), "empty -> off");
+        assert!(!debug_http_enabled_from(Some("  ")), "whitespace -> off");
+
+        // An explicitly falsey value must mean off, not "present therefore on".
+        assert!(!debug_http_enabled_from(Some("0")), "0 -> off");
+        assert!(!debug_http_enabled_from(Some("false")), "false -> off");
+        assert!(!debug_http_enabled_from(Some("FALSE")), "case-insensitive");
+        assert!(!debug_http_enabled_from(Some("no")), "no -> off");
+    }
+
+    #[test]
+    fn test_debug_http_enables_on_a_truthy_value() {
+        assert!(debug_http_enabled_from(Some("1")));
+        assert!(debug_http_enabled_from(Some("true")));
+        assert!(debug_http_enabled_from(Some(" 1 ")), "trims whitespace");
+    }
+}

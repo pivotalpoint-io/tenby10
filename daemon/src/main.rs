@@ -58,9 +58,20 @@ async fn main() {
     println!("Initializing Database at {:?}", db_path);
     let db = Arc::new(Database::new(db_path).expect("Failed to initialize SQLite database"));
 
-    // Start the local web dashboard server
-    let port = daemon::env::get_app_port(&config);
-    start_dashboard_server(db.clone(), port);
+    // Debug-only HTTP dashboard, off unless explicitly opted into (#40). The app's
+    // dashboard renders natively over IPC, so this exists purely as a triage escape
+    // hatch ("is it actually capturing?"). It stays off by default so a normal run
+    // opens no listening port.
+    if daemon::env::debug_http_enabled() {
+        let port = daemon::env::get_app_port(&config);
+        println!(
+            "[Dashboard] TENBY10_DEBUG_HTTP is set — starting the debug HTTP server on \
+             127.0.0.1:{}. It serves blurred screenshots and an activity CSV to anything \
+             that can reach loopback; unset the variable to disable it.",
+            port
+        );
+        start_dashboard_server(db.clone(), port);
+    }
 
     let state = Arc::new(TelemetryState::new());
 

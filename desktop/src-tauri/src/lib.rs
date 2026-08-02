@@ -394,12 +394,11 @@ pub fn run() {
     let db =
         Arc::new(daemon::db::Database::new(db_path).expect("Failed to initialize SQLite database"));
 
-    // Start local web server dashboard
-    let mut config_path = app_home.clone();
-    config_path.push("config.json");
-    let config = daemon::config::load_config(config_path).unwrap_or_default();
-    let port = daemon::env::get_app_port(&config);
-    daemon::dashboard::start_dashboard_server(db.clone(), port);
+    // No local HTTP server is started here (#40). The activity dashboard renders
+    // inside the app window from `#[tauri::command]` IPC, so the Axum server no
+    // longer backs any view — leaving it running would keep a loopback port open
+    // that nothing consumes. The standalone `daemon` binary can still opt into it
+    // for triage; see `daemon::dashboard::start_dashboard_server`.
 
     let state = Arc::new(daemon::daemon::TelemetryState::new());
 

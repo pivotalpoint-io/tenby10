@@ -2,20 +2,27 @@ use axum::{
     Json, Router,
     extract::State,
     response::{Html, IntoResponse},
-    routing::{get, post},
+    routing::get,
 };
 use base64::{Engine as _, engine::general_purpose};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
-use tower_http::cors::CorsLayer;
 
 use crate::db::Database;
 
 // Icon will be included and encoded at runtime
 
-/// Start the Axum web server on a background thread.
+/// Start the debug HTTP dashboard on a background thread, bound to loopback.
+///
+/// **Not started by the installed app** (#40). The activity dashboard renders
+/// in-app from Tauri IPC, so this exists only as a triage escape hatch for the
+/// standalone `daemon` binary, gated behind [`crate::env::debug_http_enabled`].
+///
+/// It is unauthenticated: while enabled, anything that can reach loopback — any
+/// local process or OS user on the machine — can read the blurred screenshots and
+/// the activity CSV it serves. Keep it off unless actively debugging.
 pub fn start_dashboard_server(db: Arc<Database>, port: u16) {
     let db_state = Arc::clone(&db);
 
@@ -29,19 +36,24 @@ pub fn start_dashboard_server(db: Arc<Database>, port: u16) {
             let mut screenshots_dir = crate::env::get_app_home();
             screenshots_dir.push("screenshots");
 
+            // Read-only triage surface. The config read/write and mock-enroll routes
+            // were removed (#40): they mutated state — including secret-bearing
+            // config — over an unauthenticated port, and had no diagnostic value now
+            // that the app configures itself over Tauri IPC.
+            //
+            // No CORS layer either. This previously ran `CorsLayer::permissive()`,
+            // which let any origin read these responses; the dashboard HTML is served
+            // from this same origin and needs no cross-origin access.
             let app = Router::new()
                 .route("/", get(serve_dashboard_html))
                 .route("/api/data", get(get_dashboard_data))
                 .route("/api/pending", get(get_pending_slots))
                 .route("/api/slot_details", get(get_slot_details))
                 .route("/api/export", get(export_csv))
-                .route("/api/settings", get(get_settings).post(save_settings))
-                .route("/api/enroll", post(mock_cloud_enroll))
                 .nest_service(
                     "/screenshots",
                     tower_http::services::ServeDir::new(screenshots_dir),
                 )
-                .layer(CorsLayer::permissive())
                 .with_state(db_state);
 
             let addr = SocketAddr::from(([127, 0, 0, 1], port));
@@ -155,23 +167,11 @@ async fn export_csv(
     (headers, csv_data).into_response()
 }
 
-async fn get_settings() -> impl IntoResponse {
-    let mut config_path = crate::env::get_app_home();
-    config_path.push("config.json");
-
-    let config = crate::config::load_config(config_path).unwrap_or_default();
-    Json(config).into_response()
-}
-
-async fn save_settings(Json(new_config): Json<crate::config::AgentConfig>) -> impl IntoResponse {
-    let mut config_path = crate::env::get_app_home();
-    config_path.push("config.json");
-
-    match crate::config::save_config(config_path, &new_config) {
-        Ok(_) => Json(serde_json::json!({"status": "ok"})).into_response(),
-        Err(e) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
-    }
-}
+// The `get_settings` / `save_settings` handlers were removed in #40. Reading the
+// agent config here served it straight from `load_config`, which overlays keychain
+// material onto the returned struct, and the write side accepted a whole config
+// from any caller. The app reads and writes config over Tauri IPC instead, so this
+// surface had no remaining consumer.
 
 /// Serves the single-page web dashboard HTML.
 async fn serve_dashboard_html() -> impl IntoResponse {
@@ -2241,21 +2241,6 @@ async fn serve_dashboard_html() -> impl IntoResponse {
     Html(html)
 }
 
-#[derive(Deserialize, Serialize)]
-struct EnrollRequest {
-    token: String,
-    public_key: String,
-    agent_id: String,
-}
-
-async fn mock_cloud_enroll(Json(payload): Json<EnrollRequest>) -> impl IntoResponse {
-    println!(
-        "[Mock Cloud] Received enrollment request! Agent: {} | Token: {}",
-        payload.agent_id, payload.token
-    );
-    Json(serde_json::json!({
-        "status": "success",
-        "message": "Agent enrolled successfully in B2B SaaS portal",
-        "agent_id": payload.agent_id,
-    }))
-}
+// `mock_cloud_enroll` and its `EnrollRequest` payload were removed in #40 — a stub
+// enrollment endpoint left on an unauthenticated port, superseded by the real
+// `enroll_agent` Tauri command.
