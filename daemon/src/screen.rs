@@ -20,6 +20,22 @@ pub fn capture_and_blur_screenshot(
     blur_and_save(raw_img, screenshots_dir, slot_start)
 }
 
+/// Ground-truth health probe: attempt a real capture and immediately discard the
+/// pixels. Nothing is blurred, saved, or returned — the raw buffer is dropped
+/// before this function returns, so probing never writes an image to disk.
+///
+/// Needed because neither available signal is trustworthy on its own: the TCC
+/// preflight (`CGPreflightScreenCaptureAccess`) keeps returning a cached `true`
+/// after a grant is revoked, and the real slot capture only runs once per
+/// 10 minutes — so a broken capture can read as healthy for that long (issue #6).
+/// Actually trying is the only way to know now.
+pub fn probe_capture() -> Result<(), String> {
+    let raw_img = capture_raw_image()?;
+    // Explicitly purge the raw capture: a probe only wants the success/failure.
+    drop(raw_img);
+    Ok(())
+}
+
 /// Shared privacy pipeline: blur the raw capture in memory, **drop the raw
 /// buffer**, and write only the blurred image as a low-resolution JPEG. The raw,
 /// unblurred image is never passed to `save`. Platform-independent so the same
@@ -238,5 +254,29 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// On-device check for the capture-health probe (issue #6). Like the capture
+    /// smoke test above it needs a real display + screen-recording permission, so
+    /// it is ignored on CI:
+    ///
+    /// ```text
+    /// cargo test -p daemon -- --ignored probe_capture
+    /// ```
+    #[test]
+    #[ignore = "captures the real screen; needs a display + screen-recording permission"]
+    fn test_probe_capture_succeeds_and_writes_nothing() {
+        let before = std::env::temp_dir().join("tenby10_probe_should_not_appear.jpg");
+        std::fs::remove_file(&before).ok();
+
+        probe_capture().expect("probe should succeed on a permitted device");
+
+        // The probe must be side-effect free: it exists to answer a yes/no, and
+        // must never leave an image behind (it does not blur, so anything it wrote
+        // would be a raw screenshot on disk).
+        assert!(
+            !before.exists(),
+            "probe_capture must not write any image to disk"
+        );
     }
 }

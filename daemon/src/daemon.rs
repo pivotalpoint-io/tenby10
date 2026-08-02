@@ -23,8 +23,12 @@ pub struct TelemetryState {
     pub input_listener_alive: AtomicBool,
     /// Unix-ms timestamp of the last input event actually observed (0 = none yet).
     pub last_input_event_ms: AtomicI64,
-    /// Whether the most recent screenshot attempt was a real capture (not a denial fallback).
+    /// Whether the most recent capture attempt — a real slot screenshot or a
+    /// [`probe`](crate::screen::probe_capture) — actually succeeded.
     pub screen_capture_ok: AtomicBool,
+    /// Unix-ms timestamp of the last capture attempt of either kind (0 = none yet).
+    /// Throttles [`TelemetryState::refresh_screen_capture_health`].
+    pub last_capture_check_ms: AtomicI64,
 }
 
 /// Rolling anti-automation window sizes (ADR 0002 addendum). Anti-automation
@@ -33,6 +37,29 @@ pub struct TelemetryState {
 /// recent N samples and bound memory by trimming the oldest.
 const KEY_INTERVAL_WINDOW: usize = 256;
 const MOUSE_POSITION_WINDOW: usize = 512;
+
+/// Minimum gap between ground-truth capture probes (issue #6). The settings UI
+/// polls capture health every 10s and each probe spawns a real screen grab, so
+/// this throttles the cost while staying 20x fresher than the 10-minute slot
+/// cadence that used to be the only thing moving the flag.
+const CAPTURE_PROBE_MIN_GAP_MS: i64 = 30_000;
+
+/// Whether a fresh capture probe is due. Split out from the probe itself so the
+/// throttle is testable on CI, where a real screen capture cannot run.
+fn capture_probe_due(last_check_ms: i64, now_ms: i64) -> bool {
+    // Never checked yet, or the clock jumped backwards (sleep/timezone) — probe.
+    last_check_ms == 0
+        || now_ms < last_check_ms
+        || now_ms - last_check_ms >= CAPTURE_PROBE_MIN_GAP_MS
+}
+
+/// Current wall-clock time in Unix milliseconds.
+fn now_unix_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
 
 /// Keep only the most recent `max` elements of `v`, dropping the oldest.
 fn trim_front<T>(v: &mut Vec<T>, max: usize) {
@@ -64,7 +91,33 @@ impl TelemetryState {
             input_listener_alive: AtomicBool::new(false),
             last_input_event_ms: AtomicI64::new(0),
             screen_capture_ok: AtomicBool::new(false),
+            last_capture_check_ms: AtomicI64::new(0),
         }
+    }
+
+    /// Record the outcome of a capture attempt (probe or real slot screenshot)
+    /// and reset the probe throttle, so the two paths keep one shared clock.
+    pub fn record_capture_result(&self, ok: bool, now_ms: i64) {
+        self.screen_capture_ok.store(ok, Ordering::Relaxed);
+        self.last_capture_check_ms.store(now_ms, Ordering::Relaxed);
+    }
+
+    /// Re-derive `screen_capture_ok` from an actual capture attempt, throttled to
+    /// at most one probe per [`CAPTURE_PROBE_MIN_GAP_MS`]. Returns the freshest
+    /// value known.
+    ///
+    /// Without this the flag only moves at 10-minute slot boundaries, so a revoked
+    /// Screen Recording grant keeps reading as healthy for up to 10 minutes — the
+    /// "green but not capturing" window in issue #6. Blocking (it spawns a real
+    /// capture); call it off the UI thread.
+    pub fn refresh_screen_capture_health(&self) -> bool {
+        let now_ms = now_unix_ms();
+        if !capture_probe_due(self.last_capture_check_ms.load(Ordering::Relaxed), now_ms) {
+            return self.screen_capture_ok.load(Ordering::Relaxed);
+        }
+        let ok = crate::screen::probe_capture().is_ok();
+        self.record_capture_result(ok, now_ms);
+        ok
     }
 
     /// Reset the per-minute counters for the next minute slot. The rolling
@@ -205,6 +258,20 @@ pub fn start_daemon_loop(db: Arc<Database>, state: Arc<TelemetryState>) {
     // Run catch-up aggregation immediately at startup
     aggregate_pending_slots(&db);
 
+    // Seed capture health from a real probe rather than leaving it at the
+    // pessimistic startup default. Without this the UI reports "Not capturing"
+    // until the first slot boundary — up to 10 minutes of a false red on a
+    // perfectly healthy machine, and a false green after a mid-run revocation
+    // once the first capture has succeeded (issue #6).
+    if state.refresh_screen_capture_health() {
+        println!("[Screen] Startup capture probe succeeded.");
+    } else {
+        eprintln!(
+            "[Screen Warning] Startup capture probe failed; Screen Recording is likely \
+             not granted. Screenshots will not be captured until it is."
+        );
+    }
+
     let mut last_screenshot_slot_start: Option<i64> = None;
 
     loop {
@@ -259,9 +326,9 @@ pub fn start_daemon_loop(db: Arc<Database>, state: Arc<TelemetryState>) {
             screenshots_dir.push("screenshots");
 
             match crate::screen::capture_and_blur_screenshot(screenshots_dir, finished_slot) {
-                Ok(_) => state.screen_capture_ok.store(true, Ordering::Relaxed),
+                Ok(_) => state.record_capture_result(true, now_unix_ms()),
                 Err(err) => {
-                    state.screen_capture_ok.store(false, Ordering::Relaxed);
+                    state.record_capture_result(false, now_unix_ms());
                     eprintln!(
                         "[Screen Warning] Screen capture failed for slot {}: {}. \
                          Screenshots will NOT be captured until Screen Recording is granted.",
@@ -713,6 +780,61 @@ mod tests {
 
     use std::sync::atomic::{AtomicUsize, Ordering};
     static DB_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn test_capture_probe_due_throttles_within_the_gap() {
+        let now = 1_000_000_000_000;
+        assert!(
+            capture_probe_due(0, now),
+            "never checked -> probe immediately"
+        );
+        assert!(
+            !capture_probe_due(now - 1, now),
+            "just checked -> do not re-probe"
+        );
+        assert!(
+            !capture_probe_due(now - (CAPTURE_PROBE_MIN_GAP_MS - 1), now),
+            "inside the throttle window -> do not re-probe"
+        );
+        assert!(
+            capture_probe_due(now - CAPTURE_PROBE_MIN_GAP_MS, now),
+            "at the gap -> probe"
+        );
+        assert!(
+            capture_probe_due(now - (CAPTURE_PROBE_MIN_GAP_MS * 20), now),
+            "long past the gap -> probe"
+        );
+    }
+
+    #[test]
+    fn test_capture_probe_due_survives_a_backwards_clock() {
+        // Sleep/wake or a timezone change can move the wall clock backwards. A
+        // naive `now - last >= gap` would then never fire again, freezing capture
+        // health at whatever it last read (issue #6).
+        let now = 1_000_000_000_000;
+        assert!(
+            capture_probe_due(now + 60_000, now),
+            "clock jumped backwards -> probe rather than latch"
+        );
+    }
+
+    #[test]
+    fn test_record_capture_result_updates_flag_and_throttle_clock() {
+        let state = TelemetryState::new();
+        assert!(
+            !state.screen_capture_ok.load(Ordering::Relaxed),
+            "starts pessimistic"
+        );
+
+        state.record_capture_result(true, 5_000);
+        assert!(state.screen_capture_ok.load(Ordering::Relaxed));
+        assert_eq!(state.last_capture_check_ms.load(Ordering::Relaxed), 5_000);
+
+        // A failing slot capture must flip the flag back, not just go unnoticed.
+        state.record_capture_result(false, 9_000);
+        assert!(!state.screen_capture_ok.load(Ordering::Relaxed));
+        assert_eq!(state.last_capture_check_ms.load(Ordering::Relaxed), 9_000);
+    }
 
     fn create_test_db() -> Database {
         let count = DB_COUNTER.fetch_add(1, Ordering::Relaxed);
