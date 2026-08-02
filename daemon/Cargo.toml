@@ -17,7 +17,7 @@ tower-http = { version = "0.7", features = ["fs", "cors"] }
 reqwest = { version = "0.13", features = ["json", "blocking"] }
 ed25519-dalek = { version = "3.0", features = ["rand_core"] }
 rand = "0.10"
-base64 = "0.22.1"
+base64 = "0.23.0"
 active-win-pos-rs = "0.11.0"
 keyring = { version = "3", features = ["apple-native", "windows-native"] }
 
