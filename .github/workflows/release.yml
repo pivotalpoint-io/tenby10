@@ -78,6 +78,10 @@ jobs:
     runs-on: ${{ matrix.platform }}
     permissions:
       contents: write
+      # Build provenance (issue #26): id-token mints the Sigstore OIDC token,
+      # attestations writes the attestation to the repo's attestation store.
+      id-token: write
+      attestations: write
 
     steps:
       - name: Checkout repository
@@ -148,6 +152,7 @@ jobs:
           echo "APPLE_API_KEY_PATH=$KEY_PATH" >> "$GITHUB_ENV"
 
       - name: Build and Publish Tauri Desktop App
+        id: tauri
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -166,3 +171,13 @@ jobs:
           prerelease: false
           projectPath: desktop
           args: --verbose
+
+      # Machine-verifiable link between each published artifact and the source
+      # commit + workflow that built it (issue #26). Each matrix leg attests the
+      # bundles it produced: macOS the .dmg/.app.tar.gz, Windows the .msi/.exe.
+      # Attests artifact *origin* only — it says nothing about runtime behaviour.
+      - name: Attest build provenance
+        if: steps.tauri.outputs.artifactPaths != '' && steps.tauri.outputs.artifactPaths != '[]'
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: ${{ join(fromJSON(steps.tauri.outputs.artifactPaths), ',') }}

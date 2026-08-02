@@ -155,6 +155,16 @@ The repository utilizes GitHub Actions to ensure code quality. On every push and
 
 **Releases are tag-driven**: The expensive "Release Build and Smoke Test" job only triggers when a version tag (e.g., `v1.2.3`) is pushed to the repository.
 
+### Verifying a release download
+
+Release artifacts ship with [build provenance attestations](https://docs.github.com/actions/security-guides/using-artifact-attestations), so you can confirm a download was built by this repository's release workflow from a specific commit:
+
+```bash
+gh attestation verify tenby10_0.2.3_aarch64.dmg --repo pivotalpoint-io/tenby10
+```
+
+This attests where the artifact *came from*, not how the program behaves at runtime. Windows builds are not yet code-signed, so provenance is currently the way to check a Windows download is genuine. See [AUDIT.md](AUDIT.md) for the full verification guide.
+
 ---
 
 ## 🔐 Security
