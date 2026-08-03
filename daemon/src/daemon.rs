@@ -53,6 +53,19 @@ fn capture_probe_due(last_check_ms: i64, now_ms: i64) -> bool {
         || now_ms - last_check_ms >= CAPTURE_PROBE_MIN_GAP_MS
 }
 
+/// How many blurred screenshots back the slot starting at `slot_start` (#50).
+///
+/// Reads the filesystem rather than any in-memory flag: the saved JPEG *is* the
+/// evidence a relying party would be shown, so asking whether it exists is the
+/// only answer that can't drift from what's actually there. Capture writes exactly
+/// one file per slot today, so this is 0 or 1.
+fn slot_screenshot_count(slot_start: i64) -> u32 {
+    let mut path = crate::env::get_app_home();
+    path.push("screenshots");
+    path.push(format!("slot_{}.jpg", slot_start));
+    if path.is_file() { 1 } else { 0 }
+}
+
 /// Current wall-clock time in Unix milliseconds.
 fn now_unix_ms() -> i64 {
     SystemTime::now()
@@ -730,6 +743,12 @@ pub fn aggregate_slot(db: &Database, config: &crate::config::AgentConfig, slot_s
         eprintln!("[Config] could not persist config blob: {e}");
     }
 
+    // Evidence count for the signed payload (#50). Derived from the blurred JPEG
+    // actually on disk rather than from in-memory capture health: the file *is* the
+    // evidence, so this stays correct across restarts and for catch-up aggregation
+    // of slots that finished while the daemon was down.
+    let screenshot_count = slot_screenshot_count(slot_start);
+
     let slot_res = db.insert_slot_summary(
         slot_start,
         final_focus_score,
@@ -740,6 +759,7 @@ pub fn aggregate_slot(db: &Database, config: &crate::config::AgentConfig, slot_s
         &app_categories_json,
         final_reasoning.as_deref(),
         &config_hash,
+        screenshot_count,
         signer.as_ref(),
     );
 

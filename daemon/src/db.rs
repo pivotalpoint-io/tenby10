@@ -50,7 +50,9 @@ pub fn aggregate_v1(focus_scores: &[u32]) -> AggregatesV1 {
 /// Version of the slot signing/hashing scheme (ADR 0014). Bumped when the
 /// canonical payload format changes so old rows still verify under their scheme.
 /// v2 (#62) binds the effective-config hash into the payload; v1 rows omit it.
-pub const LEDGER_SCHEME_VERSION: u32 = 2;
+/// v3 (#50) additionally binds the screenshot evidence count. Each version only
+/// ever appends before the parent link, so older rows keep verifying under theirs.
+pub const LEDGER_SCHEME_VERSION: u32 = 3;
 
 /// Material needed to self-sign a slot summary (ADR 0014). Sourced from the
 /// enrolled agent's config; both keys are hex-encoded Ed25519. When absent
@@ -78,6 +80,8 @@ pub struct SignedSlot {
     pub scheme_version: u32,
     /// SHA-256 of the effective-config blob in force for this slot (v2+; "" for v1).
     pub config_hash: String,
+    /// Blurred screenshots backing this slot (v3+; 0 on older rows).
+    pub screenshot_count: u32,
 }
 
 /// The signable fields of a stored slot, read back for re-chaining in [`Database::reseal_from`].
@@ -92,6 +96,7 @@ struct StoredSlotRow {
     llm_reasoning: Option<String>,
     config_hash: String,
     scheme_version: u32,
+    screenshot_count: u32,
 }
 
 /// SHA-256 of a string as lowercase hex — matches the canonical payload's field folding.
@@ -143,7 +148,29 @@ fn canonical_slot_payload(
     parent_hash: &str,
     signing_pubkey: &str,
     config_hash: &str,
+    screenshot_count: u32,
 ) -> String {
+    // v3 (#50) additionally binds how many blurred screenshots back the slot, so a
+    // relying party can tell an evidence-backed slot from one with none. Appended
+    // before the parent link; reordering would break every already-signed row.
+    if scheme_version >= 3 {
+        return format!(
+            "tenby10-slot|v{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+            scheme_version,
+            signing_pubkey,
+            slot_start,
+            focus_score,
+            active_segments,
+            idle_segments,
+            total_keystrokes,
+            total_clicks,
+            sha256_hex(app_categories_json),
+            sha256_hex(llm_reasoning.unwrap_or("")),
+            config_hash,
+            screenshot_count,
+            parent_hash,
+        );
+    }
     // v2 (#62) inserts the effective-config hash before the parent link so every
     // score is bound to the rubric that produced it. v1 rows keep the old format.
     if scheme_version >= 2 {
@@ -279,7 +306,8 @@ impl Database {
                 signature TEXT,
                 signing_pubkey TEXT,
                 scheme_version INTEGER NOT NULL DEFAULT 1,
-                config_hash TEXT NOT NULL DEFAULT ''
+                config_hash TEXT NOT NULL DEFAULT '',
+                screenshot_count INTEGER NOT NULL DEFAULT 0
             )",
             [],
         )?;
@@ -311,6 +339,12 @@ impl Database {
         // Config-in-ledger (#62): effective-config hash bound into v2 signed payloads.
         let _ = conn.execute(
             "ALTER TABLE slot_summaries ADD COLUMN config_hash TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        // Screenshot evidence (#50). Existing rows default to 0 — which is also the
+        // truth for them, since capture never worked before v0.2.5 (#47).
+        let _ = conn.execute(
+            "ALTER TABLE slot_summaries ADD COLUMN screenshot_count INTEGER NOT NULL DEFAULT 0",
             [],
         );
         // The effective-config blob for every hash we've scored a slot under, so any slot can be
@@ -364,7 +398,7 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT slot_start, focus_score, active_segments, idle_segments, total_keystrokes, \
-             total_clicks, app_categories, llm_reasoning, hash, parent_hash, signature, scheme_version, config_hash \
+             total_clicks, app_categories, llm_reasoning, hash, parent_hash, signature, scheme_version, config_hash, screenshot_count \
              FROM slot_summaries \
              WHERE signature IS NOT NULL AND synced = 0 \
              ORDER BY slot_start ASC LIMIT ?1",
@@ -384,6 +418,7 @@ impl Database {
                 signature: r.get(10)?,
                 scheme_version: r.get(11)?,
                 config_hash: r.get(12)?,
+                screenshot_count: r.get(13)?,
             })
         })?;
         rows.collect()
@@ -452,7 +487,8 @@ impl Database {
         let rows: Vec<StoredSlotRow> = {
             let mut stmt = conn.prepare(
                 "SELECT slot_start, focus_score, active_segments, idle_segments, total_keystrokes,
-                        total_clicks, app_categories, llm_reasoning, config_hash, scheme_version
+                        total_clicks, app_categories, llm_reasoning, config_hash, scheme_version,
+                        screenshot_count
                  FROM slot_summaries WHERE slot_start >= ?1 ORDER BY slot_start ASC",
             )?;
             let mapped = stmt.query_map(params![from], |r| {
@@ -467,6 +503,7 @@ impl Database {
                     llm_reasoning: r.get(7)?,
                     config_hash: r.get(8)?,
                     scheme_version: r.get(9)?,
+                    screenshot_count: r.get(10)?,
                 })
             })?;
             mapped.collect::<Result<_>>()?
@@ -487,6 +524,7 @@ impl Database {
                 &parent,
                 signer.public_key,
                 &row.config_hash,
+                row.screenshot_count,
             );
             let hash = sha256_hex(&payload);
             let signature = to_hex_bytes(&sk.sign(payload.as_bytes()).to_bytes());
@@ -541,6 +579,8 @@ impl Database {
         app_categories_json: &str,
         llm_reasoning: Option<&str>,
         config_hash: &str,
+        // Blurred screenshots backing this slot — bound into the v3 payload (#50).
+        screenshot_count: u32,
         signer: Option<&SlotSigner>,
     ) -> Result<()> {
         let parent_hash = self.get_latest_slot_hash()?;
@@ -560,6 +600,7 @@ impl Database {
             &parent_hash,
             signing_pubkey,
             config_hash,
+            screenshot_count,
         );
 
         let hash = sha256_hex(&payload);
@@ -578,8 +619,8 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT OR REPLACE INTO slot_summaries (
-                slot_start, focus_score, active_segments, idle_segments, total_keystrokes, total_clicks, app_categories, hash, parent_hash, llm_reasoning, signature, signing_pubkey, scheme_version, config_hash
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                slot_start, focus_score, active_segments, idle_segments, total_keystrokes, total_clicks, app_categories, hash, parent_hash, llm_reasoning, signature, signing_pubkey, scheme_version, config_hash, screenshot_count
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 slot_start,
                 focus_score,
@@ -594,7 +635,8 @@ impl Database {
                 signature,
                 stored_pubkey,
                 LEDGER_SCHEME_VERSION,
-                config_hash
+                config_hash,
+                screenshot_count
             ],
         )?;
         Ok(())
@@ -672,7 +714,7 @@ impl Database {
     pub fn verify_ledger_integrity(&self, expected_pubkey: &str) -> Result<Result<(), String>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT slot_start, focus_score, active_segments, idle_segments, total_keystrokes, total_clicks, app_categories, hash, parent_hash, llm_reasoning, signature, signing_pubkey, scheme_version, config_hash
+            "SELECT slot_start, focus_score, active_segments, idle_segments, total_keystrokes, total_clicks, app_categories, hash, parent_hash, llm_reasoning, signature, signing_pubkey, scheme_version, config_hash, screenshot_count
              FROM slot_summaries ORDER BY slot_start ASC",
         )?;
         let mut rows = stmt.query([])?;
@@ -694,6 +736,8 @@ impl Database {
             let signing_pubkey: Option<String> = row.get(11)?;
             let scheme_version: u32 = row.get(12).unwrap_or(1);
             let config_hash: String = row.get(13).unwrap_or_default();
+            // v1/v2 rows predate the column; their canonical form ignores it anyway.
+            let screenshot_count: u32 = row.get(14).unwrap_or(0);
 
             // 1. Verify parent_hash links correctly
             if parent_hash != expected_parent_hash {
@@ -718,6 +762,7 @@ impl Database {
                 &parent_hash,
                 row_pubkey,
                 &config_hash,
+                screenshot_count,
             );
             let computed_hash = sha256_hex(&payload);
 
@@ -1038,6 +1083,7 @@ mod tests {
             "{\"coding\": 10}",
             Some("Good"),
             "",
+            0,
             None,
         )
         .unwrap();
@@ -1051,6 +1097,7 @@ mod tests {
             "{\"coding\": 10}",
             Some("Great"),
             "",
+            0,
             None,
         )
         .unwrap();
@@ -1081,7 +1128,7 @@ mod tests {
     fn test_v2_payload_binds_config_hash() {
         let mk = |scheme: u32, cfg: &str| {
             canonical_slot_payload(
-                scheme, 1000, 80, 8, 2, 100, 10, "{}", None, "parent", "pub", cfg,
+                scheme, 1000, 80, 8, 2, 100, 10, "{}", None, "parent", "pub", cfg, 0,
             )
         };
         // v2 folds the config hash into the signed payload, so changing it changes
@@ -1111,6 +1158,9 @@ mod tests {
             "PARENT",
             "PUBKEY",
             "CONFIGHASH",
+            // v2 never carried this field. Passing a non-zero value must not change
+            // the v2 string, or every already-signed v2 row would stop verifying.
+            7,
         );
         let expected = "tenby10-slot|v2|PUBKEY|1000|80|8|2|100|10|\
 44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a|\
@@ -1119,12 +1169,76 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855|CONFIGHASH|PARE
     }
 
     #[test]
+    fn test_v3_canonical_vector_matches_cloud() {
+        // Cross-language alignment vector (#50), reproduced in the doc comment on the
+        // cloud's canonicalSlotPayload(). Keep both in lock-step.
+        let got = canonical_slot_payload(
+            3,
+            1000,
+            80,
+            8,
+            2,
+            100,
+            10,
+            "{}",
+            None,
+            "PARENT",
+            "PUBKEY",
+            "CONFIGHASH",
+            1,
+        );
+        let expected = "tenby10-slot|v3|PUBKEY|1000|80|8|2|100|10|\
+44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a|\
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855|CONFIGHASH|1|PARENT";
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn test_v3_evidence_count_is_covered_by_the_signature() {
+        // The point of binding the count: a slot with no screen evidence must not
+        // hash identically to one with evidence, or the field would be cosmetic and
+        // freely forgeable after signing.
+        let with = canonical_slot_payload(
+            3,
+            1000,
+            80,
+            8,
+            2,
+            100,
+            10,
+            "{}",
+            None,
+            "PARENT",
+            "PUBKEY",
+            "CONFIGHASH",
+            1,
+        );
+        let without = canonical_slot_payload(
+            3,
+            1000,
+            80,
+            8,
+            2,
+            100,
+            10,
+            "{}",
+            None,
+            "PARENT",
+            "PUBKEY",
+            "CONFIGHASH",
+            0,
+        );
+        assert_ne!(with, without, "evidence count must be covered by the hash");
+        assert!(without.contains("|CONFIGHASH|0|PARENT"));
+    }
+
+    #[test]
     fn test_unsigned_row_recompute_is_not_detected() {
         // Honest limitation (ADR 0014): with no signature, an attacker who
         // recomputes the hash after editing defeats a purely-local chain. This
         // test locks that intended scope so we don't over-claim.
         let db = create_test_db();
-        db.insert_slot_summary(1000, 50, 5, 5, 10, 2, "{}", None, "", None)
+        db.insert_slot_summary(1000, 50, 5, 5, 10, 2, "{}", None, "", 0, None)
             .unwrap();
 
         let forged = canonical_slot_payload(
@@ -1140,6 +1254,7 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855|CONFIGHASH|PARE
             "", // parent_hash of first row
             "", // unsigned
             "", // config_hash
+            0,
         );
         let forged_hash = sha256_hex(&forged);
         db.conn
@@ -1166,9 +1281,21 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855|CONFIGHASH|PARE
             private_key: &keys.private_key,
         };
 
-        db.insert_slot_summary(1000, 80, 8, 2, 100, 10, "{}", Some("r"), "", Some(&signer))
-            .unwrap();
-        db.insert_slot_summary(1600, 90, 9, 1, 120, 12, "{}", None, "", Some(&signer))
+        db.insert_slot_summary(
+            1000,
+            80,
+            8,
+            2,
+            100,
+            10,
+            "{}",
+            Some("r"),
+            "",
+            0,
+            Some(&signer),
+        )
+        .unwrap();
+        db.insert_slot_summary(1600, 90, 9, 1, 120, 12, "{}", None, "", 0, Some(&signer))
             .unwrap();
 
         // Valid signatures verify against the enrolled key.
@@ -1199,7 +1326,7 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855|CONFIGHASH|PARE
             public_key: &keys.public_key,
             private_key: &keys.private_key,
         };
-        db.insert_slot_summary(1000, 50, 5, 5, 10, 2, "{}", None, "", Some(&signer))
+        db.insert_slot_summary(1000, 50, 5, 5, 10, 2, "{}", None, "", 0, Some(&signer))
             .unwrap();
 
         // Attacker inflates focus and recomputes a matching hash (leaving the
@@ -1217,6 +1344,7 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855|CONFIGHASH|PARE
             "",
             &keys.public_key,
             "",
+            0,
         );
         let forged_hash = sha256_hex(&forged);
         db.conn
@@ -1329,6 +1457,7 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855|CONFIGHASH|PARE
             "{}",
             None,
             "",
+            0,
             None,
         )
         .unwrap();
@@ -1343,6 +1472,7 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855|CONFIGHASH|PARE
             "{}",
             None,
             "",
+            0,
             None,
         )
         .unwrap();
@@ -1357,12 +1487,25 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855|CONFIGHASH|PARE
             "{}",
             None,
             "",
+            0,
             None,
         )
         .unwrap();
         // Fully-idle slot (focus_score 0): NOT logged, excluded from every aggregate.
-        db.insert_slot_summary(today_midnight + 1800, 0, 0, 10, 0, 0, "{}", None, "", None)
-            .unwrap();
+        db.insert_slot_summary(
+            today_midnight + 1800,
+            0,
+            0,
+            10,
+            0,
+            0,
+            "{}",
+            None,
+            "",
+            0,
+            None,
+        )
+        .unwrap();
 
         let (avg, active, _k, _c, scores, logged_slots, billable_slots) =
             db.get_today_metrics().unwrap();
@@ -1398,11 +1541,24 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855|CONFIGHASH|PARE
             "{\"coding\": 8}",
             Some("focused work"),
             "",
+            0,
             None,
         )
         .unwrap();
-        db.insert_slot_summary(1600, 85, 9, 1, 200, 30, "{\"coding\": 10}", None, "", None)
-            .unwrap();
+        db.insert_slot_summary(
+            1600,
+            85,
+            9,
+            1,
+            200,
+            30,
+            "{\"coding\": 10}",
+            None,
+            "",
+            0,
+            None,
+        )
+        .unwrap();
 
         let slots = db.get_recent_slot_summaries(1000).unwrap();
         assert_eq!(slots.len(), 2);
@@ -1492,6 +1648,7 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855|CONFIGHASH|PARE
             "{\"coding\":10}",
             Some("a"),
             "cfg",
+            0,
             Some(&old_signer),
         )
         .unwrap();
@@ -1505,6 +1662,7 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855|CONFIGHASH|PARE
             "{\"coding\":10}",
             Some("b"),
             "cfg",
+            0,
             Some(&old_signer),
         )
         .unwrap();
@@ -1550,13 +1708,13 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855|CONFIGHASH|PARE
             private_key: &key.private_key,
         };
         // Orphaned prefix (unsigned) + an in-window suffix.
-        db.insert_slot_summary(1000, 50, 5, 5, 10, 1, "{}", None, "cfg", None)
+        db.insert_slot_summary(1000, 50, 5, 5, 10, 1, "{}", None, "cfg", 0, None)
             .unwrap();
-        db.insert_slot_summary(1600, 60, 6, 4, 20, 2, "{}", None, "cfg", None)
+        db.insert_slot_summary(1600, 60, 6, 4, 20, 2, "{}", None, "cfg", 0, None)
             .unwrap();
-        db.insert_slot_summary(2000, 80, 8, 2, 30, 3, "{}", None, "cfg", None)
+        db.insert_slot_summary(2000, 80, 8, 2, 30, 3, "{}", None, "cfg", 0, None)
             .unwrap();
-        db.insert_slot_summary(2600, 90, 9, 1, 40, 4, "{}", None, "cfg", None)
+        db.insert_slot_summary(2600, 90, 9, 1, 40, 4, "{}", None, "cfg", 0, None)
             .unwrap();
 
         let n = db.reseal_from(2000, &signer).unwrap();
@@ -1588,6 +1746,7 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855|CONFIGHASH|PARE
             &p2000,
             &key.public_key,
             "cfg",
+            0,
         );
         assert_eq!(
             sha256_hex(&canonical),
