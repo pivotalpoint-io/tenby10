@@ -983,7 +983,7 @@ version = "0.1.0"
 dependencies = [
  "active-win-pos-rs",
  "axum",
- "base64 0.22.1",
+ "base64 0.23.0",
  "chrono",
  "core-foundation 0.10.1",
  "core-graphics 0.25.0",
