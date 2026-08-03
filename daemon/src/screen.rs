@@ -69,33 +69,68 @@ fn blur_and_save(
     Ok(file_path)
 }
 
-/// macOS: capture via the native `screencapture` tool to stdout as PNG.
+/// macOS: capture the main display straight into memory via `CGDisplayCreateImage`.
+///
+/// This used to shell out to `screencapture -t png /dev/stdout` and read the
+/// child's stdout. That can never work: `Command::output()` makes stdout a
+/// **pipe**, and `screencapture` needs a seekable destination, so it always
+/// exited having written nothing — "cannot write file to intended destination".
+/// Capture therefore failed 100% of the time on every machine, and the resulting
+/// error ("permission is likely denied") sent every diagnosis down the TCC rabbit
+/// hole. See issue #47.
+///
+/// Capturing in-process also keeps the promise in AUDIT.md that the raw,
+/// unblurred screenshot **never touches disk** — a temp-file workaround would
+/// have written exactly that. Nothing is spawned and nothing is written; the raw
+/// pixels exist only in this buffer until [`blur_and_save`] drops them.
 ///
 /// Does NOT fabricate a placeholder on failure: that made a denied Screen
 /// Recording permission look like a successful capture. The error is surfaced so
 /// the caller can flag capture as unhealthy.
 #[cfg(target_os = "macos")]
 fn capture_raw_image() -> Result<DynamicImage, String> {
-    use std::process::Command;
+    use core_graphics::display::CGDisplay;
 
-    let output = Command::new("screencapture")
-        .arg("-x")
-        .arg("-t")
-        .arg("png")
-        .arg("/dev/stdout")
-        .output();
+    let display = CGDisplay::main();
+    let cg_image = display.image().ok_or_else(|| {
+        "CGDisplayCreateImage returned no image; Screen Recording permission is likely denied"
+            .to_string()
+    })?;
 
-    match output {
-        Ok(out) if out.status.success() && !out.stdout.is_empty() => {
-            image::load_from_memory_with_format(&out.stdout, ImageFormat::Png)
-                .map_err(|err| format!("Failed to parse captured PNG bytes: {}", err))
-        }
-        Ok(out) => Err(format!(
-            "screencapture produced no output (status {:?}); Screen Recording permission is likely denied",
-            out.status.code()
-        )),
-        Err(err) => Err(format!("Failed to invoke screencapture: {}", err)),
+    let width = cg_image.width();
+    let height = cg_image.height();
+    if width == 0 || height == 0 {
+        return Err("Captured display image has zero dimensions".to_string());
     }
+
+    // CoreGraphics hands back 32bpp BGRA. Rows are padded to `bytes_per_row`,
+    // which is >= width*4, so the stride must be walked rather than assuming a
+    // tightly packed buffer — otherwise the image shears on displays whose width
+    // isn't a multiple of the alignment.
+    let bytes_per_row = cg_image.bytes_per_row();
+    let src = cg_image.data();
+    let src: &[u8] = &src;
+
+    let mut rgba = Vec::with_capacity(width * height * 4);
+    for y in 0..height {
+        let row = y * bytes_per_row;
+        let row_end = row + width * 4;
+        if row_end > src.len() {
+            return Err(format!(
+                "Captured buffer is shorter than expected ({} bytes, needed {})",
+                src.len(),
+                row_end
+            ));
+        }
+        for px in src[row..row_end].chunks_exact(4) {
+            // BGRA -> RGBA
+            rgba.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
+        }
+    }
+
+    image::RgbaImage::from_raw(width as u32, height as u32, rgba)
+        .map(DynamicImage::ImageRgba8)
+        .ok_or_else(|| "Failed to build image from captured display bytes".to_string())
 }
 
 /// Windows: capture the primary display with GDI (`BitBlt` + `GetDIBits`) into a
@@ -252,6 +287,31 @@ mod tests {
             img.width() > 0 && img.height() > 0,
             "captured image has real dimensions"
         );
+
+        // Regression guard for #47: the capture must be the *actual* display, not
+        // a stand-in. A non-zero-dimensions check alone passed happily for years
+        // while every saved file was the fabricated 800x600 placeholder.
+        #[cfg(target_os = "macos")]
+        {
+            use core_graphics::display::CGDisplay;
+            let d = CGDisplay::main();
+            // `pixels_wide()` reports points; a Retina capture is a 2x pixel
+            // buffer. So assert "at least the display, and not the old fixed-size
+            // stand-in" rather than an exact match, which holds on both.
+            assert_ne!(
+                (img.width(), img.height()),
+                (800, 600),
+                "800x600 is the fabricated placeholder, not a real capture"
+            );
+            assert!(
+                img.width() >= d.pixels_wide() as u32 && img.height() >= d.pixels_high() as u32,
+                "capture ({}x{}) is smaller than the display ({}x{}) — not a real screen grab",
+                img.width(),
+                img.height(),
+                d.pixels_wide(),
+                d.pixels_high()
+            );
+        }
 
         std::fs::remove_dir_all(&dir).ok();
     }
