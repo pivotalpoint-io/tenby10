@@ -5,8 +5,10 @@ OS-level input and screen access.
 
 **Claim under audit:** *"tenby10 is not a keylogger, does not capture anything sensitive, keeps your
 raw activity on your machine, and scores your focus by fair, inspectable rules."* When you enroll and
-share a link, signed 10-minute *summaries* and your scoring configuration are uploaded — never raw
-keystrokes, screenshots, or window titles (§2).
+share a link, signed 10-minute *summaries* and your scoring configuration are uploaded to tenby10 —
+never raw keystrokes, screenshots, or window titles (§2). The one other egress is opt-in BYOK
+scoring: activity text (window titles included) sent directly to the LLM provider *you* configure
+(row 5) — fully on-device with local Ollama.
 
 This guide maps each of those claims to the exact source that proves (or, honestly, does **not** yet
 prove) it. Every reference is `file:line` and is meant to be opened and read directly — do not take
@@ -29,7 +31,7 @@ auditable; the cloud portal is not part of this repository.
 | 1 | No key **content** is captured (not a keylogger) | ✅ Verified in code | [daemon.rs:145](daemon/src/daemon.rs#L145) — `KeyPress(_)` discards the key value |
 | 2 | Only counts/metadata are stored per minute | ✅ Verified | [daemon.rs:334](daemon/src/daemon.rs#L334), [db.rs schema](daemon/src/db.rs) |
 | 3 | Raw screenshots never touch disk; only blurred JPEGs saved | ✅ Verified | [screen.rs:27-54](daemon/src/screen.rs#L27) |
-| 4 | Raw keystrokes, screenshots & window titles never leave the machine | ✅ Verified | Only signed slot *summaries* + your scoring config upload, and only once enrolled — [sync.rs](daemon/src/sync.rs) |
+| 4 | Raw keystrokes & screenshots never leave the machine; window titles never reach tenby10 | ✅ Verified | Cloud sync carries only signed slot *summaries* + your scoring config — [sync.rs](daemon/src/sync.rs); titles go only to your own BYOK provider ([daemon.rs:660](daemon/src/daemon.rs#L660), row 5) |
 | 5 | Cloud sync (when enrolled) is category/count summaries + hashes + config; your BYOK LLM is the only other egress | ✅ Verified | [sync.rs](daemon/src/sync.rs); LLM in [llm.rs](daemon/src/llm.rs), gated by [daemon.rs:570](daemon/src/daemon.rs#L570) |
 | 6 | Screenshots are never uploaded anywhere | ✅ Verified (stronger than claimed) | No image is attached to any LLM call — see Gap G1 |
 | 7 | Focus-scoring rules are deterministic and inspectable | ✅ Verified | [evaluator.rs](daemon/src/evaluator.rs), [entropy.rs](daemon/src/entropy.rs) |
@@ -38,10 +40,12 @@ auditable; the cloud portal is not part of this repository.
 | — | Local dashboard makes no third-party calls | ✅ Verified | [dashboard.rs](daemon/src/dashboard.rs) — Outfit font embedded as a data URI; no CDN `<link>` |
 | — | The installed app opens **no listening port** | ✅ Verified | The dashboard renders in-app over Tauri IPC. The loopback HTTP server is a debug-only escape hatch for the standalone `daemon` binary, off unless `TENBY10_DEBUG_HTTP` is set — [env.rs `debug_http_enabled`](daemon/src/env.rs) |
 
-Bottom line: the core privacy claims — **no keylogging, and your raw keystrokes, screenshots, and
-window titles never leave the machine** — hold up against the code. When you enroll and sync, signed
-10-minute *summaries* and your scoring configuration are uploaded to the cloud (§2); raw activity is
-not. One honest gap between marketing copy and code remains (G1 below).
+Bottom line: the core privacy claims — **no keylogging; raw keystrokes and screenshots never leave
+the machine; window titles never reach tenby10 or anyone you share a link with** — hold up against
+the code. When you enroll and sync, signed 10-minute *summaries* and your scoring configuration are
+uploaded to the cloud (§2); raw activity is not. Opt-in BYOK scoring sends activity text (window
+titles included) directly to the provider *you* configure — fully on-device with local Ollama. One
+honest gap between marketing copy and code remains (G1 below).
 
 ---
 
