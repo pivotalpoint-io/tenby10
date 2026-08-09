@@ -178,6 +178,100 @@ if (aiApiKeyInput) {
   });
 }
 
+// Per-provider endpoint/model defaults, read from the daemon (see llm.rs) so
+// this form always shows what the auditor will actually call.
+let llmProviderDefaults = {};
+
+async function loadLlmProviderDefaults() {
+  try {
+    const rows = await invoke("get_llm_provider_defaults");
+    llmProviderDefaults = Object.fromEntries(
+      rows.map(r => [r.provider, { baseUrl: r.base_url, model: r.model }])
+    );
+  } catch (err) {
+    console.error("Failed to load LLM provider defaults:", err);
+    llmProviderDefaults = {};
+  }
+}
+
+// A local endpoint's traffic never leaves the machine, so it may use plain
+// http and needs no API key. Mirrors is_loopback_url() in llm.rs.
+function isLoopbackUrl(raw) {
+  try {
+    const host = new URL(raw).hostname.replace(/^\[|\]$/g, "");
+    return host === "localhost" || host === "::1" || /^127\./.test(host);
+  } catch {
+    return false;
+  }
+}
+
+// Mirrors validate_base_url() in llm.rs. Returns an error string, or null.
+function validateBaseUrl(raw) {
+  const value = raw.trim();
+  if (!value) return null; // empty = use the provider default
+  let url;
+  try {
+    url = new URL(value);
+  } catch {
+    return "⚠️ API Base URL must be a full URL, e.g. https://api.example.com/v1";
+  }
+  if (url.protocol === "https:") return null;
+  if (url.protocol === "http:" && isLoopbackUrl(value)) return null;
+  if (url.protocol === "http:") {
+    return "⚠️ API Base URL must use https (http is allowed only for localhost). " +
+      "Your API key and window titles would otherwise travel unencrypted.";
+  }
+  return `⚠️ Unsupported URL scheme '${url.protocol.replace(":", "")}': use https`;
+}
+
+// Show each field's effective value as its placeholder, so a blank field is
+// never ambiguous about what the daemon will use.
+function updateLlmProviderHints() {
+  const provider = document.getElementById("ai-provider").value;
+  const defaults = llmProviderDefaults[provider];
+  const modelInput = document.getElementById("ai-model");
+  const baseUrlInput = document.getElementById("ai-base-url");
+  const modelHint = document.getElementById("ai-model-hint");
+  const baseUrlHint = document.getElementById("ai-base-url-hint");
+  const apiKeyHint = document.getElementById("ai-api-key-hint");
+
+  if (modelInput) modelInput.placeholder = defaults ? defaults.model : "";
+  if (baseUrlInput) baseUrlInput.placeholder = defaults ? defaults.baseUrl : "";
+  if (modelHint) {
+    modelHint.innerText = defaults
+      ? `Leave blank to use ${defaults.model}.`
+      : "";
+  }
+  if (baseUrlHint) {
+    baseUrlHint.innerText = defaults
+      ? `Leave blank to use ${defaults.baseUrl}. Point this at a company gateway, ` +
+        "or at a local model (Ollama: http://localhost:11434/v1 with the OpenAI provider)."
+      : "";
+  }
+  if (apiKeyHint) {
+    const local = baseUrlInput && isLoopbackUrl(baseUrlInput.value.trim());
+    apiKeyHint.innerText = local
+      ? "Not required for a local endpoint."
+      : "Stored in your OS keychain, never in a file and never sent to tenby10.";
+  }
+}
+
+const aiProviderSelect = document.getElementById("ai-provider");
+if (aiProviderSelect) {
+  aiProviderSelect.addEventListener("change", updateLlmProviderHints);
+}
+
+const aiBaseUrlInput = document.getElementById("ai-base-url");
+if (aiBaseUrlInput) {
+  aiBaseUrlInput.addEventListener("input", () => {
+    updateLlmProviderHints();
+    const errorEl = document.getElementById("validation-error");
+    if (errorEl) {
+      errorEl.style.display = "none";
+    }
+  });
+}
+
 function updateTokenEstimate() {
   const promptText = document.getElementById("ai-prompt").value;
   const wordCount = promptText.trim().split(/\s+/).filter(w => w.length > 0).length;
@@ -222,6 +316,10 @@ async function loadAgentConfig() {
     }
     document.getElementById("ai-provider").value = currentConfig.llm_provider || "openai";
     document.getElementById("ai-api-key").value = currentConfig.llm_api_key || "";
+    document.getElementById("ai-model").value = currentConfig.llm_model || "";
+    document.getElementById("ai-base-url").value = currentConfig.llm_base_url || "";
+    await loadLlmProviderDefaults();
+    updateLlmProviderHints();
     document.getElementById("ai-prompt").value = currentConfig.llm_prompt || "";
 
     updateTokenEstimate();
@@ -309,23 +407,31 @@ if (saveSettingsBtn) {
       const isLlmEnabled = (aiEngineToggle && aiEngineToggle.checked);
       const apiKey = document.getElementById("ai-api-key").value.trim();
       const prompt = document.getElementById("ai-prompt").value.trim();
+      const baseUrl = document.getElementById("ai-base-url").value.trim();
+      const model = document.getElementById("ai-model").value.trim();
+
+      const rejectSave = (message) => {
+        if (errorEl) {
+          errorEl.innerText = message;
+          errorEl.style.display = "block";
+        }
+        saveSettingsBtn.disabled = false;
+        saveSettingsBtn.innerText = "Save Settings";
+      };
+
       if (isLlmEnabled) {
-        if (!apiKey) {
-          if (errorEl) {
-            errorEl.innerText = "⚠️ API Key is required when AI Auditor is enabled.";
-            errorEl.style.display = "block";
-          }
-          saveSettingsBtn.disabled = false;
-          saveSettingsBtn.innerText = "Save Settings";
+        const baseUrlError = validateBaseUrl(baseUrl);
+        if (baseUrlError) {
+          rejectSave(baseUrlError);
+          return;
+        }
+        // A local endpoint needs no key (Ollama ignores it); every remote one does.
+        if (!apiKey && !isLoopbackUrl(baseUrl)) {
+          rejectSave("⚠️ API Key is required when AI Auditor is enabled.");
           return;
         }
         if (!prompt) {
-          if (errorEl) {
-            errorEl.innerText = "⚠️ System Auditor Prompt is required when AI Auditor is enabled.";
-            errorEl.style.display = "block";
-          }
-          saveSettingsBtn.disabled = false;
-          saveSettingsBtn.innerText = "Save Settings";
+          rejectSave("⚠️ System Auditor Prompt is required when AI Auditor is enabled.");
           return;
         }
       }
@@ -333,6 +439,8 @@ if (saveSettingsBtn) {
       config.engine_mode = isLlmEnabled ? "llm" : "static";
       config.llm_provider = document.getElementById("ai-provider").value;
       config.llm_api_key = apiKey;
+      config.llm_base_url = baseUrl;
+      config.llm_model = model;
       config.llm_prompt = prompt;
 
       await invoke("save_agent_config", { newConfig: config });

@@ -142,15 +142,28 @@
             <div class="form-group">
               <label class="input-label" for="ai-provider">LLM Provider</label>
               <select id="ai-provider">
-                <option value="openai">OpenAI (GPT-4o)</option>
-                <option value="anthropic">Anthropic (Claude 3.5 Sonnet)</option>
+                <option value="openai">OpenAI</option>
+                <option value="anthropic">Anthropic (Claude)</option>
                 <option value="gemini">Google Gemini</option>
               </select>
             </div>
 
             <div class="form-group">
+              <label class="input-label" for="ai-model">Model</label>
+              <input id="ai-model" type="text" spellcheck="false" autocomplete="off" />
+              <p id="ai-model-hint" class="desc"></p>
+            </div>
+
+            <div class="form-group">
+              <label class="input-label" for="ai-base-url">API Base URL</label>
+              <input id="ai-base-url" type="text" spellcheck="false" autocomplete="off" />
+              <p id="ai-base-url-hint" class="desc"></p>
+            </div>
+
+            <div class="form-group">
               <label class="input-label" for="ai-api-key">API Key</label>
               <input id="ai-api-key" type="password" placeholder="sk-... or API Key" autocomplete="off" />
+              <p id="ai-api-key-hint" class="desc"></p>
             </div>
 
             <div class="form-group">
