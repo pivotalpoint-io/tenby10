@@ -45,6 +45,14 @@ pub struct AgentConfig {
     pub llm_provider: String,
     #[serde(default)]
     pub llm_api_key: String,
+    /// API base URL for the auditor provider. Empty = the provider's default
+    /// (see `llm::provider_defaults`). Set this to reach an OpenAI-compatible
+    /// gateway or a local Ollama (`http://localhost:11434/v1`).
+    #[serde(default)]
+    pub llm_base_url: String,
+    /// Model the auditor calls. Empty = the provider's default.
+    #[serde(default)]
+    pub llm_model: String,
     #[serde(default = "default_llm_prompt")]
     pub llm_prompt: String,
     #[serde(default)]
@@ -126,6 +134,8 @@ impl Default for AgentConfig {
             engine_mode: default_engine_mode(),
             llm_provider: String::new(),
             llm_api_key: String::new(),
+            llm_base_url: String::new(),
+            llm_model: String::new(),
             llm_prompt: default_llm_prompt(),
             dashboard_port: None,
             enforce_synthetic_detection: false,
@@ -311,6 +321,8 @@ pub fn generate_enrollment_keys(enrollment_token: &str) -> AgentConfig {
         engine_mode: default_engine_mode(),
         llm_provider: String::new(),
         llm_api_key: String::new(),
+        llm_base_url: String::new(),
+        llm_model: String::new(),
         llm_prompt: default_llm_prompt(),
         dashboard_port: None,
         enforce_synthetic_detection: false,

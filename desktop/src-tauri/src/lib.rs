@@ -278,6 +278,30 @@ async fn get_agent_config() -> Result<daemon::config::AgentConfig, String> {
     daemon::config::load_config(config_path)
 }
 
+/// The endpoint and model each provider actually calls when the user leaves
+/// those settings blank. The UI reads them from here rather than carrying its
+/// own copy, so the form can never advertise a model the daemon doesn't use.
+#[derive(serde::Serialize)]
+struct LlmProviderDefaults {
+    provider: String,
+    base_url: String,
+    model: String,
+}
+
+#[tauri::command]
+async fn get_llm_provider_defaults() -> Result<Vec<LlmProviderDefaults>, String> {
+    Ok(["openai", "anthropic", "gemini"]
+        .iter()
+        .filter_map(|provider| {
+            daemon::llm::provider_defaults(provider).map(|(base_url, model)| LlmProviderDefaults {
+                provider: provider.to_string(),
+                base_url: base_url.to_string(),
+                model: model.to_string(),
+            })
+        })
+        .collect())
+}
+
 #[tauri::command]
 async fn save_agent_config(new_config: daemon::config::AgentConfig) -> Result<(), String> {
     let app_home = daemon::env::get_app_home();
@@ -418,6 +442,7 @@ pub fn run() {
             export_dashboard_csv,
             get_agent_config,
             save_agent_config,
+            get_llm_provider_defaults,
             check_permissions,
             get_capture_health,
             open_accessibility_settings,
