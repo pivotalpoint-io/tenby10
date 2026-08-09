@@ -66,7 +66,7 @@ async fn main() {
         let port = daemon::env::get_app_port(&config);
         println!(
             "[Dashboard] TENBY10_DEBUG_HTTP is set — starting the debug HTTP server on \
-             127.0.0.1:{}. It serves blurred screenshots and an activity CSV to anything \
+             127.0.0.1:{}. It serves activity data and a CSV export to anything \
              that can reach loopback; unset the variable to disable it.",
             port
         );

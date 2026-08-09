@@ -10,10 +10,8 @@ chrono = "0.4"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.11"
-image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 axum = "0.8"
 tokio = { version = "1.37", features = ["full"] }
-tower-http = { version = "0.7", features = ["fs", "cors"] }
 reqwest = { version = "0.13", features = ["json", "blocking"] }
 ed25519-dalek = { version = "3.0", features = ["rand_core"] }
 rand = "0.10"
@@ -30,4 +28,4 @@ core-graphics = "0.25"
 core-foundation = "0.10"
 
 [target.'cfg(target_os = "windows")'.dependencies]
-winapi = { version = "0.3", features = ["winuser", "wingdi"] }
+winapi = { version = "0.3", features = ["winuser"] }

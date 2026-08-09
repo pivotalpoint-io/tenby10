@@ -48,8 +48,6 @@ pub struct AgentConfig {
     #[serde(default = "default_llm_prompt")]
     pub llm_prompt: String,
     #[serde(default)]
-    pub send_screenshots: bool,
-    #[serde(default)]
     pub dashboard_port: Option<u16>,
     /// Enforce synthetic-input detection (#87): mark a minute tampered when its
     /// input was entirely software-injected. Default off — detection is observe-
@@ -129,7 +127,6 @@ impl Default for AgentConfig {
             llm_provider: String::new(),
             llm_api_key: String::new(),
             llm_prompt: default_llm_prompt(),
-            send_screenshots: false,
             dashboard_port: None,
             enforce_synthetic_detection: false,
         }
@@ -315,7 +312,6 @@ pub fn generate_enrollment_keys(enrollment_token: &str) -> AgentConfig {
         llm_provider: String::new(),
         llm_api_key: String::new(),
         llm_prompt: default_llm_prompt(),
-        send_screenshots: false,
         dashboard_port: None,
         enforce_synthetic_detection: false,
     }
@@ -381,7 +377,6 @@ mod tests {
         assert!(config.llm_provider.is_empty());
         assert!(config.llm_api_key.is_empty());
         assert!(config.llm_prompt.contains("productivity auditor"));
-        assert!(!config.send_screenshots);
     }
 
     #[test]
@@ -402,7 +397,26 @@ mod tests {
         assert_eq!(config.distracting_apps, "");
         assert!(config.productive_apps.contains("vscode")); // Uses custom default
         assert!(config.meeting_apps.contains("zoom")); // Uses custom default
-        assert!(!config.send_screenshots);
+    }
+
+    /// A config written by a pre-ADR-0018 build still carries `send_screenshots`.
+    /// The field is gone from the struct, so loading must ignore it rather than
+    /// fail — otherwise upgrading wipes the user's whole configuration.
+    #[test]
+    fn test_legacy_send_screenshots_key_is_ignored() {
+        let json = r#"{
+            "agent_id": "agent_123",
+            "enrollment_token": "token_123",
+            "public_key": "pub",
+            "private_key": "priv",
+            "send_screenshots": true,
+            "engine_mode": "llm"
+        }"#;
+
+        let config: AgentConfig = serde_json::from_str(json)
+            .expect("a legacy config with send_screenshots must still deserialize");
+        assert_eq!(config.agent_id, "agent_123");
+        assert_eq!(config.engine_mode, "llm");
     }
 
     #[test]

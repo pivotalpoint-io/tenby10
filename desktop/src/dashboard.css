@@ -472,7 +472,7 @@
             flex-grow: 1;
         }
 
-        .view-screen-compact-btn {
+        .view-slot-compact-btn {
             background: rgba(255, 255, 255, 0.04);
             border: 1px solid var(--border-card);
             color: var(--text-muted);
@@ -486,7 +486,7 @@
             transition: all 0.2s ease;
         }
 
-        .view-screen-compact-btn:hover {
+        .view-slot-compact-btn:hover {
             background: rgba(255, 255, 255, 0.08);
             color: var(--text-main);
             border-color: rgba(255, 255, 255, 0.15);
@@ -585,7 +585,7 @@
             font-size: 0.9rem;
         }
 
-        /* Native dialog styling for blurred screenshots */
+        /* Native dialog styling for the slot details modal */
         .glass-dialog {
             background: rgba(15, 17, 26, 0.95);
             border: 1px solid var(--border-card);
@@ -633,24 +633,12 @@
             color: var(--text-main);
         }
 
-        #screenshot-img {
-            max-width: 100%;
-            height: auto;
-            border-radius: 8px;
-            border: 1px solid var(--border-card);
-        }
-
-        /* Two-column layout in dialog */
+        /* Single-column dialog body (the screen-capture pane is gone, ADR 0018) */
         .dialog-body-grid {
             display: grid;
-            grid-template-columns: 1.2fr 1fr;
+            grid-template-columns: 1fr;
             gap: 1.5rem;
             margin-top: 1rem;
-        }
-        @media (max-width: 768px) {
-            .dialog-body-grid {
-                grid-template-columns: 1fr;
-            }
         }
         .dialog-details-container {
             display: flex;

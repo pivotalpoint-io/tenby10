@@ -4,9 +4,9 @@
 [![License: Source-Available (PPSAL-1.0)](https://img.shields.io/badge/License-Source--Available_(PPSAL--1.0)-purple.svg)](LICENSE)
 [![Platform: macOS](https://img.shields.io/badge/Platform-macOS-lightgrey.svg)](https://apple.com)
 
-**tenby10** is a privacy-first, source-available desktop activity tracker. A local background daemon measures your work activity on-device and turns it into a **tamper-evident, cryptographically-signed** record of your time — using only input *counts* and locally blurred screenshots, never raw keystrokes or raw screens.
+**tenby10** is a privacy-first, source-available desktop activity tracker. A local background daemon measures your work activity on-device and turns it into a **tamper-evident, cryptographically-signed** record of your time — using only input *counts*, app names and window titles — never raw keystrokes, and never an image of your screen.
 
-Everything is stored locally under `~/.tenby10/`. If you enroll a device, only signed 10-minute *summaries* and your scoring configuration are synced — raw keystrokes, screenshots, and window titles are never synced to tenby10 (see [AUDIT.md](AUDIT.md)). It also operates on a **Bring Your Own Key (BYOK)** model: if you enable AI scoring, activity text (including window titles) goes from your machine straight to the LLM provider *you* configure — your key, your provider, never through tenby10. With local Ollama it stays fully on-device.
+Everything is stored locally under `~/.tenby10/`. If you enroll a device, only signed 10-minute *summaries* and your scoring configuration are synced — raw keystrokes and window titles are never synced to tenby10 (see [AUDIT.md](AUDIT.md)). It also operates on a **Bring Your Own Key (BYOK)** model: if you enable AI scoring, activity text (including window titles) goes from your machine straight to the LLM provider *you* configure — your key, your provider, never through tenby10. With local Ollama it stays fully on-device.
 
 > 🔍 **Don't trust — verify.** This is the full **source-available** client that runs on your machine. Before granting it input and screen access, read the **[Auditor's Guide (AUDIT.md)](AUDIT.md)**: it maps every privacy and fairness claim (no keylogging, no cloud exfiltration, fair scoring rules) to the exact source lines that prove it, and honestly lists where the code doesn't yet match our copy. An AI agent can follow it end-to-end to verify us.
 
@@ -15,7 +15,8 @@ Everything is stored locally under `~/.tenby10/`. If you enroll a device, only s
 ## 🚀 Key Features
 
 *   ⏱️ **Passive, Zero-Friction Tracking**: The background daemon automatically logs active application and window states. Includes a convenient Pause/Resume toggle switch in the system tray and settings UI to control when tracking is active.
-*   🔒 **Local-First & Sandbox Storage**: All minute logs, configuration files, and screen captures are stored strictly on your machine under `~/.tenby10/`.
+*   🔒 **Local-First & Sandbox Storage**: All minute logs and configuration files are stored strictly on your machine under `~/.tenby10/`.
+*   🚫 **No screen capture, by construction**: tenby10 takes no screenshots — there is no capture code in the client. Read [`daemon/src/`](daemon/src/) and check for yourself.
     - **Development Mode**: When running from source in debug mode, the app automatically isolates itself to `~/.tenby10_dev/`.
     - **Environment Overrides**: Use `TENBY10_HOME` to override the base directory. `TENBY10_DEBUG_HTTP` opts the standalone daemon into a loopback debug server (off by default), and `TENBY10_PORT` sets its port (default: 5005).
 *   🛡️ **Tamper-Evident Ledger**: Each 10-minute slot summary is SHA-256 hash-chained over its **full** payload, so editing any stored field breaks the chain. Once you enroll, every slot is additionally **Ed25519-signed with your key**, so even a re-computed hash won't verify without that key. On a machine you control this is tamper-*evidence* and self-asserted authorship — not, by itself, third-party proof.
@@ -40,7 +41,6 @@ The codebase is structured as a lightweight monorepo containing two core compone
                   │              Background Daemon               │
                   │   - Global OS Input Listeners (rdev)         │
                   │   - Window Scraper (polling at 10s)          │
-                  │   - Screen Blur Capture (10m slot random)    │
                   │   - Local DB & Cryptographic Ledger          │
                   └──────────────┬───────────────────────────────┘
                                  │ Tauri IPC (no network)
@@ -49,22 +49,21 @@ The codebase is structured as a lightweight monorepo containing two core compone
                   │      Analytics Dashboard (in-app view)       │
                   │   - Renders inside the app window            │
                   │   - Interactive focus entropy graphs         │
-                  │   - Blurred timeline screen browser          │
                   └──────────────────────────────────────────────┘
 ```
 
-1.  **Background Daemon (`/daemon`)**: A background service written in Rust that handles global OS input hooks, scrapes active window titles at a 10s interval, processes Gaussian blurred screenshots, and maintains the local SQLite database (`tenby10.db`). **The installed app opens no network port** — the dashboard reads from the daemon over Tauri IPC. A loopback HTTP server exists in the codebase purely as a debugging escape hatch for the standalone `daemon` binary, and stays off unless `TENBY10_DEBUG_HTTP` is explicitly set.
+1.  **Background Daemon (`/daemon`)**: A background service written in Rust that handles global OS input hooks, scrapes active window titles at a 10s interval, and maintains the local SQLite database (`tenby10.db`). **The installed app opens no network port** — the dashboard reads from the daemon over Tauri IPC. A loopback HTTP server exists in the codebase purely as a debugging escape hatch for the standalone `daemon` binary, and stays off unless `TENBY10_DEBUG_HTTP` is explicitly set.
 2.  **Desktop GUI (`/desktop`)**: A native desktop wrapper built using **Tauri (v2)** with a frosted glassmorphism settings interface, enabling cryptographic key enrollment and configuration management.
 
 ---
 
 ## 🔒 Privacy & Security Blueprint
 
-*   **In-Memory Screen Blurring**: The daemon captures the active screen once per 10-minute slot. The raw image buffer is immediately processed in-memory using a 20px Gaussian blur. Only the blurred low-resolution JPEG (~13 KB) is written to the disk. The raw screenshot is immediately discarded from memory and **never** hits the persistent storage.
-*   **Negligible Footprint**: Telemetry metrics consume under **700 KB per active workday** (~80 KB SQLite DB + ~624 KB blurred screenshots), translating to less than 170 MB of disk usage per year. No background database fragmentation or CPU spikes are caused by automated deletion/vacuum cycles.
+*   **No screen capture at all**: tenby10 never reads the pixels on your screen. Earlier versions saved one heavily-blurred JPEG per 10-minute slot; that subsystem was removed outright (ADR 0018) rather than left switchable, and upgrading deletes the old `screenshots/` folder. macOS still asks for Screen Recording because it withholds *window titles* without it — the app reads titles, not pixels.
+*   **Negligible Footprint**: Telemetry metrics consume well under **100 KB per active workday**, translating to a few MB of disk usage per year. No background database fragmentation or CPU spikes are caused by automated deletion/vacuum cycles.
 *   **On-device by default — you decide what leaves**: Nothing is uploaded until *you* choose to share verifiable reports (by enrolling a device). The split is deliberate:
-    - **Always stays on your machine**: raw keystrokes (only *counts* are kept — never the keys), the screen (blurred in memory; only a low-res blurred JPEG is saved), and the full activity database under `~/.tenby10/`.
-    - **Leaves only when you share a report**: signed 10-minute *summaries* (focus score, active/idle and input **counts**, app-category counts, a **hash** of any AI note) plus your scoring configuration — enough for a recipient to see the numbers and which rules produced them. Raw keystrokes, screenshots, and window titles are **never** uploaded.
+    - **Always stays on your machine**: raw keystrokes (only *counts* are kept — never the keys) and the full activity database under `~/.tenby10/`. Your screen is never captured at all.
+    - **Leaves only when you share a report**: signed 10-minute *summaries* (focus score, active/idle and input **counts**, app-category counts, a **hash** of any AI note) plus your scoring configuration — enough for a recipient to see the numbers and which rules produced them. Raw keystrokes and window titles are **never** uploaded.
     - **Your own AI, opt-in and separate**: if you enable BYOK LLM scoring, activity text (including window titles) goes directly to *your* provider using *your* key — to your provider, never to tenby10.
 
 ---
@@ -95,7 +94,7 @@ cargo run
 
 # Optional: also start the loopback debug dashboard for triage. It is
 # unauthenticated — anything that can reach loopback on this machine can read the
-# blurred screenshots and activity CSV it serves — so leave it off by default.
+# activity data and CSV it serves — so leave it off by default.
 TENBY10_DEBUG_HTTP=1 cargo run   # then open http://localhost:5005
 ```
 

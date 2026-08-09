@@ -1,6 +1,6 @@
 // Native activity dashboard, rendered as an in-window view of the Tauri app.
 // Data comes from #[tauri::command] IPC calls (no HTTP / no 127.0.0.1),
-// screenshots are inlined as data: URLs, and CSV export uses a native save dialog.
+// CSV export uses a native save dialog.
 // This document is loaded in a same-origin iframe, so the Tauri bridge lives on
 // the parent window; fall back to it when this frame wasn't injected directly.
 const __tauri =
@@ -247,7 +247,7 @@ function goHome() {
                 .replace(/'/g, "&#039;");
         }
 
-        function showScreenshot(timestamp, event) {
+        function showSlotDetails(timestamp, event) {
             if (event) event.stopPropagation();
             
             // Format start and end time for title
@@ -256,13 +256,6 @@ function goHome() {
             const endDate = new Date((timestamp + 600) * 1000);
             const endStr = endDate.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
             document.getElementById('dialog-slot-title').innerText = `Slot Details: ${startStr} - ${endStr}`;
-            
-            const img = document.getElementById('screenshot-img');
-            const placeholder = 'data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="800" height="600" viewBox="0 0 800 600"><rect width="800" height="600" fill="%23141624"/><text x="50%" y="50%" dominant-baseline="middle" text-anchor="middle" font-family="sans-serif" font-size="22" fill="%236b7280">No blurred screen capture saved for this slot.</text></svg>';
-            img.src = placeholder;
-            invoke('dashboard_screenshot', { slotStart: timestamp })
-                .then(dataUrl => { img.src = dataUrl || placeholder; })
-                .catch(() => { img.src = placeholder; });
             
             // Render LLM Reasoning if available
             const slot = globalSlots.find(s => s.slot_start === timestamp);
@@ -326,19 +319,19 @@ function goHome() {
                     listContainer.innerHTML = `<div style="color: var(--accent-red); font-size: 0.8rem; text-align: center; padding: 2rem 0;">Failed to load activity details.</div>`;
                 });
             
-            const dialog = document.getElementById('screenshot-dialog');
+            const dialog = document.getElementById('slot-dialog');
             dialog.showModal();
         }
 
-        function closeScreenshotDialog() {
-            const dialog = document.getElementById('screenshot-dialog');
+        function closeSlotDialog() {
+            const dialog = document.getElementById('slot-dialog');
             dialog.close();
         }
 
         // Close modal dialog on backdrop click
-        document.getElementById('screenshot-dialog').addEventListener('click', function(e) {
+        document.getElementById('slot-dialog').addEventListener('click', function(e) {
             if (e.target === this) {
-                closeScreenshotDialog();
+                closeSlotDialog();
             }
         });
 
@@ -604,8 +597,8 @@ function goHome() {
                                     <div class="slot-compact-stats">
                                         ${statsHtml}
                                     </div>
-                                    <button class="view-screen-compact-btn" onclick="showScreenshot(${slot.slot_start}, event)">
-                                        🖼️ View
+                                    <button class="view-slot-compact-btn" onclick="showSlotDetails(${slot.slot_start}, event)">
+                                        📋 Details
                                     </button>
                                 </div>
                             `;

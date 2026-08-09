@@ -21,8 +21,8 @@ use crate::db::Database;
 /// standalone `daemon` binary, gated behind [`crate::env::debug_http_enabled`].
 ///
 /// It is unauthenticated: while enabled, anything that can reach loopback — any
-/// local process or OS user on the machine — can read the blurred screenshots and
-/// the activity CSV it serves. Keep it off unless actively debugging.
+/// local process or OS user on the machine — can read the activity CSV it serves.
+/// Keep it off unless actively debugging.
 pub fn start_dashboard_server(db: Arc<Database>, port: u16) {
     let db_state = Arc::clone(&db);
 
@@ -33,9 +33,6 @@ pub fn start_dashboard_server(db: Arc<Database>, port: u16) {
             .expect("Failed to build Tokio runtime for web server");
 
         rt.block_on(async move {
-            let mut screenshots_dir = crate::env::get_app_home();
-            screenshots_dir.push("screenshots");
-
             // Read-only triage surface. The config read/write and mock-enroll routes
             // were removed (#40): they mutated state — including secret-bearing
             // config — over an unauthenticated port, and had no diagnostic value now
@@ -50,10 +47,6 @@ pub fn start_dashboard_server(db: Arc<Database>, port: u16) {
                 .route("/api/pending", get(get_pending_slots))
                 .route("/api/slot_details", get(get_slot_details))
                 .route("/api/export", get(export_csv))
-                .nest_service(
-                    "/screenshots",
-                    tower_http::services::ServeDir::new(screenshots_dir),
-                )
                 .with_state(db_state);
 
             let addr = SocketAddr::from(([127, 0, 0, 1], port));
@@ -664,7 +657,7 @@ async fn serve_dashboard_html() -> impl IntoResponse {
             flex-grow: 1;
         }
 
-        .view-screen-compact-btn {
+        .view-slot-compact-btn {
             background: rgba(255, 255, 255, 0.04);
             border: 1px solid var(--border-card);
             color: var(--text-muted);
@@ -678,7 +671,7 @@ async fn serve_dashboard_html() -> impl IntoResponse {
             transition: all 0.2s ease;
         }
 
-        .view-screen-compact-btn:hover {
+        .view-slot-compact-btn:hover {
             background: rgba(255, 255, 255, 0.08);
             color: var(--text-main);
             border-color: rgba(255, 255, 255, 0.15);
@@ -777,7 +770,7 @@ async fn serve_dashboard_html() -> impl IntoResponse {
             font-size: 0.9rem;
         }
 
-        /* Native dialog styling for blurred screenshots */
+        /* Native dialog styling for the slot details modal */
         .glass-dialog {
             background: rgba(15, 17, 26, 0.95);
             border: 1px solid var(--border-card);
@@ -825,24 +818,12 @@ async fn serve_dashboard_html() -> impl IntoResponse {
             color: var(--text-main);
         }
 
-        #screenshot-img {
-            max-width: 100%;
-            height: auto;
-            border-radius: 8px;
-            border: 1px solid var(--border-card);
-        }
-
-        /* Two-column layout in dialog */
+        /* Single-column dialog body (the screen-capture pane is gone, ADR 0018) */
         .dialog-body-grid {
             display: grid;
-            grid-template-columns: 1.2fr 1fr;
+            grid-template-columns: 1fr;
             gap: 1.5rem;
             margin-top: 1rem;
-        }
-        @media (max-width: 768px) {
-            .dialog-body-grid {
-                grid-template-columns: 1fr;
-            }
         }
         .dialog-details-container {
             display: flex;
@@ -1160,20 +1141,14 @@ async fn serve_dashboard_html() -> impl IntoResponse {
         </div>
     </main>
 
-    <!-- Native screenshot & details modal dialog -->
-    <dialog id="screenshot-dialog" class="glass-dialog">
+    <!-- Slot details modal dialog -->
+    <dialog id="slot-dialog" class="glass-dialog">
         <div class="dialog-content">
             <div class="dialog-header">
                 <h3 id="dialog-slot-title">Slot Details</h3>
-                <button class="close-btn" onclick="closeScreenshotDialog()">✕</button>
+                <button class="close-btn" onclick="closeSlotDialog()">✕</button>
             </div>
             <div class="dialog-body-grid">
-                <!-- Left: Screenshot -->
-                <div style="display: flex; flex-direction: column; gap: 0.5rem; flex: 1.2;">
-                    <h4 style="font-size: 0.8rem; text-transform: uppercase; color: var(--text-muted); letter-spacing: 0.5px;">Screen Capture</h4>
-                    <img id="screenshot-img" src="" alt="Blurred Screen Capture" />
-                </div>
-                <!-- Right: Activity Details -->
                 <div style="display: flex; flex-direction: column; gap: 0.5rem; flex: 1;">
                     <h4 style="font-size: 0.8rem; text-transform: uppercase; color: var(--text-muted); letter-spacing: 0.5px;">Minute-by-Minute Activity</h4>
                     <div id="dialog-llm-reasoning"></div>
@@ -1489,7 +1464,7 @@ async fn serve_dashboard_html() -> impl IntoResponse {
                 .replace(/'/g, "&#039;");
         }
 
-        function showScreenshot(timestamp, event) {
+        function showSlotDetails(timestamp, event) {
             if (event) event.stopPropagation();
             
             // Format start and end time for title
@@ -1498,12 +1473,6 @@ async fn serve_dashboard_html() -> impl IntoResponse {
             const endDate = new Date((timestamp + 600) * 1000);
             const endStr = endDate.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
             document.getElementById('dialog-slot-title').innerText = `Slot Details: ${startStr} - ${endStr}`;
-            
-            const img = document.getElementById('screenshot-img');
-            img.src = `/screenshots/slot_${timestamp}.jpg`;
-            img.onerror = () => {
-                img.src = 'data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="800" height="600" viewBox="0 0 800 600"><rect width="800" height="600" fill="%23141624"/><text x="50%" y="50%" dominant-baseline="middle" text-anchor="middle" font-family="sans-serif" font-size="22" fill="%236b7280">No blurred screen capture saved for this slot.</text></svg>';
-            };
             
             // Render LLM Reasoning if available
             const slot = globalSlots.find(s => s.slot_start === timestamp);
@@ -1568,19 +1537,19 @@ async fn serve_dashboard_html() -> impl IntoResponse {
                     listContainer.innerHTML = `<div style="color: var(--accent-red); font-size: 0.8rem; text-align: center; padding: 2rem 0;">Failed to load activity details.</div>`;
                 });
             
-            const dialog = document.getElementById('screenshot-dialog');
+            const dialog = document.getElementById('slot-dialog');
             dialog.showModal();
         }
 
-        function closeScreenshotDialog() {
-            const dialog = document.getElementById('screenshot-dialog');
+        function closeSlotDialog() {
+            const dialog = document.getElementById('slot-dialog');
             dialog.close();
         }
 
         // Close modal dialog on backdrop click
-        document.getElementById('screenshot-dialog').addEventListener('click', function(e) {
+        document.getElementById('slot-dialog').addEventListener('click', function(e) {
             if (e.target === this) {
-                closeScreenshotDialog();
+                closeSlotDialog();
             }
         });
 
@@ -1846,8 +1815,8 @@ async fn serve_dashboard_html() -> impl IntoResponse {
                                     <div class="slot-compact-stats">
                                         ${statsHtml}
                                     </div>
-                                    <button class="view-screen-compact-btn" onclick="showScreenshot(${slot.slot_start}, event)">
-                                        🖼️ View
+                                    <button class="view-slot-compact-btn" onclick="showSlotDetails(${slot.slot_start}, event)">
+                                        📋 Details
                                     </button>
                                 </div>
                             `;

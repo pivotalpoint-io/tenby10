@@ -6,7 +6,7 @@ OS-level input and screen access.
 **Claim under audit:** *"tenby10 is not a keylogger, does not capture anything sensitive, keeps your
 raw activity on your machine, and scores your focus by fair, inspectable rules."* When you enroll and
 share a link, signed 10-minute *summaries* and your scoring configuration are uploaded to tenby10 —
-never raw keystrokes, screenshots, or window titles (§2). The one other egress is opt-in BYOK
+never raw keystrokes or window titles — and no screen images exist to upload (§2, §3). The one other egress is opt-in BYOK
 scoring: activity text (window titles included) sent directly to the LLM provider *you* configure
 (row 5) — fully on-device with local Ollama.
 
@@ -30,22 +30,26 @@ auditable; the cloud portal is not part of this repository.
 |---|-------|--------|------------------|
 | 1 | No key **content** is captured (not a keylogger) | ✅ Verified in code | [daemon.rs:145](daemon/src/daemon.rs#L145) — `KeyPress(_)` discards the key value |
 | 2 | Only counts/metadata are stored per minute | ✅ Verified | [daemon.rs:334](daemon/src/daemon.rs#L334), [db.rs schema](daemon/src/db.rs) |
-| 3 | Raw screenshots never touch disk; only blurred JPEGs saved | ✅ Verified | [screen.rs:27-54](daemon/src/screen.rs#L27) |
-| 4 | Raw keystrokes & screenshots never leave the machine; window titles never reach tenby10 | ✅ Verified | Cloud sync carries only signed slot *summaries* + your scoring config — [sync.rs](daemon/src/sync.rs); titles go only to your own BYOK provider ([daemon.rs:660](daemon/src/daemon.rs#L660), row 5) |
+| 3 | No screen capture exists at all | ✅ Verified | No capture code in the client — `grep -rn "CGDisplay\|BitBlt\|screencapture" daemon/src/` returns nothing (ADR 0018) |
+| 4 | Raw keystrokes never leave the machine; window titles never reach tenby10 | ✅ Verified | Cloud sync carries only signed slot *summaries* + your scoring config — [sync.rs](daemon/src/sync.rs); titles go only to your own BYOK provider ([daemon.rs](daemon/src/daemon.rs), row 5) |
 | 5 | Cloud sync (when enrolled) is category/count summaries + hashes + config; your BYOK LLM is the only other egress | ✅ Verified | [sync.rs](daemon/src/sync.rs); LLM in [llm.rs](daemon/src/llm.rs), gated by [daemon.rs:570](daemon/src/daemon.rs#L570) |
-| 6 | Screenshots are never uploaded anywhere | ✅ Verified (stronger than claimed) | No image is attached to any LLM call — see Gap G1 |
+| 6 | No image is sent to your LLM provider, ever | ✅ Verified structurally | The provider trait takes text only ([llm.rs](daemon/src/llm.rs)); nothing in the client can produce an image to send |
 | 7 | Focus-scoring rules are deterministic and inspectable | ✅ Verified | [evaluator.rs](daemon/src/evaluator.rs), [entropy.rs](daemon/src/entropy.rs) |
 | 8 | Local logs are tamper-evident (full-payload hash chain) + self-signed when enrolled | ✅ Verified | [db.rs `insert_slot_summary`/`verify_ledger_integrity`](daemon/src/db.rs) |
 | — | Secrets stored in OS keychain | ✅ Verified | [config.rs `save_config`/`load_config`](daemon/src/config.rs) — `private_key` & `llm_api_key` kept in the OS keychain via the `keyring` crate |
 | — | Local dashboard makes no third-party calls | ✅ Verified | [dashboard.rs](daemon/src/dashboard.rs) — Outfit font embedded as a data URI; no CDN `<link>` |
 | — | The installed app opens **no listening port** | ✅ Verified | The dashboard renders in-app over Tauri IPC. The loopback HTTP server is a debug-only escape hatch for the standalone `daemon` binary, off unless `TENBY10_DEBUG_HTTP` is set — [env.rs `debug_http_enabled`](daemon/src/env.rs) |
 
-Bottom line: the core privacy claims — **no keylogging; raw keystrokes and screenshots never leave
+Bottom line: the core privacy claims — **no keylogging; no screen capture; raw keystrokes never leave
 the machine; window titles never reach tenby10 or anyone you share a link with** — hold up against
 the code. When you enroll and sync, signed 10-minute *summaries* and your scoring configuration are
 uploaded to the cloud (§2); raw activity is not. Opt-in BYOK scoring sends activity text (window
-titles included) directly to the provider *you* configure — fully on-device with local Ollama. One
-honest gap between marketing copy and code remains (G1 below).
+titles included) directly to the provider *you* configure — fully on-device with local Ollama.
+
+The gap previously logged here as **G1** (a `send_screenshots` toggle that never sent anything) is
+closed: rather than wire it up, the screenshot subsystem was removed outright
+([ADR 0018](../decisions/0018-remove-screenshot-subsystem.md)). The toggle is gone, and so is every
+line of capture code.
 
 ---
 
@@ -110,7 +114,7 @@ Nothing leaves the machine until you **enroll** and sync. The complete list of o
      config — your auditing rules (app lists, engine mode, synthetic-detection flag) and the AI auditor
      prompt — so a relying party can see which rubric produced each score (#62).
 
-   **Never sent:** raw keystrokes, screenshot bytes, or window titles.
+   **Never sent:** raw keystrokes or window titles.
 
 2. **Your own LLM provider — opt-in, BYOK.** [llm.rs](daemon/src/llm.rs) posts directly to
    `api.openai.com` ([llm.rs:35](daemon/src/llm.rs#L35)), `api.anthropic.com`
@@ -120,7 +124,7 @@ Nothing leaves the machine until you **enroll** and sync. The complete list of o
    ([daemon.rs:570](daemon/src/daemon.rs#L570)) **and** a provider + key are configured
    ([llm.rs:152-155](daemon/src/llm.rs#L152) returns `None` otherwise — default config ships empty, so
    the default is off). The payload is the activity text (app names, **window titles**, key/click
-   counts) — built at [daemon.rs:577-587](daemon/src/daemon.rs#L577). No screenshot bytes (§ Gap G1).
+   counts) — built at [daemon.rs](daemon/src/daemon.rs). Text only; no image exists to send (§3).
 
 3. **Dashboard webfont — self-hosted.** The dashboard font is embedded as a `data:` URI
    ([dashboard.rs](daemon/src/dashboard.rs)); opening the local dashboard makes **no** third-party
@@ -131,22 +135,29 @@ raw keystrokes, screens, or window titles behind them.
 
 ---
 
-## 3. Screen capture privacy
+## 3. Screen capture: there isn't any
 
-One screenshot per 10-minute slot, blurred in memory, raw bytes dropped before anything is written.
+tenby10 does not read the pixels on your screen. This is not a setting — there is no capture code in
+the client, so there is nothing to enable, misconfigure, or push down from a managed profile.
 
-- **macOS** ([screen.rs:61-83](daemon/src/screen.rs#L61)) captures via the `screencapture` tool to
-  stdout; **Windows** ([screen.rs:89-168](daemon/src/screen.rs#L89)) via a GDI `BitBlt`. On failure it
-  **returns an error** — it does *not* fabricate a placeholder. (An earlier version substituted a gray
-  800×600 image and reported success; that was removed so a denied grant surfaces honestly and
-  `screen_capture_ok` flips false — see [daemon.rs:262-270](daemon/src/daemon.rs#L262).)
-- [screen.rs:33](daemon/src/screen.rs#L33) — `imageops::blur(&raw_img, 20.0)`, then
-  **`drop(raw_img)`** ([screen.rs:36](daemon/src/screen.rs#L36)) purges the raw buffer.
-- [screen.rs:41-47](daemon/src/screen.rs#L41) — only the blurred image is saved, as JPEG, to
-  `~/.tenby10/screenshots/slot_<ts>.jpg`.
+Verify it yourself; all three return nothing:
 
-The raw, unblurred image is never passed to `save`. Capture is **macOS + Windows**; there is no Linux
-capture path yet ([screen.rs:171](daemon/src/screen.rs#L171) returns an error on other platforms).
+```bash
+grep -rniE "CGDisplay|CGWindowListCreateImage|BitBlt|GetDIBits|screencapture" daemon/src/ desktop/src-tauri/src/
+grep -rn "image" daemon/Cargo.toml         # no imaging crate is even a dependency
+ls ~/.tenby10/screenshots 2>/dev/null      # removed on upgrade; never recreated
+```
+
+Earlier versions (≤ v0.2.x) captured one heavily-blurred JPEG per 10-minute slot and kept it locally,
+never uploading it. That subsystem was deleted rather than left switchable — see
+[ADR 0018](../decisions/0018-remove-screenshot-subsystem.md) — and the first run of a current build
+deletes the old `~/.tenby10/screenshots/` folder
+([env.rs `purge_legacy_screenshots`](daemon/src/env.rs)).
+
+**Why macOS still asks for Screen Recording.** The app reads *window titles*, and macOS withholds
+`kCGWindowName` from any process without that grant — titles come back empty. So the permission is
+held for text metadata, not pixels. The settings page reports whether titles are actually readable
+(`window_titles_ok`), which is ground truth rather than a cached TCC preflight.
 
 ---
 
@@ -239,13 +250,10 @@ Run them with `cd daemon && cargo test`.
 These are the things an honest auditor will find. None leak keystrokes or raw screens, but they are
 real mismatches to close:
 
-- **G1 — Screenshots are never actually sent to any LLM, even with the toggle on.** The
-  `send_screenshots` flag ([config.rs:51](daemon/src/config.rs#L51), default `false`) is only
-  interpolated into the LLM system prompt as text
-  ([daemon.rs:600-614](daemon/src/daemon.rs#L600)); no image bytes are attached in
-  [llm.rs](daemon/src/llm.rs). So the multimodal path from
-  [decisions/0005](../decisions/0005-byok-screenshot-llm-transmission.md) is **not wired up**.
-  *Privacy-positive today*, but the toggle is misleading — it implies a data flow that doesn't exist.
+- **G1 — CLOSED (removed, not fixed).** A `send_screenshots` toggle used to imply a multimodal
+  data flow that was never wired up. Instead of implementing it, the whole screenshot subsystem was
+  deleted ([ADR 0018](../decisions/0018-remove-screenshot-subsystem.md)): no toggle, no capture code,
+  no image path to any provider. See §3.
 
 - **G2 — Secrets are handed to the settings UI over local IPC.** `private_key` and `llm_api_key`
   live in the OS keychain and `config.json` is written sanitized with those fields blanked
@@ -271,11 +279,11 @@ grep -rniE "reqwest|\.post\(|\.get\(|https?://" daemon/src/
 
 # 3. What the cloud sync actually sends: inspect the upload payloads. Confirm they carry only counts,
 #    category counts, hashes (reasoning_hash, config_hash), the config blob, and signatures — never
-#    raw keystrokes, screenshot bytes, or window titles.
+#    raw keystrokes or window titles.
 grep -n "json!" daemon/src/sync.rs
 
-# 4. Raw screenshot is dropped, never saved: `drop(raw_img)` before any `.save`.
-grep -n "drop(raw_img)\|save_with_format\|imageops::blur" daemon/src/screen.rs
+# 4. No screen-capture code exists anywhere in the client (ADR 0018) — expect zero hits.
+grep -rniE "CGDisplay|BitBlt|screencapture|imageops::blur" daemon/src/ desktop/src-tauri/src/
 
 # 5. The scoring rules and their tests are all in these two files.
 sed -n '53,113p' daemon/src/evaluator.rs   # classification priority order
