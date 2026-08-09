@@ -23,12 +23,21 @@ pub struct TelemetryState {
     pub input_listener_alive: AtomicBool,
     /// Unix-ms timestamp of the last input event actually observed (0 = none yet).
     pub last_input_event_ms: AtomicI64,
-    /// Whether the most recent capture attempt — a real slot screenshot or a
-    /// [`probe`](crate::screen::probe_capture) — actually succeeded.
-    pub screen_capture_ok: AtomicBool,
-    /// Unix-ms timestamp of the last capture attempt of either kind (0 = none yet).
-    /// Throttles [`TelemetryState::refresh_screen_capture_health`].
-    pub last_capture_check_ms: AtomicI64,
+    /// Whether window titles are actually readable right now (ADR 0018).
+    ///
+    /// On macOS `kCGWindowName` is silently withheld when Screen Recording is not
+    /// granted, so titles arrive empty while the app name still resolves — the
+    /// telemetry looks alive but every title is blank. This flag is derived from
+    /// the real title stream, not from a TCC preflight (which caches a stale
+    /// `true` after a revocation, issue #6).
+    pub window_titles_ok: AtomicBool,
+    /// Consecutive observations where a frontmost app was identified but its title
+    /// came back empty. A single blank title is normal (some windows have none);
+    /// a run of them is the redaction fingerprint. See [`TITLE_UNREADABLE_STRIKES`].
+    pub empty_title_streak: AtomicU32,
+    /// Unix-ms timestamp of the last title-readability observation (0 = none yet).
+    /// Throttles [`TelemetryState::refresh_window_title_health`].
+    pub last_title_check_ms: AtomicI64,
 }
 
 /// Rolling anti-automation window sizes (ADR 0002 addendum). Anti-automation
@@ -38,32 +47,22 @@ pub struct TelemetryState {
 const KEY_INTERVAL_WINDOW: usize = 256;
 const MOUSE_POSITION_WINDOW: usize = 512;
 
-/// Minimum gap between ground-truth capture probes (issue #6). The settings UI
-/// polls capture health every 10s and each probe spawns a real screen grab, so
-/// this throttles the cost while staying 20x fresher than the 10-minute slot
-/// cadence that used to be the only thing moving the flag.
-const CAPTURE_PROBE_MIN_GAP_MS: i64 = 30_000;
+/// Minimum gap between title-readability probes. The settings UI polls capture
+/// health every 10s; a probe is one cheap window-metadata read (no pixels), so
+/// this simply avoids doing it on every poll.
+const TITLE_PROBE_MIN_GAP_MS: i64 = 10_000;
 
-/// Whether a fresh capture probe is due. Split out from the probe itself so the
-/// throttle is testable on CI, where a real screen capture cannot run.
-fn capture_probe_due(last_check_ms: i64, now_ms: i64) -> bool {
+/// Consecutive blank-title observations before titles are reported unreadable.
+/// A single blank title is legitimate (some windows genuinely have none), but
+/// under a withheld Screen Recording grant *every* title is blank, so a short
+/// run separates the two without false-alarming on one odd window.
+const TITLE_UNREADABLE_STRIKES: u32 = 3;
+
+/// Whether a fresh title probe is due. Split out from the probe itself so the
+/// throttle is unit-testable without a window server.
+fn title_probe_due(last_check_ms: i64, now_ms: i64) -> bool {
     // Never checked yet, or the clock jumped backwards (sleep/timezone) — probe.
-    last_check_ms == 0
-        || now_ms < last_check_ms
-        || now_ms - last_check_ms >= CAPTURE_PROBE_MIN_GAP_MS
-}
-
-/// How many blurred screenshots back the slot starting at `slot_start` (#50).
-///
-/// Reads the filesystem rather than any in-memory flag: the saved JPEG *is* the
-/// evidence a relying party would be shown, so asking whether it exists is the
-/// only answer that can't drift from what's actually there. Capture writes exactly
-/// one file per slot today, so this is 0 or 1.
-fn slot_screenshot_count(slot_start: i64) -> u32 {
-    let mut path = crate::env::get_app_home();
-    path.push("screenshots");
-    path.push(format!("slot_{}.jpg", slot_start));
-    if path.is_file() { 1 } else { 0 }
+    last_check_ms == 0 || now_ms < last_check_ms || now_ms - last_check_ms >= TITLE_PROBE_MIN_GAP_MS
 }
 
 /// Current wall-clock time in Unix milliseconds.
@@ -103,34 +102,50 @@ impl TelemetryState {
             // Start pessimistic: only flip true once the tap / capture actually works.
             input_listener_alive: AtomicBool::new(false),
             last_input_event_ms: AtomicI64::new(0),
-            screen_capture_ok: AtomicBool::new(false),
-            last_capture_check_ms: AtomicI64::new(0),
+            // Optimistic: titles are readable everywhere except a macOS machine
+            // with the grant withheld, and the first observation lands seconds
+            // after start — starting false would flash a false alarm every launch.
+            window_titles_ok: AtomicBool::new(true),
+            empty_title_streak: AtomicU32::new(0),
+            last_title_check_ms: AtomicI64::new(0),
         }
     }
 
-    /// Record the outcome of a capture attempt (probe or real slot screenshot)
-    /// and reset the probe throttle, so the two paths keep one shared clock.
-    pub fn record_capture_result(&self, ok: bool, now_ms: i64) {
-        self.screen_capture_ok.store(ok, Ordering::Relaxed);
-        self.last_capture_check_ms.store(now_ms, Ordering::Relaxed);
-    }
-
-    /// Re-derive `screen_capture_ok` from an actual capture attempt, throttled to
-    /// at most one probe per [`CAPTURE_PROBE_MIN_GAP_MS`]. Returns the freshest
-    /// value known.
+    /// Fold one title observation into the health signal.
     ///
-    /// Without this the flag only moves at 10-minute slot boundaries, so a revoked
-    /// Screen Recording grant keeps reading as healthy for up to 10 minutes — the
-    /// "green but not capturing" window in issue #6. Blocking (it spawns a real
-    /// capture); call it off the UI thread.
-    pub fn refresh_screen_capture_health(&self) -> bool {
-        let now_ms = now_unix_ms();
-        if !capture_probe_due(self.last_capture_check_ms.load(Ordering::Relaxed), now_ms) {
-            return self.screen_capture_ok.load(Ordering::Relaxed);
+    /// `identified_app` is false when no frontmost window could be read at all
+    /// (an empty desktop, a fullscreen space in transition) — that says nothing
+    /// about permissions, so it neither scores a strike nor clears the streak.
+    pub fn record_title_observation(&self, identified_app: bool, title_present: bool, now_ms: i64) {
+        self.last_title_check_ms.store(now_ms, Ordering::Relaxed);
+        if !identified_app {
+            return;
         }
-        let ok = crate::screen::probe_capture().is_ok();
-        self.record_capture_result(ok, now_ms);
-        ok
+        if title_present {
+            self.empty_title_streak.store(0, Ordering::Relaxed);
+            self.window_titles_ok.store(true, Ordering::Relaxed);
+            return;
+        }
+        let streak = self.empty_title_streak.fetch_add(1, Ordering::Relaxed) + 1;
+        if streak >= TITLE_UNREADABLE_STRIKES {
+            self.window_titles_ok.store(false, Ordering::Relaxed);
+        }
+    }
+
+    /// Re-derive title-readability from a fresh window read, throttled to at most
+    /// one probe per [`TITLE_PROBE_MIN_GAP_MS`]. Returns the freshest value known.
+    ///
+    /// Reads window metadata only — no pixels are captured anywhere in this
+    /// process (ADR 0018). This is the ground-truth replacement for the old screen
+    /// capture probe: it measures the thing the product actually consumes.
+    pub fn refresh_window_title_health(&self) -> bool {
+        let now_ms = now_unix_ms();
+        if !title_probe_due(self.last_title_check_ms.load(Ordering::Relaxed), now_ms) {
+            return self.window_titles_ok.load(Ordering::Relaxed);
+        }
+        let (identified_app, title_present) = probe_active_window_title();
+        self.record_title_observation(identified_app, title_present, now_ms);
+        self.window_titles_ok.load(Ordering::Relaxed)
     }
 
     /// Reset the per-minute counters for the next minute slot. The rolling
@@ -168,22 +183,42 @@ impl TelemetryState {
 
 /// Query the active application name and window title.
 pub fn get_active_window() -> (String, String) {
+    let (app, title, _) = read_active_window();
+    (app, title)
+}
+
+/// Read the frontmost window, returning `(app_name, title, raw_title_present)`.
+///
+/// The third element is the health signal that the app-name fallback below would
+/// otherwise hide: on macOS a withheld Screen Recording grant makes
+/// `kCGWindowName` come back empty while `kCGWindowOwnerName` still resolves, so
+/// "we identified the app but got no title" is the fingerprint of redacted
+/// titles rather than of a genuinely untitled window.
+fn read_active_window() -> (String, String, bool) {
     match active_win_pos_rs::get_active_window() {
         Ok(window) => {
+            let raw_title_present = !window.title.trim().is_empty();
             let app_name = if window.app_name.trim().is_empty() {
                 "Unknown".to_string()
             } else {
                 window.app_name
             };
-            let title = if window.title.trim().is_empty() {
-                app_name.clone() // Fallback to app name if title is empty
-            } else {
+            let title = if raw_title_present {
                 window.title
+            } else {
+                app_name.clone() // Fallback to app name if title is empty
             };
-            (app_name, title)
+            (app_name, title, raw_title_present)
         }
-        Err(_) => ("Unknown".to_string(), "Unknown".to_string()),
+        Err(_) => ("Unknown".to_string(), "Unknown".to_string(), false),
     }
+}
+
+/// One title-readability observation: `(identified_app, title_present)`.
+/// Window metadata only — nothing is captured or stored.
+fn probe_active_window_title() -> (bool, bool) {
+    let (app, _, raw_title_present) = read_active_window();
+    (app != "Unknown", raw_title_present)
 }
 
 /// Start the global input event listener thread using rdev.
@@ -268,24 +303,12 @@ pub fn start_daemon_loop(db: Arc<Database>, state: Arc<TelemetryState>) {
     let evaluator = crate::evaluator::ActivityEvaluator::new();
     let mut was_recently_active = false;
 
+    // One-time cleanup for machines upgrading from a build that still captured
+    // screens (ADR 0018).
+    crate::env::purge_legacy_screenshots();
+
     // Run catch-up aggregation immediately at startup
     aggregate_pending_slots(&db);
-
-    // Seed capture health from a real probe rather than leaving it at the
-    // pessimistic startup default. Without this the UI reports "Not capturing"
-    // until the first slot boundary — up to 10 minutes of a false red on a
-    // perfectly healthy machine, and a false green after a mid-run revocation
-    // once the first capture has succeeded (issue #6).
-    if state.refresh_screen_capture_health() {
-        println!("[Screen] Startup capture probe succeeded.");
-    } else {
-        eprintln!(
-            "[Screen Warning] Startup capture probe failed; Screen Recording is likely \
-             not granted. Screenshots will not be captured until it is."
-        );
-    }
-
-    let mut last_screenshot_slot_start: Option<i64> = None;
 
     loop {
         // Run aggregation every 60 seconds
@@ -294,7 +317,6 @@ pub fn start_daemon_loop(db: Arc<Database>, state: Arc<TelemetryState>) {
         if !state.tracking_enabled.load(Ordering::Relaxed) {
             state.reset_minute();
             state.clear_entropy_window();
-            last_screenshot_slot_start = None;
             continue;
         }
 
@@ -304,7 +326,7 @@ pub fn start_daemon_loop(db: Arc<Database>, state: Arc<TelemetryState>) {
             .as_secs() as i64;
 
         // Scrape frontmost window (we need this early to check Windows lock state)
-        let (active_app, active_title) = get_active_window();
+        let (active_app, active_title, raw_title_present) = read_active_window();
 
         let is_locked_mac = crate::sys_state::is_locked_or_asleep();
         let is_locked_win = active_app == "LockApp.exe" || active_app == "LogonUI.exe";
@@ -319,39 +341,10 @@ pub fn start_daemon_loop(db: Arc<Database>, state: Arc<TelemetryState>) {
             continue;
         }
 
-        let current_slot_start = timestamp - (timestamp % 600);
-        if last_screenshot_slot_start.is_none() {
-            last_screenshot_slot_start = Some(current_slot_start);
-        }
-
-        // Check if we transitioned to a new 10-minute slot
-        if let Some(last_slot) = last_screenshot_slot_start
-            && current_slot_start > last_slot
-        {
-            // Time to capture screenshot for the slot that just ended
-            let finished_slot = last_slot;
-            println!(
-                "[Slot Transition] Taking screenshot for finished slot starting at {}...",
-                finished_slot
-            );
-
-            let mut screenshots_dir = crate::env::get_app_home();
-            screenshots_dir.push("screenshots");
-
-            match crate::screen::capture_and_blur_screenshot(screenshots_dir, finished_slot) {
-                Ok(_) => state.record_capture_result(true, now_unix_ms()),
-                Err(err) => {
-                    state.record_capture_result(false, now_unix_ms());
-                    eprintln!(
-                        "[Screen Warning] Screen capture failed for slot {}: {}. \
-                         Screenshots will NOT be captured until Screen Recording is granted.",
-                        finished_slot, err
-                    );
-                }
-            }
-
-            last_screenshot_slot_start = Some(current_slot_start);
-        }
+        // Fold this minute's window read into title health for free — the UI's
+        // 10s probe is the fast path, this keeps the signal fresh when no one is
+        // watching the settings page.
+        state.record_title_observation(active_app != "Unknown", raw_title_present, now_unix_ms());
 
         let keystroke_count = state.keystroke_count.load(Ordering::Relaxed);
         let mouse_click_count = state.mouse_click_count.load(Ordering::Relaxed);
@@ -684,12 +677,10 @@ pub fn aggregate_slot(db: &Database, config: &crate::config::AgentConfig, slot_s
                     - Productive Apps: {}\n\
                     - Meeting Apps: {}\n\
                     - Distracting Apps: {}\n\
-                    - Screenshots Enabled: {}\n\
                     \n{}",
                     config.productive_apps,
                     config.meeting_apps,
                     config.distracting_apps,
-                    config.send_screenshots,
                     base_prompt
                 );
 
@@ -743,12 +734,6 @@ pub fn aggregate_slot(db: &Database, config: &crate::config::AgentConfig, slot_s
         eprintln!("[Config] could not persist config blob: {e}");
     }
 
-    // Evidence count for the signed payload (#50). Derived from the blurred JPEG
-    // actually on disk rather than from in-memory capture health: the file *is* the
-    // evidence, so this stays correct across restarts and for catch-up aggregation
-    // of slots that finished while the daemon was down.
-    let screenshot_count = slot_screenshot_count(slot_start);
-
     let slot_res = db.insert_slot_summary(
         slot_start,
         final_focus_score,
@@ -759,7 +744,6 @@ pub fn aggregate_slot(db: &Database, config: &crate::config::AgentConfig, slot_s
         &app_categories_json,
         final_reasoning.as_deref(),
         &config_hash,
-        screenshot_count,
         signer.as_ref(),
     );
 
@@ -802,58 +786,93 @@ mod tests {
     static DB_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
     #[test]
-    fn test_capture_probe_due_throttles_within_the_gap() {
+    fn test_title_probe_due_throttles_within_the_gap() {
         let now = 1_000_000_000_000;
         assert!(
-            capture_probe_due(0, now),
+            title_probe_due(0, now),
             "never checked -> probe immediately"
         );
         assert!(
-            !capture_probe_due(now - 1, now),
+            !title_probe_due(now - 1, now),
             "just checked -> do not re-probe"
         );
         assert!(
-            !capture_probe_due(now - (CAPTURE_PROBE_MIN_GAP_MS - 1), now),
+            !title_probe_due(now - (TITLE_PROBE_MIN_GAP_MS - 1), now),
             "inside the throttle window -> do not re-probe"
         );
         assert!(
-            capture_probe_due(now - CAPTURE_PROBE_MIN_GAP_MS, now),
+            title_probe_due(now - TITLE_PROBE_MIN_GAP_MS, now),
             "at the gap -> probe"
         );
         assert!(
-            capture_probe_due(now - (CAPTURE_PROBE_MIN_GAP_MS * 20), now),
+            title_probe_due(now - (TITLE_PROBE_MIN_GAP_MS * 20), now),
             "long past the gap -> probe"
         );
     }
 
     #[test]
-    fn test_capture_probe_due_survives_a_backwards_clock() {
+    fn test_title_probe_due_survives_a_backwards_clock() {
         // Sleep/wake or a timezone change can move the wall clock backwards. A
-        // naive `now - last >= gap` would then never fire again, freezing capture
-        // health at whatever it last read (issue #6).
+        // naive `now - last >= gap` would then never fire again, freezing title
+        // health at whatever it last read (issue #6, same trap as the old probe).
         let now = 1_000_000_000_000;
         assert!(
-            capture_probe_due(now + 60_000, now),
+            title_probe_due(now + 60_000, now),
             "clock jumped backwards -> probe rather than latch"
         );
     }
 
     #[test]
-    fn test_record_capture_result_updates_flag_and_throttle_clock() {
+    fn test_blank_titles_flag_unreadable_only_after_a_streak() {
         let state = TelemetryState::new();
         assert!(
-            !state.screen_capture_ok.load(Ordering::Relaxed),
-            "starts pessimistic"
+            state.window_titles_ok.load(Ordering::Relaxed),
+            "starts optimistic — titles read fine everywhere but a withheld grant"
         );
 
-        state.record_capture_result(true, 5_000);
-        assert!(state.screen_capture_ok.load(Ordering::Relaxed));
-        assert_eq!(state.last_capture_check_ms.load(Ordering::Relaxed), 5_000);
+        // One or two blank titles are normal (some windows genuinely have none).
+        for i in 1..TITLE_UNREADABLE_STRIKES {
+            state.record_title_observation(true, false, 1_000 * i as i64);
+            assert!(
+                state.window_titles_ok.load(Ordering::Relaxed),
+                "must not alarm on {i} blank title(s)"
+            );
+        }
 
-        // A failing slot capture must flip the flag back, not just go unnoticed.
-        state.record_capture_result(false, 9_000);
-        assert!(!state.screen_capture_ok.load(Ordering::Relaxed));
-        assert_eq!(state.last_capture_check_ms.load(Ordering::Relaxed), 9_000);
+        // A sustained run is the redaction fingerprint (macOS withholds
+        // kCGWindowName while the app name still resolves).
+        state.record_title_observation(true, false, 9_000);
+        assert!(!state.window_titles_ok.load(Ordering::Relaxed));
+        assert_eq!(state.last_title_check_ms.load(Ordering::Relaxed), 9_000);
+
+        // One real title clears it immediately — a regained grant must not wait
+        // out another streak before the UI goes green again.
+        state.record_title_observation(true, true, 10_000);
+        assert!(state.window_titles_ok.load(Ordering::Relaxed));
+        assert_eq!(state.empty_title_streak.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_unidentified_window_is_not_evidence_either_way() {
+        // No frontmost window at all (empty desktop, space transition) says
+        // nothing about permissions: it must neither strike nor clear.
+        let state = TelemetryState::new();
+        state.record_title_observation(true, false, 1_000);
+        let streak_before = state.empty_title_streak.load(Ordering::Relaxed);
+
+        for i in 0..TITLE_UNREADABLE_STRIKES * 3 {
+            state.record_title_observation(false, false, 2_000 + i as i64);
+        }
+
+        assert!(
+            state.window_titles_ok.load(Ordering::Relaxed),
+            "an unreadable window must never flag titles as redacted"
+        );
+        assert_eq!(
+            state.empty_title_streak.load(Ordering::Relaxed),
+            streak_before,
+            "the streak is untouched by observations that identified no app"
+        );
     }
 
     fn create_test_db() -> Database {

@@ -36,8 +36,9 @@ struct CaptureHealth {
     input_recently_seen: bool,
     /// Milliseconds since the last observed input event (-1 if none yet).
     input_idle_ms: i64,
-    /// The last screenshot attempt was a real capture (not a denied/placeholder fallback).
-    screen_capture_ok: bool,
+    /// Window titles are coming back with real values. On macOS a withheld Screen
+    /// Recording grant blanks them (`kCGWindowName`), which no TCC preflight reports.
+    window_titles_ok: bool,
 }
 
 mod platform;
@@ -233,29 +234,6 @@ async fn dashboard_slot_details(
         .map_err(|e| format!("Database error: {}", e))
 }
 
-/// Return the blurred slot screenshot as a `data:` URL, or `None` if none was
-/// saved. Bytes are read from the local sandbox and inlined, so the view never
-/// reaches over HTTP for screen captures.
-#[tauri::command]
-async fn dashboard_screenshot(slot_start: i64) -> Result<Option<String>, String> {
-    let mut path = daemon::env::get_app_home();
-    path.push("screenshots");
-    path.push(format!("slot_{}.jpg", slot_start));
-
-    match tokio::task::spawn_blocking(move || std::fs::read(&path))
-        .await
-        .map_err(|e| format!("Task join error: {}", e))?
-    {
-        Ok(bytes) => {
-            use base64::{engine::general_purpose, Engine as _};
-            let b64 = general_purpose::STANDARD.encode(bytes);
-            Ok(Some(format!("data:image/jpeg;base64,{}", b64)))
-        }
-        // A missing file is the common case (no capture for that slot), not an error.
-        Err(_) => Ok(None),
-    }
-}
-
 /// Export minute logs as CSV via a native save dialog. Returns the saved path,
 /// or `None` if the user cancelled the dialog.
 #[tauri::command]
@@ -326,22 +304,22 @@ async fn get_capture_health(
     let last_ms = state.last_input_event_ms.load(Ordering::Relaxed);
     let input_idle_ms = if last_ms == 0 { -1 } else { now_ms - last_ms };
 
-    // Re-derive screen health from a real capture attempt instead of reading a flag
-    // that otherwise only moves at 10-minute slot boundaries (issue #6). The probe
-    // is internally throttled, so polling this command every 10s is cheap; it
-    // spawns a capture, so it runs on the blocking pool rather than the UI thread.
+    // Re-derive title health from a fresh window read rather than trusting the
+    // cache-prone TCC preflight (issue #6). Reads window metadata only — no pixels
+    // are captured anywhere in this process (ADR 0018). Internally throttled, so
+    // polling every 10s is cheap; still off the UI thread as it touches the OS.
     let probe_state = state.inner().clone();
-    let screen_capture_ok =
-        tauri::async_runtime::spawn_blocking(move || probe_state.refresh_screen_capture_health())
+    let window_titles_ok =
+        tauri::async_runtime::spawn_blocking(move || probe_state.refresh_window_title_health())
             .await
-            .map_err(|err| format!("Capture health probe failed to run: {}", err))?;
+            .map_err(|err| format!("Window title health probe failed to run: {}", err))?;
 
     Ok(CaptureHealth {
         input_listener_alive: state.input_listener_alive.load(Ordering::Relaxed),
         // Consider input "recently seen" if an event arrived in the last 5 seconds.
         input_recently_seen: (0..=5_000).contains(&input_idle_ms),
         input_idle_ms,
-        screen_capture_ok,
+        window_titles_ok,
     })
 }
 
@@ -437,7 +415,6 @@ pub fn run() {
             dashboard_slots,
             dashboard_pending_slots,
             dashboard_slot_details,
-            dashboard_screenshot,
             export_dashboard_csv,
             get_agent_config,
             save_agent_config,

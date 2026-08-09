@@ -94,9 +94,9 @@ fn slot_payload(agent_id: &str, slot: &crate::db::SignedSlot) -> serde_json::Val
         },
         "reasoning_hash": sha256_hex_pub(slot.llm_reasoning.as_deref().unwrap_or("")),
         "config_hash": slot.config_hash,
-        // v3 (#50): part of the signed payload, so the cloud needs it to re-derive
-        // the canonical string. Older rows keep their own scheme_version and the
-        // cloud ignores the field for them.
+        // Still sent because an unsynced v3 row must upload with the count it was
+        // signed under, or the cloud cannot re-derive its canonical string. v4 rows
+        // (ADR 0018) carry 0 here and the cloud ignores the field for them.
         "screenshot_count": slot.screenshot_count,
         "ledger": { "hash": slot.hash, "parent_hash": slot.parent_hash },
         "signature": slot.signature,

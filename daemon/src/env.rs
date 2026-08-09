@@ -25,7 +25,7 @@ pub fn is_dev() -> bool {
         .unwrap_or(false)
 }
 
-/// Returns the base directory for app data (config, db, screenshots).
+/// Returns the base directory for app data (config, db).
 /// Priority:
 /// 1. TENBY10_HOME environment variable.
 /// 2. ~/.tenby10_dev (in debug builds).
@@ -42,6 +42,33 @@ pub fn get_app_home() -> PathBuf {
         path.push(".tenby10");
     }
     path
+}
+
+/// Delete the legacy `screenshots/` directory left by pre-ADR-0018 builds.
+///
+/// The subsystem is gone, so an upgrade must not silently leave a folder of
+/// screen captures on disk (retained indefinitely under the old ADR 0004 policy)
+/// with nothing left in the app that would ever show or clean it. Idempotent:
+/// after the first run there is nothing to remove. Only ever removes the
+/// directory this app created.
+pub fn purge_legacy_screenshots() {
+    let mut dir = get_app_home();
+    dir.push("screenshots");
+    if !dir.is_dir() {
+        return;
+    }
+    match std::fs::remove_dir_all(&dir) {
+        Ok(()) => println!(
+            "[Migration] Removed the legacy screenshot archive at {:?} (ADR 0018 — \
+             screen capture no longer exists).",
+            dir
+        ),
+        Err(err) => eprintln!(
+            "[Migration] Could not remove the legacy screenshot archive at {:?}: {}. \
+             It is no longer written to or read; delete it by hand if you want it gone.",
+            dir, err
+        ),
+    }
 }
 
 /// Returns the port for the dashboard server.

@@ -159,17 +159,18 @@
               <p id="token-estimate" class="token-estimate-text"></p>
             </div>
 
-            <div class="checkbox-group">
-              <input id="ai-send-screenshots" type="checkbox" />
-              <label for="ai-send-screenshots" class="checkbox-label">Send raw screenshots for analysis</label>
-            </div>
+            <p class="desc" style="margin-top: 0.75rem;">
+              The auditor receives text only: application names, window titles and
+              input counts for each minute of the slot. tenby10 never captures your
+              screen, so no image can be sent to your provider.
+            </p>
           </div>
         </div>
 
         <!-- Tab 4: Permissions -->
         <div id="tab-permissions" class="tab-content" style="display: none;">
           <h3>macOS System Permissions</h3>
-          <p class="desc">tenby10 requires permissions to capture activity metrics and screenshots. Ensure they are enabled in System Settings.</p>
+          <p class="desc">tenby10 requires permissions to capture activity metrics. Ensure they are enabled in System Settings.</p>
           
           <div class="permission-list">
             <div class="permission-item">
@@ -197,7 +198,7 @@
             <div class="permission-item">
               <div class="permission-info">
                 <span class="permission-name">Screen Recording</span>
-                <span class="permission-desc">Required to take periodic blurred screen captures for validation.</span>
+                <span class="permission-desc">Required by macOS to read window titles (they come back blank without it). tenby10 captures no screen images — the code has no capture path.</span>
               </div>
               <div class="permission-status-wrapper">
                 <span id="perm-screen-recording-status" class="status-indicator unknown">Checking...</span>
@@ -231,11 +232,11 @@
             </div>
             <div class="permission-item">
               <div class="permission-info">
-                <span class="permission-name">Screen capture</span>
-                <span id="health-screen-detail" class="permission-desc">Checking…</span>
+                <span class="permission-name">Window titles</span>
+                <span id="health-titles-detail" class="permission-desc">Checking…</span>
               </div>
               <div class="permission-status-wrapper">
-                <span id="health-screen-status" class="status-indicator unknown">Checking...</span>
+                <span id="health-titles-status" class="status-indicator unknown">Checking...</span>
               </div>
             </div>
           </div>
@@ -270,7 +271,7 @@
     </div>
   </main>
 
-  <!-- Activity dashboard: full-window in-app view (screenshots, slot details, CSV
+  <!-- Activity dashboard: full-window in-app view (slot details, CSV
        export). Hosted in an isolated iframe so its stylesheet can't collide with
        the settings UI. Shown in place of the metrics home — never a separate
        window, never a browser. The src is set lazily on first open. -->

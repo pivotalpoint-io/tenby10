@@ -187,12 +187,10 @@ function updateTokenEstimate() {
   const dailySlots = 48; // 8 hours of active time
 
   const dailyTextTotal = dailySlots * (promptTokens + slotInputTokens + expectedOutputTokens);
-  // Assume 1 screenshot per slot. A 1080p image is ~1,105 tokens for most vision models.
-  const dailyImageTotal = dailyTextTotal + (dailySlots * 1105);
-  
+
   const tokenEstimateEl = document.getElementById("token-estimate");
   if (tokenEstimateEl) {
-    tokenEstimateEl.innerText = `Estimated daily usage (8h active): ~${(dailyTextTotal / 1000).toFixed(1)}k tokens (Text) / ~${(dailyImageTotal / 1000).toFixed(1)}k tokens (+ Screenshots)`;
+    tokenEstimateEl.innerText = `Estimated daily usage (8h active): ~${(dailyTextTotal / 1000).toFixed(1)}k tokens`;
   }
 }
 
@@ -225,7 +223,6 @@ async function loadAgentConfig() {
     document.getElementById("ai-provider").value = currentConfig.llm_provider || "openai";
     document.getElementById("ai-api-key").value = currentConfig.llm_api_key || "";
     document.getElementById("ai-prompt").value = currentConfig.llm_prompt || "";
-    document.getElementById("ai-send-screenshots").checked = !!currentConfig.send_screenshots;
 
     updateTokenEstimate();
     toggleLlmFields(isLlm);
@@ -337,7 +334,6 @@ if (saveSettingsBtn) {
       config.llm_provider = document.getElementById("ai-provider").value;
       config.llm_api_key = apiKey;
       config.llm_prompt = prompt;
-      config.send_screenshots = document.getElementById("ai-send-screenshots").checked;
 
       await invoke("save_agent_config", { newConfig: config });
       currentConfig = config;
@@ -457,13 +453,13 @@ async function checkPermissionsStatus() {
 
     // macOS caches the Screen Recording preflight: CGPreflightScreenCaptureAccess
     // keeps returning true after the grant is revoked. Cross-check it against
-    // ground truth (a real capture attempt) so a stale-green permission can never
-    // read as "Granted" while capture is actually failing (issue #6).
+    // ground truth (are window titles actually coming back?) so a stale-green
+    // permission can never read as "Granted" while titles arrive blank (issue #6).
     let screenRecordingGranted = status.screen_recording;
     if (screenRecordingGranted) {
       try {
         const health = await invoke("get_capture_health");
-        if (!health.screen_capture_ok) screenRecordingGranted = "stale";
+        if (!health.window_titles_ok) screenRecordingGranted = "stale";
       } catch {
         // Health unavailable — leave the preflight answer as-is rather than
         // inventing a failure.
@@ -525,17 +521,17 @@ async function checkCaptureHealth() {
       }
     }
 
-    const screenStatus = document.getElementById("health-screen-status");
-    const screenDetail = document.getElementById("health-screen-detail");
-    if (screenStatus && screenDetail) {
-      if (health.screen_capture_ok) {
-        screenStatus.innerText = "Capturing";
-        screenStatus.className = "status-indicator granted";
-        screenDetail.innerText = "A real capture succeeded — checked live, not just at the 10-minute slot boundary.";
+    const titlesStatus = document.getElementById("health-titles-status");
+    const titlesDetail = document.getElementById("health-titles-detail");
+    if (titlesStatus && titlesDetail) {
+      if (health.window_titles_ok) {
+        titlesStatus.innerText = "Readable";
+        titlesStatus.className = "status-indicator granted";
+        titlesDetail.innerText = "Window titles are coming back with real values — checked live.";
       } else {
-        screenStatus.innerText = "Not capturing";
-        screenStatus.className = "status-indicator denied";
-        screenDetail.innerText = "A capture attempt just failed — grant Screen Recording, then fully quit and relaunch tenby10.";
+        titlesStatus.innerText = "Blank";
+        titlesStatus.className = "status-indicator denied";
+        titlesDetail.innerText = "Titles keep coming back empty, which is what macOS does without Screen Recording. Grant it, then fully quit and relaunch tenby10.";
       }
     }
   } catch (err) {

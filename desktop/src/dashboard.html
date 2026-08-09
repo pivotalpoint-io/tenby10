@@ -116,20 +116,14 @@
         </div>
     </main>
 
-    <!-- Native screenshot & details modal dialog -->
-    <dialog id="screenshot-dialog" class="glass-dialog">
+    <!-- Slot details modal dialog -->
+    <dialog id="slot-dialog" class="glass-dialog">
         <div class="dialog-content">
             <div class="dialog-header">
                 <h3 id="dialog-slot-title">Slot Details</h3>
-                <button class="close-btn" onclick="closeScreenshotDialog()">✕</button>
+                <button class="close-btn" onclick="closeSlotDialog()">✕</button>
             </div>
             <div class="dialog-body-grid">
-                <!-- Left: Screenshot -->
-                <div style="display: flex; flex-direction: column; gap: 0.5rem; flex: 1.2;">
-                    <h4 style="font-size: 0.8rem; text-transform: uppercase; color: var(--text-muted); letter-spacing: 0.5px;">Screen Capture</h4>
-                    <img id="screenshot-img" src="" alt="Blurred Screen Capture" />
-                </div>
-                <!-- Right: Activity Details -->
                 <div style="display: flex; flex-direction: column; gap: 0.5rem; flex: 1;">
                     <h4 style="font-size: 0.8rem; text-transform: uppercase; color: var(--text-muted); letter-spacing: 0.5px;">Minute-by-Minute Activity</h4>
                     <div id="dialog-llm-reasoning"></div>
