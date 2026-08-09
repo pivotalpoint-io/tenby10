@@ -129,7 +129,10 @@ impl LlmProvider for GeminiProvider {
 
         let res = self
             .client
-            .post(format!("https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={}", self.api_key))
+            .post("https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent")
+            // The key rides a header, not the query string: URLs land in proxy
+            // and gateway logs.
+            .header("x-goog-api-key", &self.api_key)
             .json(&payload)
             .send()
             .map_err(|e| e.to_string())?;
