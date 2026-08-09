@@ -2,6 +2,87 @@ use crate::config::AgentConfig;
 use reqwest::blocking::Client;
 use serde_json::Value;
 
+/// Per-provider defaults for `llm_base_url` / `llm_model`.
+///
+/// An empty config field means "use the default here". These are surfaced
+/// verbatim in the settings UI (as the placeholder of each field), so the
+/// endpoint and model the daemon will actually call are always visible —
+/// the UI never claims a model the daemon does not use.
+///
+/// Hardcoded model IDs rot: providers retire them. Both fields are
+/// user-editable precisely so a stale default is a one-line fix in Settings
+/// rather than a release.
+pub const OPENAI_DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
+pub const OPENAI_DEFAULT_MODEL: &str = "gpt-5-mini";
+pub const ANTHROPIC_DEFAULT_BASE_URL: &str = "https://api.anthropic.com/v1";
+pub const ANTHROPIC_DEFAULT_MODEL: &str = "claude-sonnet-5";
+pub const GEMINI_DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
+pub const GEMINI_DEFAULT_MODEL: &str = "gemini-3.6-flash";
+
+/// `(default_base_url, default_model)` for a known provider.
+pub fn provider_defaults(provider: &str) -> Option<(&'static str, &'static str)> {
+    match provider.to_lowercase().as_str() {
+        "openai" => Some((OPENAI_DEFAULT_BASE_URL, OPENAI_DEFAULT_MODEL)),
+        "anthropic" => Some((ANTHROPIC_DEFAULT_BASE_URL, ANTHROPIC_DEFAULT_MODEL)),
+        "gemini" => Some((GEMINI_DEFAULT_BASE_URL, GEMINI_DEFAULT_MODEL)),
+        _ => None,
+    }
+}
+
+/// Join a base URL and a path without doubling or dropping the separator.
+fn join_url(base: &str, path: &str) -> String {
+    format!(
+        "{}/{}",
+        base.trim_end_matches('/'),
+        path.trim_start_matches('/')
+    )
+}
+
+/// Whether `raw` points at this machine. Loopback endpoints (Ollama, a local
+/// proxy) are the one case where plain `http://` is acceptable and where no
+/// API key is required.
+pub fn is_loopback_url(raw: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(raw) else {
+        return false;
+    };
+    match url.host_str() {
+        Some("localhost") => true,
+        Some(host) => host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<std::net::IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false),
+        None => false,
+    }
+}
+
+/// Validate a user-supplied base URL.
+///
+/// The auditor request carries the API key **and** every window title in the
+/// slot, so a plaintext endpoint would put both on the wire in the clear. HTTP
+/// is therefore allowed only for loopback, where the traffic never leaves the
+/// machine. An empty string is valid and selects the provider default.
+pub fn validate_base_url(raw: &str) -> Result<(), String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(());
+    }
+    let url = reqwest::Url::parse(raw).map_err(|_| {
+        "API base URL must be a full URL, e.g. https://api.example.com/v1".to_string()
+    })?;
+    match url.scheme() {
+        "https" => Ok(()),
+        "http" if is_loopback_url(raw) => Ok(()),
+        "http" => Err(
+            "API base URL must use https (http is allowed only for localhost). Your API key and \
+             window titles would otherwise travel unencrypted."
+                .to_string(),
+        ),
+        other => Err(format!("Unsupported URL scheme '{other}': use https")),
+    }
+}
+
 pub trait LlmProvider {
     fn evaluate_slot(
         &self,
@@ -12,6 +93,8 @@ pub trait LlmProvider {
 
 pub struct OpenAiProvider {
     api_key: String,
+    base_url: String,
+    model: String,
     client: Client,
 }
 
@@ -22,7 +105,7 @@ impl LlmProvider for OpenAiProvider {
         activity_text: &str,
     ) -> Result<(u32, String), String> {
         let payload = serde_json::json!({
-            "model": "gpt-4o-mini",
+            "model": self.model,
             "messages": [
                 { "role": "system", "content": system_prompt },
                 { "role": "user", "content": format!("Activity log:\n{}", activity_text) }
@@ -32,7 +115,7 @@ impl LlmProvider for OpenAiProvider {
 
         let res = self
             .client
-            .post("https://api.openai.com/v1/chat/completions")
+            .post(join_url(&self.base_url, "chat/completions"))
             .header("Authorization", format!("Bearer {}", self.api_key))
             .json(&payload)
             .send()
@@ -55,6 +138,8 @@ impl LlmProvider for OpenAiProvider {
 
 pub struct AnthropicProvider {
     api_key: String,
+    base_url: String,
+    model: String,
     client: Client,
 }
 
@@ -65,8 +150,13 @@ impl LlmProvider for AnthropicProvider {
         activity_text: &str,
     ) -> Result<(u32, String), String> {
         let payload = serde_json::json!({
-            "model": "claude-3-5-sonnet-20240620",
-            "max_tokens": 512,
+            "model": self.model,
+            // Current Claude models think by default, and `max_tokens` caps
+            // thinking *plus* the reply. The auditor's own output is a small
+            // JSON object, but a tight cap would truncate it mid-object once
+            // thinking is counted — so leave headroom. Unused budget is not
+            // billed.
+            "max_tokens": 4096,
             "system": system_prompt,
             "messages": [
                 { "role": "user", "content": format!("Activity log:\n{}", activity_text) }
@@ -75,7 +165,7 @@ impl LlmProvider for AnthropicProvider {
 
         let res = self
             .client
-            .post("https://api.anthropic.com/v1/messages")
+            .post(join_url(&self.base_url, "messages"))
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", "2023-06-01")
             .json(&payload)
@@ -84,7 +174,20 @@ impl LlmProvider for AnthropicProvider {
 
         let json = res.json::<Value>().map_err(|e| e.to_string())?;
 
-        if let Some(content) = json["content"][0]["text"].as_str() {
+        // Thinking-capable models put `thinking` blocks before the text block,
+        // so take the first block that actually carries text rather than
+        // assuming index 0.
+        let text = json["content"]
+            .as_array()
+            .and_then(|blocks| {
+                blocks
+                    .iter()
+                    .find(|b| b["type"] == "text")
+                    .and_then(|b| b["text"].as_str())
+            })
+            .or_else(|| json["content"][0]["text"].as_str());
+
+        if let Some(content) = text {
             let clean_content = content
                 .trim()
                 .strip_prefix("```json")
@@ -106,6 +209,8 @@ impl LlmProvider for AnthropicProvider {
 
 pub struct GeminiProvider {
     api_key: String,
+    base_url: String,
+    model: String,
     client: Client,
 }
 
@@ -127,9 +232,17 @@ impl LlmProvider for GeminiProvider {
             }
         });
 
+        let url = join_url(
+            &self.base_url,
+            &format!("models/{}:generateContent", self.model),
+        );
+
         let res = self
             .client
-            .post(format!("https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={}", self.api_key))
+            .post(url)
+            // The key rides a header, not the query string: URLs land in proxy
+            // and gateway logs.
+            .header("x-goog-api-key", &self.api_key)
             .json(&payload)
             .send()
             .map_err(|e| e.to_string())?;
@@ -150,17 +263,58 @@ impl LlmProvider for GeminiProvider {
 }
 
 pub fn get_llm_provider(config: &AgentConfig) -> Option<Box<dyn LlmProvider>> {
-    if config.llm_api_key.is_empty() || config.llm_provider.is_empty() {
+    if config.llm_provider.is_empty() {
         return None;
     }
+
+    let (default_base_url, default_model) = provider_defaults(&config.llm_provider)?;
+
+    let base_url = if config.llm_base_url.trim().is_empty() {
+        default_base_url.to_string()
+    } else {
+        config.llm_base_url.trim().to_string()
+    };
+
+    if let Err(e) = validate_base_url(&base_url) {
+        eprintln!("[LLM] Invalid API base URL, auditor disabled: {e}");
+        return None;
+    }
+
+    // A local endpoint (Ollama, a local proxy) authenticates by not being
+    // reachable from anywhere else, so an empty key is legitimate there. Every
+    // remote endpoint still requires one.
+    if config.llm_api_key.is_empty() && !is_loopback_url(&base_url) {
+        return None;
+    }
+
+    let model = if config.llm_model.trim().is_empty() {
+        default_model.to_string()
+    } else {
+        config.llm_model.trim().to_string()
+    };
 
     let client = Client::new();
     let api_key = config.llm_api_key.clone();
 
     match config.llm_provider.to_lowercase().as_str() {
-        "openai" => Some(Box::new(OpenAiProvider { api_key, client })),
-        "gemini" => Some(Box::new(GeminiProvider { api_key, client })),
-        "anthropic" => Some(Box::new(AnthropicProvider { api_key, client })),
+        "openai" => Some(Box::new(OpenAiProvider {
+            api_key,
+            base_url,
+            model,
+            client,
+        })),
+        "gemini" => Some(Box::new(GeminiProvider {
+            api_key,
+            base_url,
+            model,
+            client,
+        })),
+        "anthropic" => Some(Box::new(AnthropicProvider {
+            api_key,
+            base_url,
+            model,
+            client,
+        })),
         _ => None,
     }
 }
@@ -203,5 +357,80 @@ mod tests {
 
         config.llm_provider = "unknown".to_string();
         assert!(get_llm_provider(&config).is_none());
+    }
+
+    #[test]
+    fn test_join_url_handles_slashes() {
+        assert_eq!(
+            join_url("https://api.example.com/v1", "messages"),
+            "https://api.example.com/v1/messages"
+        );
+        // A trailing slash pasted from a browser must not double up.
+        assert_eq!(
+            join_url("https://api.example.com/v1/", "messages"),
+            "https://api.example.com/v1/messages"
+        );
+        assert_eq!(
+            join_url("https://api.example.com/v1/", "/messages"),
+            "https://api.example.com/v1/messages"
+        );
+    }
+
+    #[test]
+    fn test_validate_base_url() {
+        // Empty selects the provider default.
+        assert!(validate_base_url("").is_ok());
+        assert!(validate_base_url("https://api.openai.com/v1").is_ok());
+
+        // Loopback may use plain http — the traffic never leaves the machine.
+        assert!(validate_base_url("http://localhost:11434/v1").is_ok());
+        assert!(validate_base_url("http://127.0.0.1:11434/v1").is_ok());
+        assert!(validate_base_url("http://[::1]:11434/v1").is_ok());
+
+        // Remote http would put the API key and window titles in the clear.
+        assert!(validate_base_url("http://api.example.com/v1").is_err());
+        assert!(validate_base_url("ftp://api.example.com").is_err());
+        assert!(validate_base_url("not a url").is_err());
+    }
+
+    #[test]
+    fn test_is_loopback_url() {
+        assert!(is_loopback_url("http://localhost:11434/v1"));
+        assert!(is_loopback_url("http://127.0.0.1:11434"));
+        assert!(is_loopback_url("http://127.1.2.3:11434"));
+        assert!(is_loopback_url("http://[::1]:11434"));
+        assert!(!is_loopback_url("https://api.openai.com/v1"));
+        // Not loopback despite the prefix — a real remote host.
+        assert!(!is_loopback_url("https://localhost.example.com/v1"));
+    }
+
+    #[test]
+    fn test_local_endpoint_needs_no_api_key() {
+        let mut config = AgentConfig::default();
+        config.llm_provider = "openai".to_string();
+        config.llm_base_url = "http://localhost:11434/v1".to_string();
+        config.llm_model = "llama3.1".to_string();
+        // Ollama ignores the key; requiring one would block the local path.
+        assert!(config.llm_api_key.is_empty());
+        assert!(get_llm_provider(&config).is_some());
+    }
+
+    #[test]
+    fn test_remote_http_base_url_is_rejected() {
+        let mut config = AgentConfig::default();
+        config.llm_provider = "openai".to_string();
+        config.llm_api_key = "test_key".to_string();
+        config.llm_base_url = "http://api.example.com/v1".to_string();
+        assert!(get_llm_provider(&config).is_none());
+    }
+
+    #[test]
+    fn test_provider_defaults_are_valid_https_urls() {
+        for provider in ["openai", "anthropic", "gemini"] {
+            let (base_url, model) = provider_defaults(provider).expect("known provider");
+            assert!(validate_base_url(base_url).is_ok(), "{provider} base url");
+            assert!(!model.is_empty(), "{provider} model");
+        }
+        assert!(provider_defaults("unknown").is_none());
     }
 }
