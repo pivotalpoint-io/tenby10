@@ -44,13 +44,16 @@ pub async fn enroll_with_cloud(
         .ok_or_else(|| "enrollment response had no agentId".to_string())
 }
 
-/// The slots endpoint replies 428 when the referenced config isn't stored server-side yet (#80).
+/// The ingest endpoints reply 428 when a blob a record references isn't stored server-side yet:
+/// a slot's effective config (#80), or a note's prompt (#147).
 const PRECONDITION_REQUIRED: u16 = 428;
 
-/// Upload the effective-config blob for `config_hash` from the local store so the cloud can
-/// interpret slots that reference it (#80). The server authenticates it with
+/// Upload the blob for `config_hash` from the local store so the cloud can resolve a record that
+/// references it. `/api/v1/config` is a plain sha256-keyed blob store, so it carries both kinds of
+/// blob we have to make resolvable: the effective config a slot was scored under (#80) and the
+/// prompt a work note was written with (#147). The server authenticates with
 /// `sha256(blob) == config_hash` and stores it idempotently. Errors if we have no local blob for
-/// the hash — which shouldn't happen, since every config we score under is persisted.
+/// the hash — which shouldn't happen, since both are persisted before the record that names them.
 fn upload_config(
     db: &Database,
     agent_id: &str,
@@ -198,6 +201,9 @@ fn withdrawal_payload(agent_id: &str, record: &crate::db::WorkSummary) -> serde_
 /// break every record behind it. Withdrawn notes are never uploaded — withdrawing before
 /// the window closes means the note simply never travels — but the *withdrawal record*
 /// always is, because a note that already left needs taking back.
+///
+/// A note rejected because the cloud lacks its prompt (428) is retried once after uploading
+/// that prompt, so the words and the rules behind them always arrive together (#147).
 pub fn sync_work_summaries(
     db: &Database,
     agent_id: &str,
@@ -224,11 +230,25 @@ pub fn sync_work_summaries(
             (&notes_url, summary_payload(agent_id, &record))
         };
 
-        let resp = client
+        let mut resp = client
             .post(url)
             .json(&payload)
             .send()
             .map_err(|e| format!("work note upload request failed: {e}"))?;
+
+        // The cloud won't take a note until it holds the prompt that wrote it, so a recipient
+        // can always read the rules behind the words (#147). Backfill the prompt from the local
+        // blob store and retry once — the same shape as a slot's config (#80), and for the same
+        // reason: presence cloud-side is decided cloud-side, never from a local "already sent"
+        // marker. Withdrawals name no prompt, so they never take this path.
+        if resp.status().as_u16() == PRECONDITION_REQUIRED && !is_withdrawal {
+            upload_config(db, agent_id, base_url, &record.prompt_hash)?;
+            resp = client
+                .post(url)
+                .json(&payload)
+                .send()
+                .map_err(|e| format!("note re-upload after prompt backfill failed: {e}"))?;
+        }
 
         if !resp.status().is_success() {
             return Err(format!(
