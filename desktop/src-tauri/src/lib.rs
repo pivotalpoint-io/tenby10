@@ -221,6 +221,33 @@ async fn dashboard_pending_slots(
         .map_err(|e| format!("Database error: {}", e))
 }
 
+/// The daily work notes (ADR 0019) covering `[from, to)`, latest revision per day,
+/// withdrawn days omitted. Empty when the user has no AI configured — the dashboard
+/// renders that as an invitation rather than an error.
+#[tauri::command]
+async fn dashboard_work_notes(
+    db: tauri::State<'_, Arc<daemon::db::Database>>,
+    from: i64,
+    to: i64,
+) -> Result<Vec<daemon::db::WorkSummary>, String> {
+    let db_clone = db.inner().clone();
+    tokio::task::spawn_blocking(move || db_clone.get_work_summaries(from, to))
+        .await
+        .map_err(|e| format!("Task join error: {}", e))?
+        .map_err(|e| format!("Database error: {}", e))
+}
+
+/// Whether note generation is live right now: the user's own AI is configured and
+/// notes are not opted out. Drives the dashboard's empty state, so the invitation
+/// only appears to people who would actually gain something by acting on it.
+#[tauri::command]
+async fn work_notes_enabled() -> Result<bool, String> {
+    let mut config_path = daemon::env::get_app_home();
+    config_path.push("config.json");
+    let config = daemon::config::load_config(config_path).unwrap_or_default();
+    Ok(!config.disable_work_summaries && daemon::llm::get_llm_provider(&config).is_some())
+}
+
 /// Classified minute-by-minute activity for a single 10-minute slot.
 #[tauri::command]
 async fn dashboard_slot_details(
@@ -439,6 +466,8 @@ pub fn run() {
             dashboard_slots,
             dashboard_pending_slots,
             dashboard_slot_details,
+            dashboard_work_notes,
+            work_notes_enabled,
             export_dashboard_csv,
             get_agent_config,
             save_agent_config,
