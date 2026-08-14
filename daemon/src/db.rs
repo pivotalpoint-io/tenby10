@@ -1217,6 +1217,58 @@ impl Database {
         rows.collect()
     }
 
+    /// Signed work notes waiting to upload, oldest first — but only those written more
+    /// than `correction_window_secs` ago (ADR 0019).
+    ///
+    /// The delay is the correction window. Nothing waits on the worker and no approval
+    /// exists, so the protection against a bad note reaching a client is that the note
+    /// sits on their own machine, visible in their own dashboard, before it travels.
+    pub fn get_unsynced_summaries(
+        &self,
+        now_ts: i64,
+        correction_window_secs: i64,
+        limit: u32,
+    ) -> Result<Vec<WorkSummary>> {
+        let cutoff = now_ts - correction_window_secs;
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, period_start, period_end, summary_text, generated_at, revision,
+                    withdrawn, hash, parent_hash, signature, scheme_version, prompt_hash
+             FROM work_summaries
+             WHERE signature IS NOT NULL AND synced = 0 AND withdrawn = 0
+               AND generated_at <= ?1
+             ORDER BY id ASC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![cutoff, limit], |row| {
+            Ok(WorkSummary {
+                id: row.get(0)?,
+                period_start: row.get(1)?,
+                period_end: row.get(2)?,
+                summary_text: row.get(3)?,
+                generated_at: row.get(4)?,
+                revision: row.get(5)?,
+                withdrawn: row.get::<_, i64>(6)? != 0,
+                hash: row.get(7)?,
+                parent_hash: row.get(8)?,
+                signature: row.get(9)?,
+                scheme_version: row.get(10).unwrap_or(SUMMARY_SCHEME_VERSION),
+                prompt_hash: row.get(11).unwrap_or_default(),
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// Mark one note row uploaded.
+    pub fn mark_summary_synced(&self, id: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE work_summaries SET synced = 1 WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(())
+    }
+
     /// Whether a period already has a summary, at any revision. The generator uses this
     /// to stay idempotent across restarts.
     pub fn has_work_summary(&self, period_start: i64) -> Result<bool> {
@@ -2522,6 +2574,121 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855|CONFIGHASH|PARE
             db.has_work_summary(86_400).unwrap(),
             "the generator still knows this period was written"
         );
+    }
+
+    #[test]
+    fn test_correction_window_holds_notes_back_and_withdrawal_stops_them() {
+        // The window is the only thing standing between a bad note and a client, since
+        // nothing waits for approval. A fresh note must not be uploadable, and a note
+        // withdrawn during the window must never become uploadable at all.
+        let db = create_test_db();
+        let keys = crate::config::generate_enrollment_keys("tok");
+        let signer = SlotSigner {
+            public_key: &keys.public_key,
+            private_key: &keys.private_key,
+        };
+        let now = 1_786_800_000;
+        let window = 12 * 3600;
+
+        db.insert_work_summary(86_400, 172_800, "Fresh note.", now, "ph", Some(&signer))
+            .unwrap();
+        assert!(
+            db.get_unsynced_summaries(now, window, 50)
+                .unwrap()
+                .is_empty(),
+            "a note written just now has not cleared the correction window"
+        );
+
+        // Same note, once the window has passed.
+        let ready = db.get_unsynced_summaries(now + window, window, 50).unwrap();
+        assert_eq!(ready.len(), 1, "after the window it is ready to travel");
+        assert_eq!(ready[0].summary_text, "Fresh note.");
+
+        db.withdraw_work_summary(86_400).unwrap();
+        assert!(
+            db.get_unsynced_summaries(now + window, window, 50)
+                .unwrap()
+                .is_empty(),
+            "a withdrawn note never travels, window or not"
+        );
+    }
+
+    #[test]
+    fn test_synced_notes_are_not_re_uploaded() {
+        let db = create_test_db();
+        let keys = crate::config::generate_enrollment_keys("tok");
+        let signer = SlotSigner {
+            public_key: &keys.public_key,
+            private_key: &keys.private_key,
+        };
+        let now = 1_786_800_000;
+        let id = db
+            .insert_work_summary(86_400, 172_800, "Note.", now - 86_400, "ph", Some(&signer))
+            .unwrap();
+
+        assert_eq!(db.get_unsynced_summaries(now, 3600, 50).unwrap().len(), 1);
+        db.mark_summary_synced(id).unwrap();
+        assert!(db.get_unsynced_summaries(now, 3600, 50).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_unsigned_notes_are_never_uploaded() {
+        // An unsigned note is a local artifact of an unenrolled machine. Uploading one
+        // would put text on a client's page that nothing can verify.
+        let db = create_test_db();
+        let now = 1_786_800_000;
+        db.insert_work_summary(86_400, 172_800, "Unsigned.", now - 86_400, "ph", None)
+            .unwrap();
+        assert!(db.get_unsynced_summaries(now, 3600, 50).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_summary_canonical_vector_matches_cloud() {
+        // Cross-language alignment vector (ADR 0019), mirrored by the cloud's
+        // canonicalSummaryPayload test. A one-character drift on either side makes
+        // every note unverifiable — and a note is the part a client actually reads.
+        let note = "Reworked the checkout flow.";
+        let note_hash = sha256_hex(note);
+
+        let v1 =
+            canonical_summary_payload(1, "PUBKEY", 86_400, 172_800, 172_900, 0, note, "", "PARENT");
+        assert_eq!(
+            v1,
+            format!("tenby10-summary|v1|PUBKEY|86400|172800|172900|0|{note_hash}|PARENT")
+        );
+
+        let v2 = canonical_summary_payload(
+            2,
+            "PUBKEY",
+            86_400,
+            172_800,
+            172_900,
+            0,
+            note,
+            "PROMPTHASH",
+            "PARENT",
+        );
+        assert_eq!(
+            v2,
+            format!(
+                "tenby10-summary|v2|PUBKEY|86400|172800|172900|0|{note_hash}|PROMPTHASH|PARENT"
+            )
+        );
+
+        // The note is folded through SHA-256, so its text can never inject the delimiter.
+        let evil = canonical_summary_payload(
+            2,
+            "PUBKEY",
+            86_400,
+            172_800,
+            172_900,
+            0,
+            "a|b|c",
+            "PROMPTHASH",
+            "PARENT",
+        );
+        assert!(!evil.contains("a|b|c"));
+        assert!(evil.contains(&sha256_hex("a|b|c")));
     }
 
     #[test]

@@ -879,6 +879,18 @@ pub fn aggregate_slot(db: &Database, config: &crate::config::AgentConfig, slot_s
             Ok(_) => {}
             Err(e) => eprintln!("[Sync] {e}"),
         }
+
+        // Work notes ride the same beat but their own chain, so a stalled note never
+        // blocks an hour from syncing, or the reverse.
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        match crate::sync::sync_work_summaries(db, &config.agent_id, &base, now) {
+            Ok(n) if n > 0 => println!("[Sync] Uploaded {n} work note(s) to the cloud."),
+            Ok(_) => {}
+            Err(e) => eprintln!("[Sync] {e}"),
+        }
     }
 }
 
