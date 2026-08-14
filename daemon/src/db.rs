@@ -56,6 +56,11 @@ pub fn aggregate_v1(focus_scores: &[u32]) -> AggregatesV1 {
 /// signed under it must keep verifying byte-for-byte, forever.
 pub const LEDGER_SCHEME_VERSION: u32 = 4;
 
+/// Version of the work-summary signing/hashing scheme (ADR 0019). Independent of
+/// [`LEDGER_SCHEME_VERSION`]: summaries are their own record type on their own chain,
+/// so the two evolve separately.
+pub const SUMMARY_SCHEME_VERSION: u32 = 1;
+
 /// Material needed to self-sign a slot summary (ADR 0014). Sourced from the
 /// enrolled agent's config; both keys are hex-encoded Ed25519. When absent
 /// (agent not yet enrolled) slots are written unsigned — tamper-evident via the
@@ -84,6 +89,27 @@ pub struct SignedSlot {
     pub config_hash: String,
     /// Blurred screenshots backing this slot (v3+; 0 on older rows).
     pub screenshot_count: u32,
+}
+
+/// A daily work summary as stored and shared (ADR 0019). The text is written by the
+/// user's own AI on their machine, from their own work log, and — unlike per-slot
+/// reasoning — it is meant to reach the client, so the whole row is signed and synced.
+///
+/// Rows are append-only: a correction is a new `revision` for the same `period_start`,
+/// never an edit. `withdrawn` is a sharing decision, not a claim about the past, so it
+/// is deliberately outside the signed payload.
+pub struct WorkSummary {
+    pub id: i64,
+    pub period_start: i64,
+    pub period_end: i64,
+    pub summary_text: String,
+    pub generated_at: i64,
+    pub revision: u32,
+    pub withdrawn: bool,
+    pub hash: String,
+    pub parent_hash: String,
+    pub signature: Option<String>,
+    pub scheme_version: u32,
 }
 
 /// The signable fields of a stored slot, read back for re-chaining in [`Database::reseal_from`].
@@ -207,6 +233,39 @@ fn canonical_slot_payload(
             parent_hash,
         )
     }
+}
+
+/// Canonical signable form of a work summary (ADR 0019).
+///
+/// `generated_at` is in the payload on purpose: the value of a summary is that it was
+/// written while the work was fresh, so the claim being signed is "this text described
+/// this period, and it was written at this moment". A backdated summary cannot be
+/// re-signed without the key, and a late one is visibly late.
+///
+/// `withdrawn` is *not* here. Withdrawing is a decision about sharing from now on, not
+/// an assertion about the past, and the past is what a signature covers.
+#[allow(clippy::too_many_arguments)]
+fn canonical_summary_payload(
+    scheme_version: u32,
+    signing_pubkey: &str,
+    period_start: i64,
+    period_end: i64,
+    generated_at: i64,
+    revision: u32,
+    summary_text: &str,
+    parent_hash: &str,
+) -> String {
+    format!(
+        "tenby10-summary|v{}|{}|{}|{}|{}|{}|{}|{}",
+        scheme_version,
+        signing_pubkey,
+        period_start,
+        period_end,
+        generated_at,
+        revision,
+        sha256_hex(summary_text),
+        parent_hash,
+    )
 }
 
 /// Verify an Ed25519 slot signature. `Ok(true)`/`Ok(false)` on a well-formed
@@ -356,6 +415,33 @@ impl Database {
             "CREATE TABLE IF NOT EXISTS config_blobs (config_hash TEXT PRIMARY KEY, blob TEXT NOT NULL)",
             [],
         )?;
+
+        // Daily work summaries (ADR 0019), on their own hash chain. They are independent
+        // of slot ordering — a summary attests "this text described this period, written
+        // at this time" — so they link to each other rather than interleaving with slots.
+        // Corrections append a new revision; nothing is ever rewritten in place.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS work_summaries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                period_start INTEGER NOT NULL,
+                period_end INTEGER NOT NULL,
+                summary_text TEXT NOT NULL,
+                generated_at INTEGER NOT NULL,
+                revision INTEGER NOT NULL DEFAULT 0,
+                withdrawn INTEGER NOT NULL DEFAULT 0,
+                hash TEXT NOT NULL,
+                parent_hash TEXT NOT NULL,
+                signature TEXT,
+                signing_pubkey TEXT,
+                scheme_version INTEGER NOT NULL DEFAULT 1,
+                synced INTEGER NOT NULL DEFAULT 0
+            )",
+            [],
+        )?;
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_work_summaries_period ON work_summaries(period_start)",
+            [],
+        );
 
         Ok(())
     }
@@ -803,6 +889,275 @@ impl Database {
             }
 
             // Move the chain forward
+            expected_parent_hash = hash;
+        }
+
+        Ok(Ok(()))
+    }
+
+    /// Head of the work-summary chain, or `""` when no summary has been written yet.
+    pub fn get_latest_summary_hash(&self) -> Result<String> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT hash FROM work_summaries ORDER BY id DESC LIMIT 1")?;
+        let mut rows = stmt.query([])?;
+        if let Some(row) = rows.next()? {
+            row.get(0)
+        } else {
+            Ok(String::new())
+        }
+    }
+
+    /// Append a work summary for `period_start..period_end`, chained and — when enrolled —
+    /// signed (ADR 0019). `revision` 0 is the original; corrections come through
+    /// [`Database::revise_work_summary`], which appends rather than edits.
+    ///
+    /// Like slot insertion, a malformed key leaves the row unsigned (still chained) rather
+    /// than failing the write: losing the summary is worse than losing its signature.
+    pub fn insert_work_summary(
+        &self,
+        period_start: i64,
+        period_end: i64,
+        summary_text: &str,
+        generated_at: i64,
+        signer: Option<&SlotSigner>,
+    ) -> Result<i64> {
+        self.append_summary_revision(
+            period_start,
+            period_end,
+            summary_text,
+            generated_at,
+            0,
+            signer,
+        )
+    }
+
+    /// Append a correction for a period that already has a summary. The prior revision
+    /// stays in the ledger and stays signed; readers take the highest revision. Returns
+    /// the new row id, or `None` when the period has no summary to revise.
+    pub fn revise_work_summary(
+        &self,
+        period_start: i64,
+        summary_text: &str,
+        generated_at: i64,
+        signer: Option<&SlotSigner>,
+    ) -> Result<Option<i64>> {
+        let existing: Option<(i64, u32)> = {
+            let conn = self.conn.lock().unwrap();
+            let mut stmt = conn.prepare(
+                "SELECT period_end, MAX(revision) FROM work_summaries WHERE period_start = ?1",
+            )?;
+            let mut rows = stmt.query(params![period_start])?;
+            match rows.next()? {
+                Some(row) => {
+                    let period_end: Option<i64> = row.get(0)?;
+                    let max_revision: Option<u32> = row.get(1)?;
+                    match (period_end, max_revision) {
+                        (Some(end), Some(rev)) => Some((end, rev)),
+                        _ => None,
+                    }
+                }
+                None => None,
+            }
+        };
+
+        let Some((period_end, max_revision)) = existing else {
+            return Ok(None);
+        };
+
+        self.append_summary_revision(
+            period_start,
+            period_end,
+            summary_text,
+            generated_at,
+            max_revision + 1,
+            signer,
+        )
+        .map(Some)
+    }
+
+    fn append_summary_revision(
+        &self,
+        period_start: i64,
+        period_end: i64,
+        summary_text: &str,
+        generated_at: i64,
+        revision: u32,
+        signer: Option<&SlotSigner>,
+    ) -> Result<i64> {
+        let parent_hash = self.get_latest_summary_hash()?;
+        let signing_pubkey = signer.map(|s| s.public_key).unwrap_or("");
+
+        let payload = canonical_summary_payload(
+            SUMMARY_SCHEME_VERSION,
+            signing_pubkey,
+            period_start,
+            period_end,
+            generated_at,
+            revision,
+            summary_text,
+            &parent_hash,
+        );
+        let hash = sha256_hex(&payload);
+
+        let signature: Option<String> = signer.and_then(|s| {
+            let bytes = from_hex(s.private_key)?;
+            let arr: [u8; 32] = bytes.try_into().ok()?;
+            let sk = SigningKey::from_bytes(&arr);
+            Some(to_hex_bytes(&sk.sign(payload.as_bytes()).to_bytes()))
+        });
+        let stored_pubkey: Option<&str> = signature.as_ref().map(|_| signing_pubkey);
+
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO work_summaries (
+                period_start, period_end, summary_text, generated_at, revision,
+                hash, parent_hash, signature, signing_pubkey, scheme_version
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                period_start,
+                period_end,
+                summary_text,
+                generated_at,
+                revision,
+                hash,
+                parent_hash,
+                signature,
+                stored_pubkey,
+                SUMMARY_SCHEME_VERSION,
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Stop sharing every revision for a period. The rows and their signatures stay —
+    /// withdrawing is a decision about what the client sees from now on, not a claim
+    /// that the work never happened. Returns the number of rows affected.
+    pub fn withdraw_work_summary(&self, period_start: i64) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE work_summaries SET withdrawn = 1, synced = 0 WHERE period_start = ?1",
+            params![period_start],
+        )
+    }
+
+    /// The current summary for each period in `[from, to)`: highest revision, withdrawn
+    /// periods omitted. This is what a reader — the dashboard, and later the client's
+    /// verified page — should show.
+    pub fn get_work_summaries(&self, from: i64, to: i64) -> Result<Vec<WorkSummary>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, period_start, period_end, summary_text, generated_at, revision,
+                    withdrawn, hash, parent_hash, signature, scheme_version
+             FROM work_summaries w
+             WHERE period_start >= ?1 AND period_start < ?2
+               AND withdrawn = 0
+               AND revision = (SELECT MAX(revision) FROM work_summaries
+                               WHERE period_start = w.period_start)
+             ORDER BY period_start ASC",
+        )?;
+        let rows = stmt.query_map(params![from, to], |row| {
+            Ok(WorkSummary {
+                id: row.get(0)?,
+                period_start: row.get(1)?,
+                period_end: row.get(2)?,
+                summary_text: row.get(3)?,
+                generated_at: row.get(4)?,
+                revision: row.get(5)?,
+                withdrawn: row.get::<_, i64>(6)? != 0,
+                hash: row.get(7)?,
+                parent_hash: row.get(8)?,
+                signature: row.get(9)?,
+                scheme_version: row.get(10).unwrap_or(SUMMARY_SCHEME_VERSION),
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// Whether a period already has a summary, at any revision. The generator uses this
+    /// to stay idempotent across restarts.
+    pub fn has_work_summary(&self, period_start: i64) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            conn.prepare("SELECT 1 FROM work_summaries WHERE period_start = ?1 LIMIT 1")?;
+        let mut rows = stmt.query(params![period_start])?;
+        Ok(rows.next()?.is_some())
+    }
+
+    /// Walk the summary chain the way an auditor would: every link, every hash, every
+    /// signature. Mirrors [`Database::verify_ledger_integrity`] for the summary record type.
+    pub fn verify_summary_chain(&self, expected_pubkey: &str) -> Result<Result<(), String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, period_start, period_end, summary_text, generated_at, revision,
+                    hash, parent_hash, signature, signing_pubkey, scheme_version
+             FROM work_summaries ORDER BY id ASC",
+        )?;
+        let mut rows = stmt.query([])?;
+
+        let mut expected_parent_hash = String::new();
+
+        while let Some(row) = rows.next()? {
+            let id: i64 = row.get(0)?;
+            let period_start: i64 = row.get(1)?;
+            let period_end: i64 = row.get(2)?;
+            let summary_text: String = row.get(3)?;
+            let generated_at: i64 = row.get(4)?;
+            let revision: u32 = row.get(5)?;
+            let hash: String = row.get(6)?;
+            let parent_hash: String = row.get(7)?;
+            let signature: Option<String> = row.get(8)?;
+            let signing_pubkey: Option<String> = row.get(9)?;
+            let scheme_version: u32 = row.get(10).unwrap_or(SUMMARY_SCHEME_VERSION);
+
+            if parent_hash != expected_parent_hash {
+                return Ok(Err(format!(
+                    "Summary chain link broken at row {}. Expected parent hash '{}', found '{}'.",
+                    id, expected_parent_hash, parent_hash
+                )));
+            }
+
+            let row_pubkey = signing_pubkey.as_deref().unwrap_or("");
+            let payload = canonical_summary_payload(
+                scheme_version,
+                row_pubkey,
+                period_start,
+                period_end,
+                generated_at,
+                revision,
+                &summary_text,
+                &parent_hash,
+            );
+            if hash != sha256_hex(&payload) {
+                return Ok(Err(format!(
+                    "Summary {} has been modified after it was written.",
+                    id
+                )));
+            }
+
+            if let Some(sig_hex) = signature.as_deref() {
+                if !expected_pubkey.is_empty() && row_pubkey != expected_pubkey {
+                    return Ok(Err(format!(
+                        "Summary {} signed by unexpected key '{}' (enrolled key is '{}').",
+                        id, row_pubkey, expected_pubkey
+                    )));
+                }
+                match verify_slot_signature(&payload, sig_hex, row_pubkey) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return Ok(Err(format!(
+                            "Signature verification failed at summary {}.",
+                            id
+                        )));
+                    }
+                    Err(e) => {
+                        return Ok(Err(format!(
+                            "Malformed signature or key at summary {}: {}.",
+                            id, e
+                        )));
+                    }
+                }
+            }
+
             expected_parent_hash = hash;
         }
 
@@ -1808,5 +2163,215 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855|CONFIGHASH|PARE
             verify_slot_signature(&canonical, &sig2000, &key.public_key).unwrap(),
             "resealed signature verifies under the current key"
         );
+    }
+
+    // --- Work summaries (ADR 0019) ---
+
+    #[test]
+    fn test_summary_roundtrip_and_chain_verifies() {
+        let db = create_test_db();
+        let keys = crate::config::generate_enrollment_keys("tok");
+        let signer = SlotSigner {
+            public_key: &keys.public_key,
+            private_key: &keys.private_key,
+        };
+
+        db.insert_work_summary(
+            86_400,
+            172_800,
+            "Shipped the ingestion API.",
+            172_900,
+            Some(&signer),
+        )
+        .unwrap();
+        db.insert_work_summary(
+            172_800,
+            259_200,
+            "Reviewed two pull requests.",
+            259_300,
+            Some(&signer),
+        )
+        .unwrap();
+
+        assert!(
+            db.verify_summary_chain(&keys.public_key).unwrap().is_ok(),
+            "a freshly written summary chain verifies"
+        );
+
+        let summaries = db.get_work_summaries(0, 300_000).unwrap();
+        assert_eq!(summaries.len(), 2);
+        assert_eq!(summaries[0].summary_text, "Shipped the ingestion API.");
+        assert_eq!(summaries[0].revision, 0);
+
+        let other = crate::config::generate_enrollment_keys("tok2");
+        assert!(
+            db.verify_summary_chain(&other.public_key).unwrap().is_err(),
+            "a summary signed by a different identity must not verify"
+        );
+    }
+
+    #[test]
+    fn test_edited_summary_text_is_detected() {
+        // The property the client's whole claim rests on: text that reaches a client
+        // cannot be quietly rewritten afterwards. Editing the row breaks the hash even
+        // though every other column is untouched.
+        let db = create_test_db();
+        db.insert_work_summary(86_400, 172_800, "Fixed the checkout bug.", 172_900, None)
+            .unwrap();
+        assert!(db.verify_summary_chain("").unwrap().is_ok());
+
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE work_summaries SET summary_text = 'Rebuilt the entire checkout.' WHERE period_start = 86400",
+                [],
+            )
+            .unwrap();
+        }
+
+        let verdict = db.verify_summary_chain("").unwrap();
+        assert!(
+            verdict.is_err(),
+            "an edited summary must fail verification: {verdict:?}"
+        );
+    }
+
+    #[test]
+    fn test_signature_defeats_summary_recompute_attack() {
+        // Recomputing the hash after an edit beats the chain alone. It must not beat
+        // the signature — the attacker does not hold the key.
+        let db = create_test_db();
+        let keys = crate::config::generate_enrollment_keys("tok");
+        let signer = SlotSigner {
+            public_key: &keys.public_key,
+            private_key: &keys.private_key,
+        };
+        db.insert_work_summary(
+            86_400,
+            172_800,
+            "Two hours on the API.",
+            172_900,
+            Some(&signer),
+        )
+        .unwrap();
+
+        let forged_text = "Nine hours on the API.";
+        let forged_payload = canonical_summary_payload(
+            SUMMARY_SCHEME_VERSION,
+            &keys.public_key,
+            86_400,
+            172_800,
+            172_900,
+            0,
+            forged_text,
+            "",
+        );
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE work_summaries SET summary_text = ?1, hash = ?2 WHERE period_start = 86400",
+                params![forged_text, sha256_hex(&forged_payload)],
+            )
+            .unwrap();
+        }
+
+        assert!(
+            db.verify_summary_chain(&keys.public_key).unwrap().is_err(),
+            "a re-hashed forgery must still fail the signature check"
+        );
+    }
+
+    #[test]
+    fn test_revision_appends_and_supersedes() {
+        let db = create_test_db();
+        db.insert_work_summary(86_400, 172_800, "Worked on billing.", 172_900, None)
+            .unwrap();
+        let revised = db
+            .revise_work_summary(86_400, "Worked on billing and refunds.", 173_500, None)
+            .unwrap();
+        assert!(
+            revised.is_some(),
+            "revising an existing period appends a row"
+        );
+
+        // Readers see the correction; the chain still holds because nothing was rewritten.
+        let summaries = db.get_work_summaries(0, 200_000).unwrap();
+        assert_eq!(
+            summaries.len(),
+            1,
+            "one row per period, the latest revision"
+        );
+        assert_eq!(summaries[0].summary_text, "Worked on billing and refunds.");
+        assert_eq!(summaries[0].revision, 1);
+        assert!(db.verify_summary_chain("").unwrap().is_ok());
+
+        // The superseded original is still in the ledger.
+        {
+            let conn = db.conn.lock().unwrap();
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM work_summaries WHERE period_start = 86400",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 2, "the original revision is kept, not overwritten");
+        }
+
+        assert!(
+            db.revise_work_summary(999_999, "No such period.", 1_000_000, None)
+                .unwrap()
+                .is_none(),
+            "revising a period with no summary is a no-op, not an insert"
+        );
+    }
+
+    #[test]
+    fn test_withdrawn_summary_is_hidden_but_still_verifies() {
+        // Withdrawing is a sharing decision, so it must not be a claim about the past:
+        // the row stays, the chain stays intact, readers stop seeing it.
+        let db = create_test_db();
+        let keys = crate::config::generate_enrollment_keys("tok");
+        let signer = SlotSigner {
+            public_key: &keys.public_key,
+            private_key: &keys.private_key,
+        };
+        db.insert_work_summary(
+            86_400,
+            172_800,
+            "Client call and follow-up.",
+            172_900,
+            Some(&signer),
+        )
+        .unwrap();
+
+        assert_eq!(db.withdraw_work_summary(86_400).unwrap(), 1);
+        assert!(
+            db.get_work_summaries(0, 200_000).unwrap().is_empty(),
+            "a withdrawn period is not shown"
+        );
+        assert!(
+            db.verify_summary_chain(&keys.public_key).unwrap().is_ok(),
+            "withdrawal must not break the chain"
+        );
+        assert!(
+            db.has_work_summary(86_400).unwrap(),
+            "the generator still knows this period was written"
+        );
+    }
+
+    #[test]
+    fn test_summary_chain_is_independent_of_slots() {
+        // Summaries link to summaries. Writing slots in between must not disturb them.
+        let db = create_test_db();
+        db.insert_work_summary(86_400, 172_800, "Morning: API work.", 172_900, None)
+            .unwrap();
+        db.insert_slot_summary(1000, 80, 8, 2, 100, 10, "{}", None, "", None)
+            .unwrap();
+        db.insert_work_summary(172_800, 259_200, "Afternoon: reviews.", 259_300, None)
+            .unwrap();
+
+        assert!(db.verify_summary_chain("").unwrap().is_ok());
+        assert!(db.verify_ledger_integrity("").unwrap().is_ok());
     }
 }
