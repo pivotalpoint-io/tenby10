@@ -849,3 +849,71 @@
             color: var(--text-muted);
             padding-bottom: 0.5rem;
         }
+
+        /* Daily work note (ADR 0019). The plain-words answer to "what was worked
+           on", shown above the timeline because that is the question people bring
+           to a day. Same text a client would read, so it is styled to be read,
+           not scanned. */
+        .work-note-card {
+            background: rgba(16, 185, 129, 0.06);
+            border: 1px solid rgba(16, 185, 129, 0.18);
+            border-radius: 12px;
+            padding: 1.2rem 1.4rem;
+            margin-bottom: 2rem;
+        }
+
+        .work-note-label {
+            font-size: 0.8rem;
+            text-transform: uppercase;
+            color: var(--text-muted);
+            letter-spacing: 0.8px;
+            margin-bottom: 0.7rem;
+        }
+
+        .work-note-text {
+            font-size: 1rem;
+            line-height: 1.6;
+            color: var(--text-primary, #e5e7eb);
+            margin: 0;
+        }
+
+        .work-note-meta {
+            display: block;
+            margin-top: 0.7rem;
+            font-size: 0.72rem;
+            color: var(--text-muted);
+        }
+
+        /* No AI configured: an invitation, not a warning. Nothing is broken. */
+        .work-note-empty {
+            background: rgba(255, 255, 255, 0.03);
+            border-color: var(--border-card);
+        }
+
+        .work-note-empty .work-note-text {
+            font-size: 0.9rem;
+            color: var(--text-muted);
+        }
+
+        .work-note-row {
+            display: flex;
+            gap: 1rem;
+            align-items: baseline;
+            padding: 0.6rem 0;
+            border-top: 1px solid var(--border-card);
+        }
+
+        .work-note-row:first-of-type {
+            border-top: none;
+        }
+
+        .work-note-day {
+            flex: 0 0 4.5rem;
+            font-size: 0.78rem;
+            font-weight: 600;
+            color: var(--text-muted);
+        }
+
+        .work-note-row .work-note-text {
+            font-size: 0.92rem;
+        }

@@ -322,6 +322,17 @@ async function loadAgentConfig() {
     updateLlmProviderHints();
     document.getElementById("ai-prompt").value = currentConfig.llm_prompt || "";
 
+    // Work notes are on unless explicitly turned off (ADR 0019): the config stores
+    // the opt-out, the switch shows the state.
+    const summaryToggle = document.getElementById("summary-toggle");
+    if (summaryToggle) {
+      summaryToggle.checked = !currentConfig.disable_work_summaries;
+    }
+    const summaryPrompt = document.getElementById("summary-prompt");
+    if (summaryPrompt) {
+      summaryPrompt.value = currentConfig.summary_prompt || "";
+    }
+
     updateTokenEstimate();
     toggleLlmFields(isLlm);
   } catch (err) {
@@ -436,7 +447,21 @@ if (saveSettingsBtn) {
         }
       }
 
+      const summaryToggleEl = document.getElementById("summary-toggle");
+      const summaryPromptEl = document.getElementById("summary-prompt");
+      if (isLlmEnabled && summaryToggleEl && summaryToggleEl.checked) {
+        // A note with no rules behind it is exactly what we refuse to produce.
+        if (summaryPromptEl && !summaryPromptEl.value.trim()) {
+          rejectSave("⚠️ Work Note Prompt is required while daily work notes are on.");
+          return;
+        }
+      }
+
       config.engine_mode = isLlmEnabled ? "llm" : "static";
+      config.disable_work_summaries = !(summaryToggleEl && summaryToggleEl.checked);
+      if (summaryPromptEl) {
+        config.summary_prompt = summaryPromptEl.value.trim();
+      }
       config.llm_provider = document.getElementById("ai-provider").value;
       config.llm_api_key = apiKey;
       config.llm_base_url = baseUrl;
