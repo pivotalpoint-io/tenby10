@@ -100,6 +100,7 @@ pub struct SignedSlot {
 /// Rows are append-only: a correction is a new `revision` for the same `period_start`,
 /// never an edit. `withdrawn` is a sharing decision, not a claim about the past, so it
 /// is deliberately outside the signed payload.
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct WorkSummary {
     pub id: i64,
     pub period_start: i64,

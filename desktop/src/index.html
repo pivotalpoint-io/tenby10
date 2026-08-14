@@ -172,6 +172,28 @@
               <p id="token-estimate" class="token-estimate-text"></p>
             </div>
 
+            <!-- Daily work notes (ADR 0019). On because the AI is on; the switch is
+                 here for the exception case, not as a setup step. -->
+            <div class="ai-toggle-header" style="margin-top: 0.5rem;">
+              <label class="input-label" for="summary-toggle" style="margin: 0;">Daily work notes</label>
+              <label class="switch">
+                <input id="summary-toggle" type="checkbox" checked />
+                <span class="slider round"></span>
+              </label>
+            </div>
+            <p class="desc">
+              Once a day is over, your AI writes a short note of what was worked on, from
+              your billable time. It appears in your log, and on any link you share.
+            </p>
+
+            <div class="form-group" id="summary-prompt-group">
+              <label class="input-label" for="summary-prompt">Work Note Prompt</label>
+              <textarea id="summary-prompt" style="height: 120px;"></textarea>
+              <p class="desc">
+                These rules travel with every note, so a reader can always see what wrote it.
+              </p>
+            </div>
+
             <p class="desc" style="margin-top: 0.75rem;">
               The auditor receives text only: application names, window titles and
               input counts for each minute of the slot. tenby10 never captures your

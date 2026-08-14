@@ -26,11 +26,71 @@ function goHome() {
         let currentViewMode = 'daily';
         let weekStartDay = parseInt(localStorage.getItem('weekStartDay') || '1', 10); // 1 = Monday, 0 = Sunday
 
+        // Daily work notes (ADR 0019), keyed by YYYY-MM-DD, plus whether note
+        // generation is live at all. Empty is a normal state, not an error: without
+        // an AI configured the log still shows hours, categories and rules.
+        let workNotes = {};
+        let workNotesEnabled = false;
+
+        function dateKeyOf(unixSeconds) {
+            const d = new Date(unixSeconds * 1000);
+            const y = d.getFullYear();
+            const m = String(d.getMonth() + 1).padStart(2, '0');
+            const day = String(d.getDate()).padStart(2, '0');
+            return `${y}-${m}-${day}`;
+        }
+
+        async function fetchWorkNotes() {
+            try {
+                workNotesEnabled = await invoke('work_notes_enabled');
+                // One fetch covers every view; the volume is one row per worked day.
+                const notes = await invoke('dashboard_work_notes', { from: 0, to: 4102444800 });
+                workNotes = {};
+                (notes || []).forEach(note => {
+                    workNotes[dateKeyOf(note.period_start)] = note;
+                });
+            } catch (err) {
+                console.error('Error fetching work notes', err);
+            }
+        }
+
+        /// The note card shown above a day's timeline. Returns '' when there is
+        /// nothing honest to show — no note and no reason to nag.
+        function renderWorkNote(dateKey) {
+            const note = workNotes[dateKey];
+            if (note) {
+                const generated = new Date(note.generated_at * 1000);
+                const dayEnd = note.period_end;
+                // Contemporaneity is the point, so lateness is stated, never hidden.
+                const late = note.generated_at - dayEnd > 48 * 3600;
+                const revised = note.revision > 0 ? ' · revised' : '';
+                return `
+                    <div class="work-note-card">
+                        <h4 class="work-note-label">What was worked on</h4>
+                        <p class="work-note-text">${escapeHtml(note.summary_text)}</p>
+                        <span class="work-note-meta">
+                            Written by your AI from the work log on ${generated.toLocaleDateString()}${revised}${late ? ' · written late' : ''}
+                        </span>
+                    </div>
+                `;
+            }
+            if (!workNotesEnabled) {
+                return `
+                    <div class="work-note-card work-note-empty">
+                        <p class="work-note-text">Connect your own AI in Settings and tenby10 writes a short note of each day's work, in plain words.</p>
+                        <span class="work-note-meta">Without it, your log shows hours and categories only.</span>
+                    </div>
+                `;
+            }
+            return '';
+        }
+
         // Fetch dashboard data
         async function fetchDashboardData() {
             try {
                 const slots = await invoke('dashboard_slots');
                 const pendingSlots = await invoke('dashboard_pending_slots');
+                await fetchWorkNotes();
 
                 globalSlots = slots || [];
 
@@ -640,6 +700,8 @@ function goHome() {
                     </div>
                 </div>
 
+                ${renderWorkNote(currentDateKey)}
+
                 <div style="margin-bottom: 2rem; background: rgba(0,0,0,0.15); border: 1px solid var(--border-card); border-radius: 12px; padding: 1.2rem;">
                     <h4 style="font-size: 0.8rem; text-transform: uppercase; color: var(--text-muted); letter-spacing: 0.8px; margin-bottom: 0.6rem;">24-Hour Focus Heatmap</h4>
                     <div class="heatmap-bar">
@@ -678,6 +740,34 @@ function goHome() {
             return startOfWeek;
         }
 
+        /// The week's notes, stacked oldest first. This is the "what shipped this week"
+        /// read — the same text a client would see, before anyone sends it.
+        function renderWeekNotes(startOfWeek) {
+            const rows = [];
+            for (let i = 0; i < 7; i++) {
+                const cur = new Date(startOfWeek);
+                cur.setDate(cur.getDate() + i);
+                const y = cur.getFullYear();
+                const m = String(cur.getMonth() + 1).padStart(2, '0');
+                const d = String(cur.getDate()).padStart(2, '0');
+                const note = workNotes[`${y}-${m}-${d}`];
+                if (!note) continue;
+                rows.push(`
+                    <div class="work-note-row">
+                        <span class="work-note-day">${cur.toLocaleDateString('en-US', { weekday: 'short', day: 'numeric' })}</span>
+                        <p class="work-note-text">${escapeHtml(note.summary_text)}</p>
+                    </div>
+                `);
+            }
+            if (rows.length === 0) return '';
+            return `
+                <div class="work-note-card">
+                    <h4 class="work-note-label">What was worked on this week</h4>
+                    ${rows.join('')}
+                </div>
+            `;
+        }
+
         function renderWeeklyView() {
             const container = document.getElementById('week-view-container');
             
@@ -707,6 +797,7 @@ function goHome() {
                         <span class="day-view-meta">Weekly aggregate productivity overview.</span>
                     </div>
                 </div>
+                ${renderWeekNotes(startOfWeek)}
                 <div class="month-grid" style="margin-top: 0;">
             `;
 
