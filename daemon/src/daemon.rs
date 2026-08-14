@@ -310,6 +310,13 @@ pub fn start_daemon_loop(db: Arc<Database>, state: Arc<TelemetryState>) {
     // Run catch-up aggregation immediately at startup
     aggregate_pending_slots(&db);
 
+    // Catch up on any missed work notes too, on a worker thread so a slow AI call
+    // never delays the first telemetry minute.
+    {
+        let db_clone = db.clone();
+        thread::spawn(move || generate_pending_summaries(&db_clone));
+    }
+
     loop {
         // Run aggregation every 60 seconds
         thread::sleep(Duration::from_secs(60));
@@ -423,10 +430,112 @@ pub fn start_daemon_loop(db: Arc<Database>, state: Arc<TelemetryState>) {
         let db_clone = db.clone();
         thread::spawn(move || {
             aggregate_pending_slots(&db_clone);
+            // Off the same beat, and off the main thread: writing a note calls the
+            // user's own AI over the network, which must never stall telemetry.
+            generate_pending_summaries(&db_clone);
         });
 
         // Reset counts for the next minute segment
         state.reset_minute();
+    }
+}
+
+/// How far back a first run will reach when writing missing work notes (ADR 0019).
+/// Bounded on purpose: installing this on a months-old database must not spend the
+/// user's own API budget summarizing history nobody asked for.
+const SUMMARY_LOOKBACK_DAYS: i64 = 7;
+
+/// Write the daily work note for any finished local day that doesn't have one yet
+/// (ADR 0019).
+///
+/// Runs off the same 60-second loop as aggregation and requires nothing from the user:
+/// notes exist because their AI is configured, which is what the AI is for. A day is
+/// only summarized once it is over, and only once — so this is safe to call repeatedly.
+pub fn generate_pending_summaries(db: &Database) {
+    let mut config_path = crate::env::get_app_home();
+    config_path.push("config.json");
+    let config = crate::config::load_config(config_path).unwrap_or_default();
+
+    if config.disable_work_summaries {
+        return;
+    }
+    let Some(provider) = crate::llm::get_llm_provider(&config) else {
+        // No AI configured: hours, categories and rules still work, there is just no
+        // note. Nothing to warn about on every loop.
+        return;
+    };
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+
+    let pending = match db.days_needing_summary(now, SUMMARY_LOOKBACK_DAYS) {
+        Ok(days) => days,
+        Err(err) => {
+            eprintln!("[Summary] Could not list days needing a note: {err:?}");
+            return;
+        }
+    };
+
+    let prompt = if config.summary_prompt.trim().is_empty() {
+        crate::config::default_summary_prompt()
+    } else {
+        config.summary_prompt.clone()
+    };
+    let prompt_hash = crate::db::sha256_hex_pub(&prompt);
+
+    for (day_start, day_end) in pending {
+        let digest = match db.activity_digest(day_start, day_end) {
+            Ok(lines) => lines,
+            Err(err) => {
+                eprintln!("[Summary] Could not read activity for {day_start}: {err:?}");
+                continue;
+            }
+        };
+        // A day with almost nothing in it has nothing worth describing, and asking a
+        // model to describe it invites invention.
+        if digest.len() < 3 {
+            continue;
+        }
+
+        println!("[Summary] Writing the work note for the day starting {day_start}...");
+        let note = match provider.write_note(&prompt, &digest.join("\n")) {
+            Ok(text) => text,
+            Err(err) => {
+                // Left unwritten on purpose: the next loop retries, and a missing note
+                // is honest where a fabricated one is not.
+                eprintln!("[Summary] The AI could not write a note for {day_start}: {err}");
+                continue;
+            }
+        };
+
+        // Keep the prompt that produced the note, so a reader can always see the rules
+        // behind the words even after the user edits their prompt later.
+        if let Err(err) = db.store_config_blob(&prompt_hash, &prompt) {
+            eprintln!("[Summary] Could not store the prompt behind the note: {err:?}");
+        }
+
+        let signer = if config.public_key.is_empty() || config.private_key.is_empty() {
+            None
+        } else {
+            Some(crate::db::SlotSigner {
+                public_key: &config.public_key,
+                private_key: &config.private_key,
+            })
+        };
+
+        match db.insert_work_summary(
+            day_start,
+            day_end,
+            &note,
+            now,
+            &prompt_hash,
+            signer.as_ref(),
+        ) {
+            Ok(_) => println!("[Summary] {day_start}: {note}"),
+            Err(err) => eprintln!("[Summary] Could not store the note for {day_start}: {err:?}"),
+        }
     }
 }
 

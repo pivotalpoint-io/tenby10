@@ -59,7 +59,9 @@ pub const LEDGER_SCHEME_VERSION: u32 = 4;
 /// Version of the work-summary signing/hashing scheme (ADR 0019). Independent of
 /// [`LEDGER_SCHEME_VERSION`]: summaries are their own record type on their own chain,
 /// so the two evolve separately.
-pub const SUMMARY_SCHEME_VERSION: u32 = 1;
+/// v2 binds the SHA-256 of the prompt that wrote the note, so a reader can always see
+/// which rules produced the text. v1 rows keep hashing under v1, forever.
+pub const SUMMARY_SCHEME_VERSION: u32 = 2;
 
 /// Material needed to self-sign a slot summary (ADR 0014). Sourced from the
 /// enrolled agent's config; both keys are hex-encoded Ed25519. When absent
@@ -110,6 +112,10 @@ pub struct WorkSummary {
     pub parent_hash: String,
     pub signature: Option<String>,
     pub scheme_version: u32,
+    /// SHA-256 of the prompt that produced this note (v2+; "" on v1 rows). The prompt
+    /// text itself is kept in `config_blobs` under this hash, so a reader can always
+    /// show the rules behind the words.
+    pub prompt_hash: String,
 }
 
 /// The signable fields of a stored slot, read back for re-chaining in [`Database::reseal_from`].
@@ -125,6 +131,36 @@ struct StoredSlotRow {
     config_hash: String,
     scheme_version: u32,
     screenshot_count: u32,
+}
+
+/// Start and end of the local calendar day containing `ts`, as unix timestamps.
+///
+/// Local, not UTC: a work note covers the day the person actually worked, and someone
+/// in UTC+13 finishing at 22:00 must not have it filed under tomorrow.
+pub fn local_day_bounds(ts: i64) -> (i64, i64) {
+    use chrono::{Local, TimeZone};
+    let dt = Local.timestamp_opt(ts, 0).single();
+    let Some(dt) = dt else {
+        // Ambiguous or non-existent local time (a DST transition): fall back to a plain
+        // UTC-day bucket rather than dropping the day entirely.
+        let day_start = ts - ts.rem_euclid(86_400);
+        return (day_start, day_start + 86_400);
+    };
+    let start_naive = dt.date_naive().and_hms_opt(0, 0, 0).unwrap();
+    let end_naive = dt.date_naive().and_hms_opt(23, 59, 59).unwrap();
+    // `.earliest()` / `.latest()` pick a side deterministically when DST makes the local
+    // wall-clock time ambiguous, so bounds never depend on which run computed them.
+    let start = Local
+        .from_local_datetime(&start_naive)
+        .earliest()
+        .map(|d| d.timestamp())
+        .unwrap_or(ts - ts.rem_euclid(86_400));
+    let end = Local
+        .from_local_datetime(&end_naive)
+        .latest()
+        .map(|d| d.timestamp() + 1)
+        .unwrap_or(start + 86_400);
+    (start, end)
 }
 
 /// SHA-256 of a string as lowercase hex — matches the canonical payload's field folding.
@@ -253,8 +289,25 @@ fn canonical_summary_payload(
     generated_at: i64,
     revision: u32,
     summary_text: &str,
+    prompt_hash: &str,
     parent_hash: &str,
 ) -> String {
+    // v2 inserts the prompt hash before the parent link, the same way slot v2 inserted
+    // the config hash: the note and the rules that wrote it are signed together.
+    if scheme_version >= 2 {
+        return format!(
+            "tenby10-summary|v{}|{}|{}|{}|{}|{}|{}|{}|{}",
+            scheme_version,
+            signing_pubkey,
+            period_start,
+            period_end,
+            generated_at,
+            revision,
+            sha256_hex(summary_text),
+            prompt_hash,
+            parent_hash,
+        );
+    }
     format!(
         "tenby10-summary|v{}|{}|{}|{}|{}|{}|{}|{}",
         scheme_version,
@@ -434,12 +487,18 @@ impl Database {
                 signature TEXT,
                 signing_pubkey TEXT,
                 scheme_version INTEGER NOT NULL DEFAULT 1,
-                synced INTEGER NOT NULL DEFAULT 0
+                synced INTEGER NOT NULL DEFAULT 0,
+                prompt_hash TEXT NOT NULL DEFAULT ''
             )",
             [],
         )?;
         let _ = conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_work_summaries_period ON work_summaries(period_start)",
+            [],
+        );
+        // v2 (ADR 0019): the note carries the SHA-256 of the prompt that wrote it.
+        let _ = conn.execute(
+            "ALTER TABLE work_summaries ADD COLUMN prompt_hash TEXT NOT NULL DEFAULT ''",
             [],
         );
 
@@ -919,6 +978,7 @@ impl Database {
         period_end: i64,
         summary_text: &str,
         generated_at: i64,
+        prompt_hash: &str,
         signer: Option<&SlotSigner>,
     ) -> Result<i64> {
         self.append_summary_revision(
@@ -927,6 +987,7 @@ impl Database {
             summary_text,
             generated_at,
             0,
+            prompt_hash,
             signer,
         )
     }
@@ -939,6 +1000,7 @@ impl Database {
         period_start: i64,
         summary_text: &str,
         generated_at: i64,
+        prompt_hash: &str,
         signer: Option<&SlotSigner>,
     ) -> Result<Option<i64>> {
         let existing: Option<(i64, u32)> = {
@@ -970,11 +1032,13 @@ impl Database {
             summary_text,
             generated_at,
             max_revision + 1,
+            prompt_hash,
             signer,
         )
         .map(Some)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn append_summary_revision(
         &self,
         period_start: i64,
@@ -982,6 +1046,7 @@ impl Database {
         summary_text: &str,
         generated_at: i64,
         revision: u32,
+        prompt_hash: &str,
         signer: Option<&SlotSigner>,
     ) -> Result<i64> {
         let parent_hash = self.get_latest_summary_hash()?;
@@ -995,6 +1060,7 @@ impl Database {
             generated_at,
             revision,
             summary_text,
+            prompt_hash,
             &parent_hash,
         );
         let hash = sha256_hex(&payload);
@@ -1011,8 +1077,8 @@ impl Database {
         conn.execute(
             "INSERT INTO work_summaries (
                 period_start, period_end, summary_text, generated_at, revision,
-                hash, parent_hash, signature, signing_pubkey, scheme_version
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                hash, parent_hash, signature, signing_pubkey, scheme_version, prompt_hash
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 period_start,
                 period_end,
@@ -1024,6 +1090,7 @@ impl Database {
                 signature,
                 stored_pubkey,
                 SUMMARY_SCHEME_VERSION,
+                prompt_hash,
             ],
         )?;
         Ok(conn.last_insert_rowid())
@@ -1047,7 +1114,7 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, period_start, period_end, summary_text, generated_at, revision,
-                    withdrawn, hash, parent_hash, signature, scheme_version
+                    withdrawn, hash, parent_hash, signature, scheme_version, prompt_hash
              FROM work_summaries w
              WHERE period_start >= ?1 AND period_start < ?2
                AND withdrawn = 0
@@ -1068,7 +1135,83 @@ impl Database {
                 parent_hash: row.get(8)?,
                 signature: row.get(9)?,
                 scheme_version: row.get(10).unwrap_or(SUMMARY_SCHEME_VERSION),
+                prompt_hash: row.get(11).unwrap_or_default(),
             })
+        })?;
+        rows.collect()
+    }
+
+    /// Local calendar days that have activity but no work note yet, oldest first.
+    ///
+    /// Days are bucketed in **local** time, because that is the day the person worked;
+    /// `local_day_bounds` does the conversion. Only days that ended before `now_ts` are
+    /// returned — a day in progress is not summarized. `lookback_days` bounds how far
+    /// back a first run reaches, so installing this on an old database does not spend
+    /// the user's own API budget summarizing months of history.
+    pub fn days_needing_summary(&self, now_ts: i64, lookback_days: i64) -> Result<Vec<(i64, i64)>> {
+        let earliest = now_ts - lookback_days * 86_400;
+        let slot_starts: Vec<i64> = {
+            let conn = self.conn.lock().unwrap();
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT slot_start FROM slot_summaries
+                 WHERE slot_start >= ?1 ORDER BY slot_start ASC",
+            )?;
+            let rows = stmt.query_map(params![earliest], |row| row.get(0))?;
+            rows.collect::<Result<Vec<i64>>>()?
+        };
+
+        let mut days: Vec<(i64, i64)> = Vec::new();
+        for slot_start in slot_starts {
+            let (day_start, day_end) = local_day_bounds(slot_start);
+            // Only whole, finished days.
+            if day_end > now_ts {
+                continue;
+            }
+            if days.last().map(|(s, _)| *s) == Some(day_start) {
+                continue;
+            }
+            if !days.iter().any(|(s, _)| *s == day_start) {
+                days.push((day_start, day_end));
+            }
+        }
+
+        let mut pending = Vec::new();
+        for (day_start, day_end) in days {
+            if !self.has_work_summary(day_start)? {
+                pending.push((day_start, day_end));
+            }
+        }
+        Ok(pending)
+    }
+
+    /// What the note generator sends to the user's own AI for `[from, to)`: app and
+    /// window title, grouped by minutes spent.
+    ///
+    /// **Billable slots only.** The note describes the work a client is paying for, so
+    /// the log behind it is drawn from slots that cleared the focus bar. Personal
+    /// browsing in an unbilled slot never reaches the model, and cannot end up
+    /// paraphrased in something a client reads. Minutes with no input at all are
+    /// excluded too — a screensaver title is not work.
+    pub fn activity_digest(&self, from: i64, to: i64) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT m.active_app_name, m.active_window_title, COUNT(*) AS minutes
+             FROM minute_logs m
+             JOIN slot_summaries s
+               ON s.slot_start = m.timestamp - (m.timestamp % 600)
+             WHERE m.timestamp >= ?1 AND m.timestamp < ?2
+               AND s.focus_score >= ?3
+               AND (m.keystroke_count > 0 OR m.mouse_click_count > 0 OR m.scroll_event_count > 0)
+             GROUP BY m.active_app_name, m.active_window_title
+             HAVING minutes >= 2
+             ORDER BY minutes DESC
+             LIMIT 60",
+        )?;
+        let rows = stmt.query_map(params![from, to, BILLABLE_FOCUS_THRESHOLD], |row| {
+            let app: String = row.get(0)?;
+            let title: String = row.get(1)?;
+            let minutes: i64 = row.get(2)?;
+            Ok(format!("{minutes}m — {app}: {title}"))
         })?;
         rows.collect()
     }
@@ -1089,7 +1232,7 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, period_start, period_end, summary_text, generated_at, revision,
-                    hash, parent_hash, signature, signing_pubkey, scheme_version
+                    hash, parent_hash, signature, signing_pubkey, scheme_version, prompt_hash
              FROM work_summaries ORDER BY id ASC",
         )?;
         let mut rows = stmt.query([])?;
@@ -1108,6 +1251,7 @@ impl Database {
             let signature: Option<String> = row.get(8)?;
             let signing_pubkey: Option<String> = row.get(9)?;
             let scheme_version: u32 = row.get(10).unwrap_or(SUMMARY_SCHEME_VERSION);
+            let prompt_hash: String = row.get(11).unwrap_or_default();
 
             if parent_hash != expected_parent_hash {
                 return Ok(Err(format!(
@@ -1125,6 +1269,7 @@ impl Database {
                 generated_at,
                 revision,
                 &summary_text,
+                &prompt_hash,
                 &parent_hash,
             );
             if hash != sha256_hex(&payload) {
@@ -2181,6 +2326,7 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855|CONFIGHASH|PARE
             172_800,
             "Shipped the ingestion API.",
             172_900,
+            "ph",
             Some(&signer),
         )
         .unwrap();
@@ -2189,6 +2335,7 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855|CONFIGHASH|PARE
             259_200,
             "Reviewed two pull requests.",
             259_300,
+            "ph",
             Some(&signer),
         )
         .unwrap();
@@ -2216,8 +2363,15 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855|CONFIGHASH|PARE
         // cannot be quietly rewritten afterwards. Editing the row breaks the hash even
         // though every other column is untouched.
         let db = create_test_db();
-        db.insert_work_summary(86_400, 172_800, "Fixed the checkout bug.", 172_900, None)
-            .unwrap();
+        db.insert_work_summary(
+            86_400,
+            172_800,
+            "Fixed the checkout bug.",
+            172_900,
+            "ph",
+            None,
+        )
+        .unwrap();
         assert!(db.verify_summary_chain("").unwrap().is_ok());
 
         {
@@ -2251,6 +2405,7 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855|CONFIGHASH|PARE
             172_800,
             "Two hours on the API.",
             172_900,
+            "ph",
             Some(&signer),
         )
         .unwrap();
@@ -2264,6 +2419,7 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855|CONFIGHASH|PARE
             172_900,
             0,
             forged_text,
+            "ph",
             "",
         );
         {
@@ -2284,10 +2440,16 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855|CONFIGHASH|PARE
     #[test]
     fn test_revision_appends_and_supersedes() {
         let db = create_test_db();
-        db.insert_work_summary(86_400, 172_800, "Worked on billing.", 172_900, None)
+        db.insert_work_summary(86_400, 172_800, "Worked on billing.", 172_900, "ph", None)
             .unwrap();
         let revised = db
-            .revise_work_summary(86_400, "Worked on billing and refunds.", 173_500, None)
+            .revise_work_summary(
+                86_400,
+                "Worked on billing and refunds.",
+                173_500,
+                "ph",
+                None,
+            )
             .unwrap();
         assert!(
             revised.is_some(),
@@ -2319,7 +2481,7 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855|CONFIGHASH|PARE
         }
 
         assert!(
-            db.revise_work_summary(999_999, "No such period.", 1_000_000, None)
+            db.revise_work_summary(999_999, "No such period.", 1_000_000, "ph", None)
                 .unwrap()
                 .is_none(),
             "revising a period with no summary is a no-op, not an insert"
@@ -2341,6 +2503,7 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855|CONFIGHASH|PARE
             172_800,
             "Client call and follow-up.",
             172_900,
+            "ph",
             Some(&signer),
         )
         .unwrap();
@@ -2361,14 +2524,189 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855|CONFIGHASH|PARE
     }
 
     #[test]
+    fn test_prompt_hash_is_bound_into_the_signature() {
+        // A note must carry the rules that wrote it: swapping the prompt hash after the
+        // fact has to break verification exactly like editing the text does.
+        let db = create_test_db();
+        let keys = crate::config::generate_enrollment_keys("tok");
+        let signer = SlotSigner {
+            public_key: &keys.public_key,
+            private_key: &keys.private_key,
+        };
+        db.insert_work_summary(
+            86_400,
+            172_800,
+            "Reviewed the API.",
+            172_900,
+            "prompt-a",
+            Some(&signer),
+        )
+        .unwrap();
+        assert!(db.verify_summary_chain(&keys.public_key).unwrap().is_ok());
+
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE work_summaries SET prompt_hash = 'prompt-b' WHERE period_start = 86400",
+                [],
+            )
+            .unwrap();
+        }
+        assert!(
+            db.verify_summary_chain(&keys.public_key).unwrap().is_err(),
+            "swapping the prompt behind a note must fail verification"
+        );
+    }
+
+    #[test]
+    fn test_days_needing_summary_skips_today_and_written_days() {
+        let db = create_test_db();
+        // Two finished days plus the day "now" falls in.
+        let now = 1_786_800_000;
+        let (today_start, _) = local_day_bounds(now);
+        let yesterday = today_start - 86_400 + 3_600;
+        let two_days_ago = today_start - 2 * 86_400 + 3_600;
+
+        for ts in [two_days_ago, yesterday, today_start + 60] {
+            db.insert_slot_summary(ts, 80, 8, 2, 100, 10, "{}", None, "", None)
+                .unwrap();
+        }
+
+        let pending = db.days_needing_summary(now, 7).unwrap();
+        assert_eq!(
+            pending.len(),
+            2,
+            "the day in progress is not summarized yet"
+        );
+
+        // Writing one removes it; the other stays pending.
+        let (first_start, first_end) = pending[0];
+        db.insert_work_summary(first_start, first_end, "Did the thing.", now, "ph", None)
+            .unwrap();
+        let pending_after = db.days_needing_summary(now, 7).unwrap();
+        assert_eq!(pending_after.len(), 1);
+        assert_ne!(pending_after[0].0, first_start);
+
+        // The lookback bounds a first run on an old database.
+        assert!(
+            db.days_needing_summary(now, 1).unwrap().len() <= 1,
+            "a 1-day lookback must not reach two days back"
+        );
+    }
+
+    #[test]
+    fn test_activity_digest_only_describes_billable_work() {
+        // The note describes what the client is paying for, so unbilled time must not
+        // reach the model at all: one slot above the bar (work), one below it
+        // (personal browsing). Only the first may appear. Input-less minutes inside a
+        // billable slot are excluded too — a screensaver title is not work.
+        let db = create_test_db();
+        let (billable_slot, unbilled_slot) = (0i64, 600i64);
+
+        for i in 0..4 {
+            db.insert_minute_log(
+                billable_slot + i * 60,
+                40,
+                5,
+                0,
+                10.0,
+                "Code",
+                "billing.rs",
+                false,
+            )
+            .unwrap();
+        }
+        for i in 0..4 {
+            db.insert_minute_log(
+                unbilled_slot + i * 60,
+                30,
+                8,
+                0,
+                40.0,
+                "Chrome",
+                "Personal inbox",
+                false,
+            )
+            .unwrap();
+        }
+        for i in 5..7 {
+            db.insert_minute_log(
+                billable_slot + i * 60,
+                0,
+                0,
+                0,
+                0.0,
+                "Screensaver",
+                "idle",
+                false,
+            )
+            .unwrap();
+        }
+
+        db.insert_slot_summary(
+            billable_slot,
+            BILLABLE_FOCUS_THRESHOLD + 40,
+            8,
+            2,
+            160,
+            20,
+            "{}",
+            None,
+            "",
+            None,
+        )
+        .unwrap();
+        db.insert_slot_summary(
+            unbilled_slot,
+            BILLABLE_FOCUS_THRESHOLD - 10,
+            2,
+            8,
+            120,
+            32,
+            "{}",
+            None,
+            "",
+            None,
+        )
+        .unwrap();
+
+        let digest = db.activity_digest(0, 10_000).unwrap();
+        assert_eq!(
+            digest.len(),
+            1,
+            "only billable, active minutes are described: {digest:?}"
+        );
+        assert!(digest[0].contains("billing.rs"), "got {:?}", digest[0]);
+        assert!(
+            digest[0].starts_with("4m"),
+            "minutes are grouped: {:?}",
+            digest[0]
+        );
+        assert!(
+            !digest.iter().any(|l| l.contains("Personal inbox")),
+            "unbilled time must never reach the model: {digest:?}"
+        );
+    }
+
+    #[test]
+    fn test_local_day_bounds_covers_the_day_exactly() {
+        let (start, end) = local_day_bounds(1_786_800_000);
+        assert!(start <= 1_786_800_000 && 1_786_800_000 < end);
+        assert_eq!(end - start, 86_400, "a normal day is 24h in local time");
+        // Any timestamp inside the day maps to the same bucket.
+        let (start2, _) = local_day_bounds(start + 3_600);
+        assert_eq!(start, start2);
+    }
+
+    #[test]
     fn test_summary_chain_is_independent_of_slots() {
         // Summaries link to summaries. Writing slots in between must not disturb them.
         let db = create_test_db();
-        db.insert_work_summary(86_400, 172_800, "Morning: API work.", 172_900, None)
+        db.insert_work_summary(86_400, 172_800, "Morning: API work.", 172_900, "ph", None)
             .unwrap();
         db.insert_slot_summary(1000, 80, 8, 2, 100, 10, "{}", None, "", None)
             .unwrap();
-        db.insert_work_summary(172_800, 259_200, "Afternoon: reviews.", 259_300, None)
+        db.insert_work_summary(172_800, 259_200, "Afternoon: reviews.", 259_300, "ph", None)
             .unwrap();
 
         assert!(db.verify_summary_chain("").unwrap().is_ok());

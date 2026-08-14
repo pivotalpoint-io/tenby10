@@ -89,6 +89,28 @@ pub trait LlmProvider {
         system_prompt: &str,
         activity_text: &str,
     ) -> Result<(u32, String), String>;
+
+    /// Write the daily work note (ADR 0019). Same provider and key as scoring, but the
+    /// reply is prose rather than JSON, because this text is what a client reads.
+    fn write_note(&self, system_prompt: &str, activity_text: &str) -> Result<String, String>;
+}
+
+/// Guard rail on whatever the model returns. The note publishes without a review step,
+/// so the daemon refuses obviously broken output rather than signing it: empty replies,
+/// a model that started explaining itself, or an essay where a sentence was asked for.
+/// The cap is generous — this rejects malfunctions, not styles.
+pub fn sanitize_note(raw: &str) -> Result<String, String> {
+    let text = raw.trim().trim_matches('"').trim().to_string();
+    if text.is_empty() {
+        return Err("model returned an empty note".into());
+    }
+    if text.chars().count() > 600 {
+        return Err(format!(
+            "model returned {} characters; expected one or two sentences",
+            text.chars().count()
+        ));
+    }
+    Ok(text)
 }
 
 pub struct OpenAiProvider {
@@ -133,6 +155,31 @@ impl LlmProvider for OpenAiProvider {
         }
 
         Err("Failed to parse OpenAI response".into())
+    }
+
+    fn write_note(&self, system_prompt: &str, activity_text: &str) -> Result<String, String> {
+        let payload = serde_json::json!({
+            "model": self.model,
+            "messages": [
+                { "role": "system", "content": system_prompt },
+                { "role": "user", "content": format!("Activity log:\n{}", activity_text) }
+            ]
+        });
+
+        let res = self
+            .client
+            .post(join_url(&self.base_url, "chat/completions"))
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .json(&payload)
+            .send()
+            .map_err(|e| e.to_string())?;
+
+        let json = res.json::<Value>().map_err(|e| e.to_string())?;
+
+        match json["choices"][0]["message"]["content"].as_str() {
+            Some(content) => sanitize_note(content),
+            None => Err("Failed to parse OpenAI note response".into()),
+        }
     }
 }
 
@@ -205,6 +252,44 @@ impl LlmProvider for AnthropicProvider {
 
         Err("Failed to parse Anthropic response".into())
     }
+
+    fn write_note(&self, system_prompt: &str, activity_text: &str) -> Result<String, String> {
+        let payload = serde_json::json!({
+            "model": self.model,
+            "max_tokens": 4096,
+            "system": system_prompt,
+            "messages": [
+                { "role": "user", "content": format!("Activity log:\n{}", activity_text) }
+            ]
+        });
+
+        let res = self
+            .client
+            .post(join_url(&self.base_url, "messages"))
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", "2023-06-01")
+            .json(&payload)
+            .send()
+            .map_err(|e| e.to_string())?;
+
+        let json = res.json::<Value>().map_err(|e| e.to_string())?;
+
+        // Same block-picking rule as scoring: thinking blocks can precede the text.
+        let text = json["content"]
+            .as_array()
+            .and_then(|blocks| {
+                blocks
+                    .iter()
+                    .find(|b| b["type"] == "text")
+                    .and_then(|b| b["text"].as_str())
+            })
+            .or_else(|| json["content"][0]["text"].as_str());
+
+        match text {
+            Some(content) => sanitize_note(content),
+            None => Err("Failed to parse Anthropic note response".into()),
+        }
+    }
 }
 
 pub struct GeminiProvider {
@@ -259,6 +344,35 @@ impl LlmProvider for GeminiProvider {
         }
 
         Err("Failed to parse Gemini response".into())
+    }
+
+    fn write_note(&self, system_prompt: &str, activity_text: &str) -> Result<String, String> {
+        let payload = serde_json::json!({
+            "systemInstruction": { "parts": [{ "text": system_prompt }] },
+            "contents": [{
+                "parts": [{ "text": format!("Activity log:\n{}", activity_text) }]
+            }]
+        });
+
+        let url = join_url(
+            &self.base_url,
+            &format!("models/{}:generateContent", self.model),
+        );
+
+        let res = self
+            .client
+            .post(url)
+            .header("x-goog-api-key", &self.api_key)
+            .json(&payload)
+            .send()
+            .map_err(|e| e.to_string())?;
+
+        let json = res.json::<Value>().map_err(|e| e.to_string())?;
+
+        match json["candidates"][0]["content"]["parts"][0]["text"].as_str() {
+            Some(content) => sanitize_note(content),
+            None => Err("Failed to parse Gemini note response".into()),
+        }
     }
 }
 
@@ -323,6 +437,26 @@ pub fn get_llm_provider(config: &AgentConfig) -> Option<Box<dyn LlmProvider>> {
 mod tests {
     use super::*;
     use crate::config::AgentConfig;
+
+    #[test]
+    fn test_sanitize_note_accepts_a_normal_note_and_rejects_malfunctions() {
+        // Nothing reviews this text before a client can read it, so the daemon refuses
+        // to sign output that is obviously broken rather than publishing it.
+        assert_eq!(
+            sanitize_note("  \"Reworked the checkout flow and fixed two bugs.\"  ").unwrap(),
+            "Reworked the checkout flow and fixed two bugs.",
+            "surrounding quotes and whitespace are stripped"
+        );
+        assert!(sanitize_note("   ").is_err(), "an empty note is refused");
+        assert!(
+            sanitize_note(&"x".repeat(700)).is_err(),
+            "an essay where a sentence was asked for is refused"
+        );
+        assert!(
+            sanitize_note(&"x".repeat(500)).is_ok(),
+            "the cap rejects malfunctions, not long-ish sentences"
+        );
+    }
 
     #[test]
     fn test_get_llm_provider_empty_config() {
