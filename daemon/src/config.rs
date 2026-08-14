@@ -27,6 +27,23 @@ pub fn default_llm_prompt() -> String {
     Output ONLY a JSON object with two fields: 'score' (integer) and 'reasoning' (1-2 sentences).".to_string()
 }
 
+/// Prompt for the daily work note (ADR 0019). Unlike the scoring prompt, whatever this
+/// produces is meant to be read by the client, so the constraints are the privacy
+/// mechanism: describe the task, never the window title, never a third party. There is
+/// no review step before it publishes, so the prompt is what keeps the note safe.
+pub fn default_summary_prompt() -> String {
+    "You are writing a short work note that a client will read next to an invoice. \
+    From the activity log below (apps and window titles), write one or two sentences \
+    describing what was worked on, in plain professional language. \
+    - Describe the task, not the tools: \"reworked the checkout flow\", not \"was in VSCode\". \
+    - Never quote a window title, file path, or URL. \
+    - Never name a person, company, or any third party. \
+    - Do not mention hours, focus scores, or productivity. \
+    - If the activity is too unclear to describe honestly, say that plainly instead of guessing. \
+    Output ONLY the sentences, with no preamble."
+        .to_string()
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct AgentConfig {
     pub agent_id: String,
@@ -55,6 +72,15 @@ pub struct AgentConfig {
     pub llm_model: String,
     #[serde(default = "default_llm_prompt")]
     pub llm_prompt: String,
+    /// Prompt for the daily work note (ADR 0019). Its SHA-256 is bound into every
+    /// summary record, so a note always carries the rules that wrote it.
+    #[serde(default = "default_summary_prompt")]
+    pub summary_prompt: String,
+    /// Daily work notes are generated whenever the user's own AI is configured — that
+    /// is what the AI is for. This opt-out exists for the exception case, not as a
+    /// setup step (ADR 0019: setup once, then invisible).
+    #[serde(default)]
+    pub disable_work_summaries: bool,
     #[serde(default)]
     pub dashboard_port: Option<u16>,
     /// Enforce synthetic-input detection (#87): mark a minute tampered when its
@@ -137,6 +163,8 @@ impl Default for AgentConfig {
             llm_base_url: String::new(),
             llm_model: String::new(),
             llm_prompt: default_llm_prompt(),
+            summary_prompt: default_summary_prompt(),
+            disable_work_summaries: false,
             dashboard_port: None,
             enforce_synthetic_detection: false,
         }
@@ -324,6 +352,8 @@ pub fn generate_enrollment_keys(enrollment_token: &str) -> AgentConfig {
         llm_base_url: String::new(),
         llm_model: String::new(),
         llm_prompt: default_llm_prompt(),
+        summary_prompt: default_summary_prompt(),
+        disable_work_summaries: false,
         dashboard_port: None,
         enforce_synthetic_detection: false,
     }
