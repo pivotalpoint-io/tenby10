@@ -512,8 +512,18 @@ pub fn generate_pending_summaries(db: &Database) {
 
         // Keep the prompt that produced the note, so a reader can always see the rules
         // behind the words even after the user edits their prompt later.
+        //
+        // Nothing is signed until this lands. The note commits to this hash, the cloud won't
+        // accept the note until it can serve the prompt behind it (#147), and only this local
+        // copy can supply it — so a note signed now would stall the whole note chain at upload
+        // and never be readable. Leaving the day unwritten costs one loop: the next pass
+        // regenerates it.
         if let Err(err) = db.store_config_blob(&prompt_hash, &prompt) {
-            eprintln!("[Summary] Could not store the prompt behind the note: {err:?}");
+            eprintln!(
+                "[Summary] Could not store the prompt behind the note for {day_start}, \
+                 leaving the day unwritten for now: {err:?}"
+            );
+            continue;
         }
 
         let signer = if config.public_key.is_empty() || config.private_key.is_empty() {
