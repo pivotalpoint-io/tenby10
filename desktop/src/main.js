@@ -272,6 +272,53 @@ if (aiBaseUrlInput) {
   });
 }
 
+// Prompt length limit. A prompt is bound into every record it scores by hash, and a record
+// is only accepted once the prompt behind it is stored — so a prompt too long to sync would
+// stop those records uploading, silently and for good. The daemon owns the number; this is
+// only the fallback for the moment before it answers.
+let maxPromptBytes = 32 * 1024;
+
+async function loadPromptLimit() {
+  try {
+    maxPromptBytes = await invoke("get_max_prompt_bytes");
+  } catch (err) {
+    console.error("Failed to read the prompt length limit:", err);
+  }
+}
+
+// The limit is a byte count (that is what the sync endpoint measures), and one typed
+// character is not always one byte.
+function promptByteLength(text) {
+  return new TextEncoder().encode(text).length;
+}
+
+function formatBytes(bytes) {
+  return bytes < 1024 ? `${bytes} characters` : `${Math.round(bytes / 1024)} KB`;
+}
+
+// Show how long a prompt is only once it is long enough to matter: silence for an ordinary
+// prompt, a heads-up as it nears the limit, a plain refusal past it.
+function updatePromptLengthHint(textareaId, hintId) {
+  const textarea = document.getElementById(textareaId);
+  const hint = document.getElementById(hintId);
+  if (!textarea || !hint) return;
+
+  const used = promptByteLength(textarea.value);
+  if (used > maxPromptBytes) {
+    hint.innerText =
+      `Too long to save: ${formatBytes(used)} of ${formatBytes(maxPromptBytes)}. ` +
+      `Please remove about ${formatBytes(used - maxPromptBytes)}.`;
+    hint.className = "length-hint over-limit";
+    hint.style.display = "block";
+  } else if (used > maxPromptBytes * 0.8) {
+    hint.innerText = `${formatBytes(used)} of ${formatBytes(maxPromptBytes)} used.`;
+    hint.className = "length-hint";
+    hint.style.display = "block";
+  } else {
+    hint.style.display = "none";
+  }
+}
+
 function updateTokenEstimate() {
   const promptText = document.getElementById("ai-prompt").value;
   const wordCount = promptText.trim().split(/\s+/).filter(w => w.length > 0).length;
@@ -292,6 +339,18 @@ const aiPromptTextarea = document.getElementById("ai-prompt");
 if (aiPromptTextarea) {
   aiPromptTextarea.addEventListener("input", () => {
     updateTokenEstimate();
+    updatePromptLengthHint("ai-prompt", "ai-prompt-length");
+    const errorEl = document.getElementById("validation-error");
+    if (errorEl) {
+      errorEl.style.display = "none";
+    }
+  });
+}
+
+const summaryPromptTextarea = document.getElementById("summary-prompt");
+if (summaryPromptTextarea) {
+  summaryPromptTextarea.addEventListener("input", () => {
+    updatePromptLengthHint("summary-prompt", "summary-prompt-length");
     const errorEl = document.getElementById("validation-error");
     if (errorEl) {
       errorEl.style.display = "none";
@@ -303,6 +362,7 @@ if (aiPromptTextarea) {
 async function loadAgentConfig() {
   try {
     currentConfig = await invoke("get_agent_config");
+    await loadPromptLimit();
 
     // Rules
     document.getElementById("rules-productive").value = currentConfig.productive_apps || "";
@@ -334,6 +394,8 @@ async function loadAgentConfig() {
     }
 
     updateTokenEstimate();
+    updatePromptLengthHint("ai-prompt", "ai-prompt-length");
+    updatePromptLengthHint("summary-prompt", "summary-prompt-length");
     toggleLlmFields(isLlm);
   } catch (err) {
     console.error("Failed to load agent config:", err);
@@ -457,10 +519,29 @@ if (saveSettingsBtn) {
         }
       }
 
+      // Length is checked whatever the engine is set to: the auditor prompt is part of the
+      // rules every slot is signed against, so an over-long one stalls uploads even with the
+      // AI switched off. The daemon refuses these too — this is so the user is told in the
+      // form they typed it in, next to the field at fault.
+      const summaryPromptText = summaryPromptEl ? summaryPromptEl.value.trim() : "";
+      const tooLong = [
+        ["System Auditor Prompt", prompt],
+        ["Work Note Prompt", summaryPromptText],
+      ].find(([, text]) => promptByteLength(text) > maxPromptBytes);
+      if (tooLong) {
+        const [label, text] = tooLong;
+        rejectSave(
+          `⚠️ The ${label} is too long (${formatBytes(promptByteLength(text))}). ` +
+          `Please shorten it to under ${formatBytes(maxPromptBytes)} — a longer prompt ` +
+          `cannot be synced, and your time would stop uploading.`
+        );
+        return;
+      }
+
       config.engine_mode = isLlmEnabled ? "llm" : "static";
       config.disable_work_summaries = !(summaryToggleEl && summaryToggleEl.checked);
       if (summaryPromptEl) {
-        config.summary_prompt = summaryPromptEl.value.trim();
+        config.summary_prompt = summaryPromptText;
       }
       config.llm_provider = document.getElementById("ai-provider").value;
       config.llm_api_key = apiKey;

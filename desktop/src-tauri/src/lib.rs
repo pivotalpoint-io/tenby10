@@ -329,6 +329,14 @@ async fn get_llm_provider_defaults() -> Result<Vec<LlmProviderDefaults>, String>
         .collect())
 }
 
+/// How long a prompt may be before it can no longer be synced. The form reads it from
+/// here rather than carrying its own copy, so the length it enforces can never drift from
+/// the length `save_config` accepts.
+#[tauri::command]
+async fn get_max_prompt_bytes() -> Result<usize, String> {
+    Ok(daemon::config::MAX_PROMPT_BYTES)
+}
+
 #[tauri::command]
 async fn save_agent_config(new_config: daemon::config::AgentConfig) -> Result<(), String> {
     let app_home = daemon::env::get_app_home();
@@ -472,6 +480,7 @@ pub fn run() {
             get_agent_config,
             save_agent_config,
             get_llm_provider_defaults,
+            get_max_prompt_bytes,
             check_permissions,
             get_capture_health,
             open_accessibility_settings,

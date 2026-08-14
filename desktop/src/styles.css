@@ -806,6 +806,20 @@ input:checked + .slider:before {
   line-height: 1.4;
 }
 
+/* Prompt length hint. Hidden until a prompt is long enough to be worth mentioning,
+   so an ordinary prompt never carries a counter it will never need. */
+.length-hint {
+  font-size: 0.72rem;
+  color: var(--text-muted);
+  margin-top: 0.3rem;
+  line-height: 1.4;
+}
+
+.length-hint.over-limit {
+  color: var(--accent-red, #ef4444);
+  font-weight: 600;
+}
+
 .error-box {
   background: rgba(239, 68, 68, 0.05);
   border: 1px solid rgba(239, 68, 68, 0.2);

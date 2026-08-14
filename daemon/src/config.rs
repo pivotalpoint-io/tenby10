@@ -116,6 +116,42 @@ pub struct EffectiveConfig<'a> {
 /// Scheme 2 (ADR 0017) adds `aggregation_version`; scheme-1 blobs are read as aggregation v1.
 pub const EFFECTIVE_CONFIG_SCHEME: u32 = 2;
 
+/// Largest blob the sync endpoint will store, in bytes. A record is signed over the *hash*
+/// of its blob, and ingestion refuses the record until the blob is stored — so a blob the
+/// cloud rejects means a hash chain that can never advance again. Mirrors the server's own
+/// ceiling; keep the two in step.
+pub const MAX_CONFIG_BLOB_BYTES: usize = 64 * 1024;
+
+/// Ceiling for a single user-authored prompt, in bytes. Half the blob ceiling, so
+/// `llm_prompt` still fits once the app lists it shares the effective-config blob with are
+/// counted. ~32,000 characters is around 5,000 words: far past any prompt worth writing,
+/// close enough to catch a paste before it stalls the ledger.
+pub const MAX_PROMPT_BYTES: usize = 32 * 1024;
+
+/// Render a byte count the way the message needs to read: plain bytes while small, KB once
+/// the numbers stop being meaningful (which, at these limits, is always the case).
+fn describe_bytes(bytes: usize) -> String {
+    if bytes < 1024 {
+        format!("{bytes} characters")
+    } else {
+        format!("{:.0} KB", bytes as f64 / 1024.0)
+    }
+}
+
+/// Reject a prompt the cloud could never store. The message is shown to the user in
+/// Settings, so it names the field as the UI labels it and says what to do about it.
+pub fn validate_prompt(label: &str, prompt: &str) -> Result<(), String> {
+    if prompt.len() > MAX_PROMPT_BYTES {
+        return Err(format!(
+            "The {} is too long ({}). Please shorten it to under {} — a prompt larger than that cannot be synced, and the records that carry it would stop uploading.",
+            label,
+            describe_bytes(prompt.len()),
+            describe_bytes(MAX_PROMPT_BYTES),
+        ));
+    }
+    Ok(())
+}
+
 /// Aggregation-semantics version these slots are scored/aggregated under (ADR 0017). Bump only
 /// alongside a new `aggregate_v*` in `db.rs` and a new golden vector — never edit v1 in place.
 pub const AGGREGATION_VERSION: u32 = 1;
@@ -144,6 +180,31 @@ impl AgentConfig {
     /// that produced it.
     pub fn effective_config_hash(&self) -> String {
         crate::db::sha256_hex_pub(&self.effective_config_blob())
+    }
+
+    /// Refuse a configuration whose blobs the cloud would reject. Both prompts are bound
+    /// into signed records by hash — `llm_prompt` through the effective-config blob on every
+    /// slot, `summary_prompt` as the blob behind every work note — and a record is only
+    /// accepted once its blob is stored. So an over-long prompt does not degrade sync, it
+    /// ends it: the record is signed, the blob is refused, and that chain never advances
+    /// again. Cheaper to say no at the keyboard than to strand a ledger.
+    ///
+    /// Errors are written for the user; the Settings save path surfaces them as-is.
+    pub fn validate(&self) -> Result<(), String> {
+        validate_prompt("System Auditor Prompt", &self.llm_prompt)?;
+        validate_prompt("Work Note Prompt", &self.summary_prompt)?;
+
+        // The prompt ceiling leaves room for the app lists, but nothing bounds those on
+        // their own — so check the assembled blob too, rather than assume the parts.
+        let blob = self.effective_config_blob();
+        if blob.len() > MAX_CONFIG_BLOB_BYTES {
+            return Err(format!(
+                "Your evaluation rules and prompt are too large together ({}). Please shorten them to under {} — past that they cannot be synced, and your slots would stop uploading.",
+                describe_bytes(blob.len()),
+                describe_bytes(MAX_CONFIG_BLOB_BYTES),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -277,6 +338,44 @@ pub fn load_config(config_path: PathBuf) -> Result<AgentConfig, String> {
         config.llm_prompt = default_llm_prompt();
     }
 
+    // Settings refuses to save an over-long prompt, but `config.json` can be edited by hand.
+    // Signing a record against a blob the cloud will never accept stalls that hash chain for
+    // good, so fall back to the built-in prompt rather than sign something unuploadable. The
+    // fallback is what the daemon then actually scores with, so the blob it commits to stays
+    // an honest record of the rules that were used.
+    if config.llm_prompt.len() > MAX_PROMPT_BYTES {
+        eprintln!(
+            "[WARN] llm_prompt in config.json is {} — over the {} limit, so it cannot be synced. \
+             Using the built-in auditor prompt instead. Shorten it in Settings to use your own.",
+            describe_bytes(config.llm_prompt.len()),
+            describe_bytes(MAX_PROMPT_BYTES),
+        );
+        config.llm_prompt = default_llm_prompt();
+    }
+    if config.summary_prompt.len() > MAX_PROMPT_BYTES {
+        eprintln!(
+            "[WARN] summary_prompt in config.json is {} — over the {} limit, so it cannot be synced. \
+             Using the built-in work note prompt instead. Shorten it in Settings to use your own.",
+            describe_bytes(config.summary_prompt.len()),
+            describe_bytes(MAX_PROMPT_BYTES),
+        );
+        config.summary_prompt = default_summary_prompt();
+    }
+
+    // Nothing bounds the app lists on their own, so a hand-edited config can still exceed the
+    // blob ceiling without either prompt being at fault. There is no honest fallback here —
+    // silently swapping in different scoring rules would misreport what the slot was judged
+    // by — so say plainly what is wrong and leave the rules as written.
+    let blob_len = config.effective_config_blob().len();
+    if blob_len > MAX_CONFIG_BLOB_BYTES {
+        eprintln!(
+            "[WARN] The evaluation rules in config.json total {} — over the {} limit, so slots \
+             scored under them cannot be uploaded. Shorten the app lists in Settings.",
+            describe_bytes(blob_len),
+            describe_bytes(MAX_CONFIG_BLOB_BYTES),
+        );
+    }
+
     // One-time migration: move plaintext secrets from config.json into the OS
     // keychain and rewrite the file without them. Best-effort — a keychain
     // failure here must not break loading, since the in-memory secrets are
@@ -298,7 +397,12 @@ pub fn load_config(config_path: PathBuf) -> Result<AgentConfig, String> {
 /// Secrets (`private_key`, `llm_api_key`) are written to the OS keychain; a
 /// sanitized copy of the config — with those fields blanked — is written to
 /// `config.json` so no secret ever lands in plaintext on disk.
+///
+/// A configuration whose blobs the cloud would refuse is rejected before anything is
+/// written, so a save either lands whole or leaves the previous one untouched.
 pub fn save_config(config_path: PathBuf, config: &AgentConfig) -> Result<(), String> {
+    config.validate()?;
+
     if let Some(parent) = config_path.parent() {
         fs::create_dir_all(parent)
             .map_err(|err| format!("Failed to create config directory: {}", err))?;
@@ -557,6 +661,104 @@ mod tests {
         assert_eq!(
             repair.enrollment_token, "second_token",
             "token should be updated"
+        );
+
+        let _ = fs::remove_file(&path);
+    }
+
+    /// A prompt exactly at the limit is still the user's to write; only past it is refused.
+    #[test]
+    fn test_prompt_at_the_limit_is_accepted() {
+        let at_limit = "x".repeat(MAX_PROMPT_BYTES);
+        assert!(validate_prompt("System Auditor Prompt", &at_limit).is_ok());
+
+        let over = "x".repeat(MAX_PROMPT_BYTES + 1);
+        let err = validate_prompt("System Auditor Prompt", &over)
+            .expect_err("a prompt over the limit must be refused");
+        // The message is shown to the user, so it must name the field and the ceiling.
+        assert!(err.contains("System Auditor Prompt"), "message was: {err}");
+        assert!(err.contains("32 KB"), "message was: {err}");
+    }
+
+    /// The whole point of the prompt ceiling: a config that passes validation always
+    /// produces a blob the cloud will store, so no slot is ever signed against a hash
+    /// whose blob can't upload.
+    #[test]
+    fn test_max_prompt_leaves_room_for_the_app_lists() {
+        let config = AgentConfig {
+            llm_prompt: "x".repeat(MAX_PROMPT_BYTES),
+            distracting_apps: "y".repeat(4096),
+            ..Default::default()
+        };
+        config
+            .validate()
+            .expect("a max-length prompt must be valid");
+        assert!(
+            config.effective_config_blob().len() <= MAX_CONFIG_BLOB_BYTES,
+            "the blob for a max-length prompt must still be uploadable"
+        );
+    }
+
+    /// An over-long prompt must be refused *before* anything is written, so a rejected
+    /// save leaves the previous configuration intact rather than half-applied.
+    #[test]
+    fn test_save_config_rejects_oversized_prompts() {
+        use_mock_keychain();
+
+        for (field, mutate) in [
+            (
+                "System Auditor Prompt",
+                (|c: &mut AgentConfig| c.llm_prompt = "x".repeat(MAX_PROMPT_BYTES + 1))
+                    as fn(&mut AgentConfig),
+            ),
+            ("Work Note Prompt", |c: &mut AgentConfig| {
+                c.summary_prompt = "x".repeat(MAX_PROMPT_BYTES + 1)
+            }),
+        ] {
+            let path = temp_config_path();
+            let mut config = generate_enrollment_keys("tok");
+            save_config(path.clone(), &config).expect("the baseline save should succeed");
+            let before = fs::read_to_string(&path).expect("config file should exist");
+
+            mutate(&mut config);
+            let err = save_config(path.clone(), &config)
+                .expect_err("an over-long prompt must not be saved");
+            assert!(err.contains(field), "message was: {err}");
+
+            let after = fs::read_to_string(&path).expect("config file should still exist");
+            assert_eq!(before, after, "a rejected save must not touch config.json");
+
+            let _ = fs::remove_file(&path);
+        }
+    }
+
+    /// Settings refuses an over-long prompt, but `config.json` can be edited by hand. Loading
+    /// one must fall back to the built-in prompt: signing a record against a blob the cloud
+    /// will never accept stalls that hash chain permanently.
+    #[test]
+    fn test_load_config_falls_back_on_oversized_prompts() {
+        use_mock_keychain();
+        let path = temp_config_path();
+
+        let huge = "x".repeat(MAX_PROMPT_BYTES + 1);
+        let handwritten = serde_json::json!({
+            "agent_id": "agent_handwritten",
+            "enrollment_token": "tok",
+            "public_key": "pub",
+            "private_key": "",
+            "llm_prompt": huge,
+            "summary_prompt": huge,
+        });
+        fs::write(&path, handwritten.to_string()).unwrap();
+
+        let config = load_config(path.clone()).expect("load_config should succeed");
+        assert_eq!(config.llm_prompt, default_llm_prompt());
+        assert_eq!(config.summary_prompt, default_summary_prompt());
+        // The rest of the configuration is untouched — only the unusable prompts are replaced.
+        assert_eq!(config.agent_id, "agent_handwritten");
+        assert!(
+            config.effective_config_blob().len() <= MAX_CONFIG_BLOB_BYTES,
+            "the blob a slot commits to must be uploadable after the fallback"
         );
 
         let _ = fs::remove_file(&path);
