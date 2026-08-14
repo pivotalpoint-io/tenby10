@@ -100,7 +100,7 @@ pub struct SignedSlot {
 /// Rows are append-only: a correction is a new `revision` for the same `period_start`,
 /// never an edit. `withdrawn` is a sharing decision, not a claim about the past, so it
 /// is deliberately outside the signed payload.
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(serde::Serialize, serde::Deserialize, Debug)]
 pub struct WorkSummary {
     pub id: i64,
     pub period_start: i64,
@@ -117,6 +117,9 @@ pub struct WorkSummary {
     /// text itself is kept in `config_blobs` under this hash, so a reader can always
     /// show the rules behind the words.
     pub prompt_hash: String,
+    /// `"note"` or `"withdrawal"`. Both share one chain; the kind selects which
+    /// canonical form the row is verified under.
+    pub kind: String,
 }
 
 /// The signable fields of a stored slot, read back for re-chaining in [`Database::reseal_from`].
@@ -322,6 +325,28 @@ fn canonical_summary_payload(
     )
 }
 
+/// Canonical signable form of a withdrawal (ADR 0019).
+///
+/// Withdrawing is a decision about sharing from now on, so it is its own record with
+/// its own moment rather than a mutable flag on the note. Signing it is what lets the
+/// cloud act on it: without a signature, anyone could take back anyone's note.
+///
+/// Deliberately short: a withdrawal says only *which* period is being taken back and
+/// *when*. It never restates the text, so withdrawing cannot be used to smuggle a
+/// second version of a note into the record.
+fn canonical_withdrawal_payload(
+    scheme_version: u32,
+    signing_pubkey: &str,
+    period_start: i64,
+    withdrawn_at: i64,
+    parent_hash: &str,
+) -> String {
+    format!(
+        "tenby10-withdrawal|v{}|{}|{}|{}|{}",
+        scheme_version, signing_pubkey, period_start, withdrawn_at, parent_hash,
+    )
+}
+
 /// Verify an Ed25519 slot signature. `Ok(true)`/`Ok(false)` on a well-formed
 /// key+sig; `Err` when the key or signature bytes are malformed.
 fn verify_slot_signature(
@@ -489,7 +514,8 @@ impl Database {
                 signing_pubkey TEXT,
                 scheme_version INTEGER NOT NULL DEFAULT 1,
                 synced INTEGER NOT NULL DEFAULT 0,
-                prompt_hash TEXT NOT NULL DEFAULT ''
+                prompt_hash TEXT NOT NULL DEFAULT '',
+                kind TEXT NOT NULL DEFAULT 'note'
             )",
             [],
         )?;
@@ -500,6 +526,13 @@ impl Database {
         // v2 (ADR 0019): the note carries the SHA-256 of the prompt that wrote it.
         let _ = conn.execute(
             "ALTER TABLE work_summaries ADD COLUMN prompt_hash TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        // Withdrawals are records too (ADR 0019): taking a note back is an event with a
+        // time, signed like everything else, not a flag someone could flip. Both kinds
+        // share one chain so the whole history stays a single verifiable sequence.
+        let _ = conn.execute(
+            "ALTER TABLE work_summaries ADD COLUMN kind TEXT NOT NULL DEFAULT 'note'",
             [],
         );
 
@@ -1007,7 +1040,8 @@ impl Database {
         let existing: Option<(i64, u32)> = {
             let conn = self.conn.lock().unwrap();
             let mut stmt = conn.prepare(
-                "SELECT period_end, MAX(revision) FROM work_summaries WHERE period_start = ?1",
+                "SELECT period_end, MAX(revision) FROM work_summaries
+                 WHERE period_start = ?1 AND kind = 'note'",
             )?;
             let mut rows = stmt.query(params![period_start])?;
             match rows.next()? {
@@ -1097,15 +1131,69 @@ impl Database {
         Ok(conn.last_insert_rowid())
     }
 
-    /// Stop sharing every revision for a period. The rows and their signatures stay —
-    /// withdrawing is a decision about what the client sees from now on, not a claim
-    /// that the work never happened. Returns the number of rows affected.
-    pub fn withdraw_work_summary(&self, period_start: i64) -> Result<usize> {
+    /// Stop sharing every revision for a period, and record that decision.
+    ///
+    /// Two things happen, and both matter. Locally the note rows are flagged so nothing
+    /// shows or uploads them — their text and signatures stay, because withdrawing is a
+    /// decision about what a client sees from now on, not a claim that the work never
+    /// happened. And a **signed withdrawal record** is appended to the chain, which is
+    /// what lets the cloud act on it: a flag on its own would be an instruction anyone
+    /// could send about anyone's note.
+    ///
+    /// Returns the id of the withdrawal record, or `None` when the period has no note.
+    pub fn withdraw_work_summary(
+        &self,
+        period_start: i64,
+        withdrawn_at: i64,
+        signer: Option<&SlotSigner>,
+    ) -> Result<Option<i64>> {
+        {
+            let conn = self.conn.lock().unwrap();
+            let affected = conn.execute(
+                "UPDATE work_summaries SET withdrawn = 1 WHERE period_start = ?1 AND kind = 'note'",
+                params![period_start],
+            )?;
+            if affected == 0 {
+                return Ok(None);
+            }
+        }
+
+        let parent_hash = self.get_latest_summary_hash()?;
+        let signing_pubkey = signer.map(|s| s.public_key).unwrap_or("");
+        let payload = canonical_withdrawal_payload(
+            SUMMARY_SCHEME_VERSION,
+            signing_pubkey,
+            period_start,
+            withdrawn_at,
+            &parent_hash,
+        );
+        let hash = sha256_hex(&payload);
+        let signature: Option<String> = signer.and_then(|s| {
+            let bytes = from_hex(s.private_key)?;
+            let arr: [u8; 32] = bytes.try_into().ok()?;
+            let sk = SigningKey::from_bytes(&arr);
+            Some(to_hex_bytes(&sk.sign(payload.as_bytes()).to_bytes()))
+        });
+        let stored_pubkey: Option<&str> = signature.as_ref().map(|_| signing_pubkey);
+
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "UPDATE work_summaries SET withdrawn = 1, synced = 0 WHERE period_start = ?1",
-            params![period_start],
-        )
+            "INSERT INTO work_summaries (
+                period_start, period_end, summary_text, generated_at, revision,
+                hash, parent_hash, signature, signing_pubkey, scheme_version, prompt_hash, kind
+            ) VALUES (?1, ?2, '', ?3, 0, ?4, ?5, ?6, ?7, ?8, '', 'withdrawal')",
+            params![
+                period_start,
+                period_start,
+                withdrawn_at,
+                hash,
+                parent_hash,
+                signature,
+                stored_pubkey,
+                SUMMARY_SCHEME_VERSION,
+            ],
+        )?;
+        Ok(Some(conn.last_insert_rowid()))
     }
 
     /// The current summary for each period in `[from, to)`: highest revision, withdrawn
@@ -1115,12 +1203,13 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, period_start, period_end, summary_text, generated_at, revision,
-                    withdrawn, hash, parent_hash, signature, scheme_version, prompt_hash
+                    withdrawn, hash, parent_hash, signature, scheme_version, prompt_hash, kind
              FROM work_summaries w
              WHERE period_start >= ?1 AND period_start < ?2
+               AND kind = 'note'
                AND withdrawn = 0
                AND revision = (SELECT MAX(revision) FROM work_summaries
-                               WHERE period_start = w.period_start)
+                               WHERE period_start = w.period_start AND kind = 'note')
              ORDER BY period_start ASC",
         )?;
         let rows = stmt.query_map(params![from, to], |row| {
@@ -1137,6 +1226,7 @@ impl Database {
                 signature: row.get(9)?,
                 scheme_version: row.get(10).unwrap_or(SUMMARY_SCHEME_VERSION),
                 prompt_hash: row.get(11).unwrap_or_default(),
+                kind: row.get(12).unwrap_or_else(|_| "note".to_string()),
             })
         })?;
         rows.collect()
@@ -1231,12 +1321,16 @@ impl Database {
     ) -> Result<Vec<WorkSummary>> {
         let cutoff = now_ts - correction_window_secs;
         let conn = self.conn.lock().unwrap();
+        // Notes wait out the correction window and are dropped once withdrawn.
+        // Withdrawals do neither: taking something back must travel immediately, and it
+        // is the one record whose whole purpose survives the note being withdrawn.
         let mut stmt = conn.prepare(
             "SELECT id, period_start, period_end, summary_text, generated_at, revision,
-                    withdrawn, hash, parent_hash, signature, scheme_version, prompt_hash
+                    withdrawn, hash, parent_hash, signature, scheme_version, prompt_hash, kind
              FROM work_summaries
-             WHERE signature IS NOT NULL AND synced = 0 AND withdrawn = 0
-               AND generated_at <= ?1
+             WHERE signature IS NOT NULL AND synced = 0
+               AND (kind = 'withdrawal'
+                    OR (withdrawn = 0 AND generated_at <= ?1))
              ORDER BY id ASC
              LIMIT ?2",
         )?;
@@ -1254,6 +1348,7 @@ impl Database {
                 signature: row.get(9)?,
                 scheme_version: row.get(10).unwrap_or(SUMMARY_SCHEME_VERSION),
                 prompt_hash: row.get(11).unwrap_or_default(),
+                kind: row.get(12).unwrap_or_else(|_| "note".to_string()),
             })
         })?;
         rows.collect()
@@ -1273,8 +1368,9 @@ impl Database {
     /// to stay idempotent across restarts.
     pub fn has_work_summary(&self, period_start: i64) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt =
-            conn.prepare("SELECT 1 FROM work_summaries WHERE period_start = ?1 LIMIT 1")?;
+        let mut stmt = conn.prepare(
+            "SELECT 1 FROM work_summaries WHERE period_start = ?1 AND kind = 'note' LIMIT 1",
+        )?;
         let mut rows = stmt.query(params![period_start])?;
         Ok(rows.next()?.is_some())
     }
@@ -1285,7 +1381,7 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, period_start, period_end, summary_text, generated_at, revision,
-                    hash, parent_hash, signature, signing_pubkey, scheme_version, prompt_hash
+                    hash, parent_hash, signature, signing_pubkey, scheme_version, prompt_hash, kind
              FROM work_summaries ORDER BY id ASC",
         )?;
         let mut rows = stmt.query([])?;
@@ -1305,6 +1401,7 @@ impl Database {
             let signing_pubkey: Option<String> = row.get(9)?;
             let scheme_version: u32 = row.get(10).unwrap_or(SUMMARY_SCHEME_VERSION);
             let prompt_hash: String = row.get(11).unwrap_or_default();
+            let kind: String = row.get(12).unwrap_or_else(|_| "note".to_string());
 
             if parent_hash != expected_parent_hash {
                 return Ok(Err(format!(
@@ -1314,17 +1411,30 @@ impl Database {
             }
 
             let row_pubkey = signing_pubkey.as_deref().unwrap_or("");
-            let payload = canonical_summary_payload(
-                scheme_version,
-                row_pubkey,
-                period_start,
-                period_end,
-                generated_at,
-                revision,
-                &summary_text,
-                &prompt_hash,
-                &parent_hash,
-            );
+            // Both record kinds share the chain, so each row is re-derived under its own
+            // canonical form. A withdrawal that tried to pass as a note (or the reverse)
+            // would hash differently and fail here.
+            let payload = if kind == "withdrawal" {
+                canonical_withdrawal_payload(
+                    scheme_version,
+                    row_pubkey,
+                    period_start,
+                    generated_at,
+                    &parent_hash,
+                )
+            } else {
+                canonical_summary_payload(
+                    scheme_version,
+                    row_pubkey,
+                    period_start,
+                    period_end,
+                    generated_at,
+                    revision,
+                    &summary_text,
+                    &prompt_hash,
+                    &parent_hash,
+                )
+            };
             if hash != sha256_hex(&payload) {
                 return Ok(Err(format!(
                     "Summary {} has been modified after it was written.",
@@ -2561,7 +2671,11 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855|CONFIGHASH|PARE
         )
         .unwrap();
 
-        assert_eq!(db.withdraw_work_summary(86_400).unwrap(), 1);
+        assert!(
+            db.withdraw_work_summary(86_400, 172_950, Some(&signer))
+                .unwrap()
+                .is_some()
+        );
         assert!(
             db.get_work_summaries(0, 200_000).unwrap().is_empty(),
             "a withdrawn period is not shown"
@@ -2604,12 +2718,17 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855|CONFIGHASH|PARE
         assert_eq!(ready.len(), 1, "after the window it is ready to travel");
         assert_eq!(ready[0].summary_text, "Fresh note.");
 
-        db.withdraw_work_summary(86_400).unwrap();
-        assert!(
-            db.get_unsynced_summaries(now + window, window, 50)
-                .unwrap()
-                .is_empty(),
-            "a withdrawn note never travels, window or not"
+        db.withdraw_work_summary(86_400, now + window + 60, Some(&signer))
+            .unwrap();
+        let after_withdrawal = db.get_unsynced_summaries(now + window, window, 50).unwrap();
+        assert_eq!(
+            after_withdrawal.len(),
+            1,
+            "the note stops travelling, but the withdrawal must travel: {after_withdrawal:?}"
+        );
+        assert_eq!(
+            after_withdrawal[0].kind, "withdrawal",
+            "a withdrawn note never travels, window or not — only the withdrawal does"
         );
     }
 
@@ -2640,6 +2759,95 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855|CONFIGHASH|PARE
         db.insert_work_summary(86_400, 172_800, "Unsigned.", now - 86_400, "ph", None)
             .unwrap();
         assert!(db.get_unsynced_summaries(now, 3600, 50).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_withdrawal_is_a_signed_record_on_the_same_chain() {
+        // Taking a note back is an event, not a flag: it is signed, chained, and stays
+        // in the ledger. That signature is what lets the cloud act on it at all.
+        let db = create_test_db();
+        let keys = crate::config::generate_enrollment_keys("tok");
+        let signer = SlotSigner {
+            public_key: &keys.public_key,
+            private_key: &keys.private_key,
+        };
+
+        db.insert_work_summary(86_400, 172_800, "A note.", 172_900, "ph", Some(&signer))
+            .unwrap();
+        let id = db
+            .withdraw_work_summary(86_400, 173_000, Some(&signer))
+            .unwrap();
+        assert!(
+            id.is_some(),
+            "withdrawing an existing note appends a record"
+        );
+
+        // The chain still verifies with two record kinds in it.
+        assert!(db.verify_summary_chain(&keys.public_key).unwrap().is_ok());
+
+        // The note is hidden from readers; its text and signature are untouched.
+        assert!(db.get_work_summaries(0, 200_000).unwrap().is_empty());
+        {
+            let conn = db.conn.lock().unwrap();
+            let (text, sig_present): (String, bool) = conn
+                .query_row(
+                    "SELECT summary_text, signature IS NOT NULL FROM work_summaries
+                     WHERE period_start = 86400 AND kind = 'note'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get::<_, i64>(1)? != 0)),
+                )
+                .unwrap();
+            assert_eq!(
+                text, "A note.",
+                "withdrawal must not erase what was written"
+            );
+            assert!(sig_present, "and must not strip its signature");
+        }
+
+        assert!(
+            db.withdraw_work_summary(999_999, 173_000, Some(&signer))
+                .unwrap()
+                .is_none(),
+            "withdrawing a period with no note is a no-op, not a stray record"
+        );
+    }
+
+    #[test]
+    fn test_forged_withdrawal_fails_verification() {
+        // The whole point of signing a withdrawal: one that was not authored by the key
+        // cannot pass, so nobody can take back someone else's note.
+        let db = create_test_db();
+        let keys = crate::config::generate_enrollment_keys("tok");
+        let signer = SlotSigner {
+            public_key: &keys.public_key,
+            private_key: &keys.private_key,
+        };
+        db.insert_work_summary(86_400, 172_800, "A note.", 172_900, "ph", Some(&signer))
+            .unwrap();
+        db.withdraw_work_summary(86_400, 173_000, Some(&signer))
+            .unwrap();
+
+        // Rewrite which period the withdrawal claims to take back.
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE work_summaries SET period_start = 99999 WHERE kind = 'withdrawal'",
+                [],
+            )
+            .unwrap();
+        }
+        assert!(
+            db.verify_summary_chain(&keys.public_key).unwrap().is_err(),
+            "an altered withdrawal must fail verification"
+        );
+    }
+
+    #[test]
+    fn test_withdrawal_canonical_vector_matches_cloud() {
+        // Cross-language contract, same as notes: the cloud re-derives this exact string
+        // to decide whether to honour a withdrawal.
+        let got = canonical_withdrawal_payload(2, "PUBKEY", 86_400, 173_000, "PARENT");
+        assert_eq!(got, "tenby10-withdrawal|v2|PUBKEY|86400|173000|PARENT");
     }
 
     #[test]

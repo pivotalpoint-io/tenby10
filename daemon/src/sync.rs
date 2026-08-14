@@ -179,11 +179,25 @@ fn summary_payload(agent_id: &str, note: &crate::db::WorkSummary) -> serde_json:
     })
 }
 
-/// Upload work notes that have cleared the correction window, oldest first (ADR 0019).
+fn withdrawal_payload(agent_id: &str, record: &crate::db::WorkSummary) -> serde_json::Value {
+    serde_json::json!({
+        "agent_id": agent_id,
+        "scheme_version": record.scheme_version,
+        "period_start": record.period_start,
+        // The withdrawal's own moment; `generated_at` is when the decision was taken.
+        "withdrawn_at": record.generated_at,
+        "ledger": { "hash": record.hash, "parent_hash": record.parent_hash },
+        "signature": record.signature,
+    })
+}
+
+/// Upload work notes that have cleared the correction window, oldest first (ADR 0019),
+/// and withdrawals as soon as they exist.
 ///
 /// Stops at the first rejection, like slots: notes are a hash chain too, and a gap would
-/// break every note behind it. Withdrawn notes are never uploaded — withdrawing before
-/// the window closes means the note simply never travels.
+/// break every record behind it. Withdrawn notes are never uploaded — withdrawing before
+/// the window closes means the note simply never travels — but the *withdrawal record*
+/// always is, because a note that already left needs taking back.
 pub fn sync_work_summaries(
     db: &Database,
     agent_id: &str,
@@ -198,25 +212,38 @@ pub fn sync_work_summaries(
         .map_err(|e| format!("could not read unsynced work notes: {e}"))?;
 
     let client = reqwest::blocking::Client::new();
-    let url = format!("{base_url}/api/v1/summaries");
+    let notes_url = format!("{base_url}/api/v1/summaries");
+    let withdrawals_url = format!("{base_url}/api/v1/summaries/withdraw");
     let mut uploaded = 0usize;
 
-    for note in notes {
+    for record in notes {
+        let is_withdrawal = record.kind == "withdrawal";
+        let (url, payload) = if is_withdrawal {
+            (&withdrawals_url, withdrawal_payload(agent_id, &record))
+        } else {
+            (&notes_url, summary_payload(agent_id, &record))
+        };
+
         let resp = client
-            .post(&url)
-            .json(&summary_payload(agent_id, &note))
+            .post(url)
+            .json(&payload)
             .send()
             .map_err(|e| format!("work note upload request failed: {e}"))?;
 
         if !resp.status().is_success() {
             return Err(format!(
-                "work note for {} rejected: HTTP {} — stopping this sync",
-                note.period_start,
+                "{} for {} rejected: HTTP {} — stopping this sync",
+                if is_withdrawal {
+                    "withdrawal"
+                } else {
+                    "work note"
+                },
+                record.period_start,
                 resp.status()
             ));
         }
-        db.mark_summary_synced(note.id)
-            .map_err(|e| format!("could not mark work note {} synced: {e}", note.id))?;
+        db.mark_summary_synced(record.id)
+            .map_err(|e| format!("could not mark record {} synced: {e}", record.id))?;
         uploaded += 1;
     }
     Ok(uploaded)
