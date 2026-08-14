@@ -152,3 +152,72 @@ pub fn sync_signed_slots(db: &Database, agent_id: &str, base_url: &str) -> Resul
     }
     Ok(uploaded)
 }
+
+/// How long a note sits on the worker's machine before it can travel (ADR 0019).
+///
+/// This is the correction window. There is no approval step and nothing waits on the
+/// worker, so what protects them from a bad note reaching a client is time: the note
+/// appears in their own dashboard first, and they can revise or withdraw it. Twelve
+/// hours means a note written at the close of one day leaves around the middle of the
+/// next — after an ordinary person has had a morning to look.
+pub const SUMMARY_CORRECTION_WINDOW_SECS: i64 = 12 * 3600;
+
+fn summary_payload(agent_id: &str, note: &crate::db::WorkSummary) -> serde_json::Value {
+    serde_json::json!({
+        "agent_id": agent_id,
+        "scheme_version": note.scheme_version,
+        "period_start": note.period_start,
+        "period_end": note.period_end,
+        "generated_at": note.generated_at,
+        "revision": note.revision,
+        // The text itself travels: it exists to be read by whoever receives a link.
+        // Its SHA-256 is inside the signature, so what lands is provably what was signed.
+        "summary_text": note.summary_text,
+        "prompt_hash": note.prompt_hash,
+        "ledger": { "hash": note.hash, "parent_hash": note.parent_hash },
+        "signature": note.signature,
+    })
+}
+
+/// Upload work notes that have cleared the correction window, oldest first (ADR 0019).
+///
+/// Stops at the first rejection, like slots: notes are a hash chain too, and a gap would
+/// break every note behind it. Withdrawn notes are never uploaded — withdrawing before
+/// the window closes means the note simply never travels.
+pub fn sync_work_summaries(
+    db: &Database,
+    agent_id: &str,
+    base_url: &str,
+    now_ts: i64,
+) -> Result<usize, String> {
+    if agent_id.is_empty() {
+        return Ok(0);
+    }
+    let notes = db
+        .get_unsynced_summaries(now_ts, SUMMARY_CORRECTION_WINDOW_SECS, 50)
+        .map_err(|e| format!("could not read unsynced work notes: {e}"))?;
+
+    let client = reqwest::blocking::Client::new();
+    let url = format!("{base_url}/api/v1/summaries");
+    let mut uploaded = 0usize;
+
+    for note in notes {
+        let resp = client
+            .post(&url)
+            .json(&summary_payload(agent_id, &note))
+            .send()
+            .map_err(|e| format!("work note upload request failed: {e}"))?;
+
+        if !resp.status().is_success() {
+            return Err(format!(
+                "work note for {} rejected: HTTP {} — stopping this sync",
+                note.period_start,
+                resp.status()
+            ));
+        }
+        db.mark_summary_synced(note.id)
+            .map_err(|e| format!("could not mark work note {} synced: {e}", note.id))?;
+        uploaded += 1;
+    }
+    Ok(uploaded)
+}
