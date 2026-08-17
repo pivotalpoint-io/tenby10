@@ -24,6 +24,9 @@ function goHome() {
         let availableDates = [];
         let currentDateKey = null;
         let currentViewMode = 'daily';
+        // Set once the landing date and view have been chosen, so the 15s poll never
+        // re-chooses them under a user who is browsing (#78).
+        let positionInitialized = false;
         let weekStartDay = parseInt(localStorage.getItem('weekStartDay') || '1', 10); // 1 = Monday, 0 = Sunday
 
         // Daily work notes (ADR 0019), keyed by YYYY-MM-DD, plus whether note
@@ -110,37 +113,45 @@ function goHome() {
                 }
                 
                 processSlots();
-                
-                // Determine initial date
-                const urlParams = getParamsFromUrl();
-                if (urlParams.date) {
-                    currentDateKey = urlParams.date;
-                } else if (availableDates.length > 0) {
-                    // Default to the most recent date with data
-                    currentDateKey = availableDates[availableDates.length - 1];
-                } else {
-                    // Fallback to today's date in YYYY-MM-DD local format
-                    const today = new Date();
-                    const year = today.getFullYear();
-                    const month = String(today.getMonth() + 1).padStart(2, '0');
-                    const day = String(today.getDate()).padStart(2, '0');
-                    currentDateKey = `${year}-${month}-${day}`;
+
+                // Where the user is looking is theirs, not the poll's. This runs once, on the
+                // first load; every later refresh below only re-renders whatever day, week or
+                // month is currently open, so browsing the past isn't yanked back to today
+                // every 15 seconds (#78). The Today button is how you come back.
+                if (!positionInitialized) {
+                    positionInitialized = true;
+
+                    // Determine initial date
+                    const urlParams = getParamsFromUrl();
+                    if (urlParams.date) {
+                        currentDateKey = urlParams.date;
+                    } else if (availableDates.length > 0) {
+                        // Default to the most recent date with data
+                        currentDateKey = availableDates[availableDates.length - 1];
+                    } else {
+                        // Fallback to today's date in YYYY-MM-DD local format
+                        const today = new Date();
+                        const year = today.getFullYear();
+                        const month = String(today.getMonth() + 1).padStart(2, '0');
+                        const day = String(today.getDate()).padStart(2, '0');
+                        currentDateKey = `${year}-${month}-${day}`;
+                    }
+
+                    if (urlParams.tab) {
+                        currentViewMode = urlParams.tab;
+                    }
+
+                    document.getElementById('week-start-select').value = weekStartDay.toString();
+
+                    document.querySelectorAll('.view-tab').forEach(el => el.classList.remove('active'));
+                    const activeTab = document.getElementById(`tab-${currentViewMode}`);
+                    if (activeTab) activeTab.classList.add('active');
+
+                    document.getElementById('day-view-container').style.display = currentViewMode === 'daily' ? 'block' : 'none';
+                    document.getElementById('week-view-container').style.display = currentViewMode === 'weekly' ? 'block' : 'none';
+                    document.getElementById('month-view-container').style.display = currentViewMode === 'monthly' ? 'block' : 'none';
                 }
-                
-                if (urlParams.tab) {
-                    currentViewMode = urlParams.tab;
-                }
-                
-                document.getElementById('week-start-select').value = weekStartDay.toString();
-                
-                document.querySelectorAll('.view-tab').forEach(el => el.classList.remove('active'));
-                const activeTab = document.getElementById(`tab-${currentViewMode}`);
-                if (activeTab) activeTab.classList.add('active');
-                
-                document.getElementById('day-view-container').style.display = currentViewMode === 'daily' ? 'block' : 'none';
-                document.getElementById('week-view-container').style.display = currentViewMode === 'weekly' ? 'block' : 'none';
-                document.getElementById('month-view-container').style.display = currentViewMode === 'monthly' ? 'block' : 'none';
-                
+
                 renderCurrentView();
             } catch (err) {
                 console.error("Error fetching dashboard data", err);
