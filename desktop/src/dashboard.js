@@ -411,7 +411,7 @@ function goHome() {
             let billableSlots = 0;
             let daysRun = 0;
 
-            let labelBillable = 'Billable';
+            let labelBillable = 'Active Time';
             let labelFocus = 'Avg Focus';
             let labelDays = 'Days Run';
             
@@ -419,7 +419,7 @@ function goHome() {
             
             if (currentViewMode === 'daily') {
                 if (daysMap[currentDateKey]) relevantDays.push(daysMap[currentDateKey]);
-                labelBillable = 'Billable Today';
+                labelBillable = 'Active Time Today';
                 labelFocus = 'Focus Today';
                 labelDays = 'Logged Slots';
             } else if (currentViewMode === 'weekly') {
@@ -433,7 +433,7 @@ function goHome() {
                     const key = `${y}-${m}-${day}`;
                     if (daysMap[key]) relevantDays.push(daysMap[key]);
                 }
-                labelBillable = 'Billable This Week';
+                labelBillable = 'Active Time This Week';
                 labelFocus = 'Focus This Week';
                 labelDays = 'Active Days';
             } else if (currentViewMode === 'monthly') {
@@ -444,7 +444,7 @@ function goHome() {
                     const key = `${y}-${m}-${String(d).padStart(2, '0')}`;
                     if (daysMap[key]) relevantDays.push(daysMap[key]);
                 }
-                labelBillable = 'Billable This Month';
+                labelBillable = 'Active Time This Month';
                 labelFocus = 'Focus This Month';
                 labelDays = 'Active Days';
             }

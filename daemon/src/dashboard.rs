@@ -1058,7 +1058,7 @@ async fn serve_dashboard_html() -> impl IntoResponse {
             <div class="glass-card" style="flex: 1; display: flex; justify-content: space-between; align-items: center; padding: 1.2rem 2.5rem;">
                 <div class="metric-item" style="border: none; background: transparent; padding: 0;">
                     <span class="metric-value" id="stat-billable" style="font-size: 3rem; color: var(--accent-green);">-</span>
-                    <span class="metric-label" id="label-billable" style="font-size: 1rem;">Billable Today</span>
+                    <span class="metric-label" id="label-billable" style="font-size: 1rem;">Active Time Today</span>
                     <span class="metric-hint" id="hint-billable" style="font-size: 0.72rem; color: var(--text-muted);">&nbsp;</span>
                 </div>
                 <div class="metric-item" style="border: none; background: transparent; padding: 0;">
@@ -1569,7 +1569,7 @@ async fn serve_dashboard_html() -> impl IntoResponse {
             let billableSlots = 0;
             let daysRun = 0;
 
-            let labelBillable = 'Billable';
+            let labelBillable = 'Active Time';
             let labelFocus = 'Avg Focus';
             let labelDays = 'Days Run';
             
@@ -1577,7 +1577,7 @@ async fn serve_dashboard_html() -> impl IntoResponse {
             
             if (currentViewMode === 'daily') {
                 if (daysMap[currentDateKey]) relevantDays.push(daysMap[currentDateKey]);
-                labelBillable = 'Billable Today';
+                labelBillable = 'Active Time Today';
                 labelFocus = 'Focus Today';
                 labelDays = 'Logged Slots';
             } else if (currentViewMode === 'weekly') {
@@ -1591,7 +1591,7 @@ async fn serve_dashboard_html() -> impl IntoResponse {
                     const key = `${y}-${m}-${day}`;
                     if (daysMap[key]) relevantDays.push(daysMap[key]);
                 }
-                labelBillable = 'Billable This Week';
+                labelBillable = 'Active Time This Week';
                 labelFocus = 'Focus This Week';
                 labelDays = 'Active Days';
             } else if (currentViewMode === 'monthly') {
@@ -1602,7 +1602,7 @@ async fn serve_dashboard_html() -> impl IntoResponse {
                     const key = `${y}-${m}-${String(d).padStart(2, '0')}`;
                     if (daysMap[key]) relevantDays.push(daysMap[key]);
                 }
-                labelBillable = 'Billable This Month';
+                labelBillable = 'Active Time This Month';
                 labelFocus = 'Focus This Month';
                 labelDays = 'Active Days';
             }
