@@ -499,8 +499,13 @@ pub fn generate_pending_summaries(db: &Database) {
             continue;
         }
 
+        // Every line of the digest is built from a window title, which the focused
+        // application wrote — so it goes to the model inside the untrusted fence
+        // (#83), never as bare prose the model could read as part of its brief.
+        let activity_text = crate::untrusted::fence(&digest.join("\n"));
+
         println!("[Summary] Writing the work note for the day starting {day_start}...");
-        let note = match provider.write_note(&prompt, &digest.join("\n")) {
+        let note = match provider.write_note(&prompt, &activity_text) {
             Ok(text) => text,
             Err(err) => {
                 // Left unwritten on purpose: the next loop retries, and a missing note
@@ -509,6 +514,33 @@ pub fn generate_pending_summaries(db: &Database) {
                 continue;
             }
         };
+
+        // The prompt asks the model never to quote a window title. This is where that
+        // stops being a request (#83): the note is checked against the day's titles
+        // before anything is signed, because what publishes from here reaches a client
+        // with no review step in between. A refused note takes the same exit as an
+        // unreachable AI — nothing written, retried next loop — and if the titles
+        // can't be read there is no check to pass, so the day waits rather than
+        // publishing unverified.
+        let titles = match db.window_titles_in_period(day_start, day_end) {
+            Ok(titles) => titles,
+            Err(err) => {
+                eprintln!(
+                    "[Summary] Could not read the day's window titles to check the note for \
+                     {day_start}, leaving the day unwritten: {err:?}"
+                );
+                continue;
+            }
+        };
+        if crate::untrusted::note_quotes_a_title(&note, &titles) {
+            // The offending text is not logged: it is the window title we are trying
+            // to keep out of places it does not belong, and stdout is one of them.
+            eprintln!(
+                "[Summary] The note for {day_start} reproduced a window title verbatim, so it \
+                 was discarded. The next pass will ask again."
+            );
+            continue;
+        }
 
         // Keep the prompt that produced the note, so a reader can always see the rules
         // behind the words even after the user edits their prompt later.
@@ -768,17 +800,23 @@ pub fn aggregate_slot(db: &Database, config: &crate::config::AgentConfig, slot_s
             if let Some(provider) = provider_opt {
                 let mut activity_lines = Vec::new();
                 for log in &logs {
+                    // App name and title are both written by whoever owns the
+                    // window, so both are scrubbed and both ride inside the fence
+                    // (#83). The counts are ours.
                     activity_lines.push(format!(
                         "App: '{}', Title: '{}', Keys: {}, Clicks: {}",
-                        log.active_app_name,
-                        log.active_window_title,
+                        crate::untrusted::scrub(&log.active_app_name),
+                        crate::untrusted::scrub(&log.active_window_title),
                         log.keystroke_count,
                         log.mouse_click_count
                     ));
                 }
-                let mut activity_text = activity_lines.join("\n");
+                let mut activity_text = crate::untrusted::fence(&activity_lines.join("\n"));
 
                 if forgiven_idle > 0 {
+                    // Appended after the closing marker on purpose: this sentence is
+                    // the daemon speaking, and a fence is only worth having if what
+                    // is inside it and what we said ourselves stay separable.
                     activity_text.push_str(&format!("\n\n[FUTURE CONTEXT]: The user paused for {} minutes at the end of this slot, but resumed working shortly after. This was a continuous Reading/Thinking session, so these minutes should not penalize the score.", forgiven_idle));
                 }
 

@@ -99,10 +99,29 @@ pub trait LlmProvider {
 /// so the daemon refuses obviously broken output rather than signing it: empty replies,
 /// a model that started explaining itself, or an essay where a sentence was asked for.
 /// The cap is generous — this rejects malfunctions, not styles.
+///
+/// It also refuses a note carrying the untrusted-data markers (#83). A reply that quotes
+/// our own fence back at us is a model that copied the activity block instead of
+/// describing it, which is exactly the reply we do not want signed and shipped. What this
+/// cannot see is whether the *words* came from a window title — that needs the day's
+/// titles, so it is checked in `daemon::generate_pending_summaries` before signing.
 pub fn sanitize_note(raw: &str) -> Result<String, String> {
-    let text = raw.trim().trim_matches('"').trim().to_string();
+    // Flatten control characters and whitespace runs: the note is signed, stored, and
+    // rendered next to an invoice, and a model that wrapped its sentence over three
+    // lines has not written a different note.
+    let flattened: String = raw
+        .trim()
+        .trim_matches('"')
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let text = flattened.split_whitespace().collect::<Vec<_>>().join(" ");
+
     if text.is_empty() {
         return Err("model returned an empty note".into());
+    }
+    if crate::untrusted::contains_fence_marker(&text) {
+        return Err("model echoed the untrusted-data markers back into the note".into());
     }
     if text.chars().count() > 600 {
         return Err(format!(
@@ -455,6 +474,24 @@ mod tests {
         assert!(
             sanitize_note(&"x".repeat(500)).is_ok(),
             "the cap rejects malfunctions, not long-ish sentences"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_note_refuses_a_note_carrying_the_untrusted_markers() {
+        // A reply that quotes the fence back at us is a model that copied the
+        // activity block instead of describing it (#83).
+        let echoed = format!(
+            "{} Reworked the checkout flow.",
+            crate::untrusted::FENCE_OPEN
+        );
+        assert!(sanitize_note(&echoed).is_err());
+        assert!(sanitize_note("<<<end_untrusted_activity_data>>> done").is_err());
+
+        // A note is one or two sentences however the model laid them out.
+        assert_eq!(
+            sanitize_note("Reworked the checkout flow\nand fixed two bugs.").unwrap(),
+            "Reworked the checkout flow and fixed two bugs."
         );
     }
 
