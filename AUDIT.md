@@ -5,10 +5,13 @@ OS-level input and screen access.
 
 **Claim under audit:** *"tenby10 is not a keylogger, does not capture anything sensitive, keeps your
 raw activity on your machine, and scores your focus by fair, inspectable rules."* When you enroll and
-share a link, signed 10-minute *summaries* and your scoring configuration are uploaded to tenby10 —
-never raw keystrokes or window titles — and no screen images exist to upload (§2, §3). The one other egress is opt-in BYOK
-scoring: activity text (window titles included) sent directly to the LLM provider *you* configure
-(row 5) — fully on-device with local Ollama.
+share a link, signed 10-minute *summaries*, your scoring configuration and — once you connect your
+own AI — a signed one-or-two-sentence *work note* per day are uploaded to tenby10. Raw keystrokes and
+raw window titles are not, and no screen images exist to upload (§2, §3). That work note is prose
+your own AI writes *from* your window titles, so it is the one place where title-*derived* text
+travels to tenby10; read rows 4 and 9 before you rely on that boundary. The other egress is opt-in
+BYOK inference: activity text (window titles included) sent directly to the LLM provider *you*
+configure (row 5) — fully on-device with local Ollama.
 
 This guide maps each of those claims to the exact source that proves (or, honestly, does **not** yet
 prove) it. Every reference is `file:line` and is meant to be opened and read directly — do not take
@@ -28,23 +31,28 @@ auditable; the cloud portal is not part of this repository.
 
 | # | Claim | Status | Primary evidence |
 |---|-------|--------|------------------|
-| 1 | No key **content** is captured (not a keylogger) | ✅ Verified in code | [daemon.rs:145](daemon/src/daemon.rs#L145) — `KeyPress(_)` discards the key value |
-| 2 | Only counts/metadata are stored per minute | ✅ Verified | [daemon.rs:334](daemon/src/daemon.rs#L334), [db.rs schema](daemon/src/db.rs) |
+| 1 | No key **content** is captured (not a keylogger) | ✅ Verified in code | [daemon.rs:246](daemon/src/daemon.rs#L246) — `KeyPress(_)` discards the key value |
+| 2 | Only counts/metadata are stored per minute | ✅ Verified | [daemon.rs:414](daemon/src/daemon.rs#L414), [db.rs schema](daemon/src/db.rs) |
 | 3 | No screen capture exists at all | ✅ Verified | No capture code in the client — `grep -rn "CGDisplay\|BitBlt\|screencapture" daemon/src/` returns nothing (ADR 0018) |
-| 4 | Raw keystrokes never leave the machine; window titles never reach tenby10 | ✅ Verified | Cloud sync carries only signed slot *summaries* + your scoring config — [sync.rs](daemon/src/sync.rs); titles go only to your own BYOK provider ([daemon.rs](daemon/src/daemon.rs), row 5) |
-| 5 | Cloud sync (when enrolled) is category/count summaries + hashes + config; your BYOK LLM is the only other egress | ✅ Verified | [sync.rs](daemon/src/sync.rs); LLM in [llm.rs](daemon/src/llm.rs), gated by [daemon.rs:570](daemon/src/daemon.rs#L570) |
+| 4 | Raw keystrokes never leave the machine; **raw** window titles never reach tenby10 | ⚠️ Verified, but narrowed on 2026-08-14 | Still true of raw titles: no upload payload has a title field ([sync.rs:85](daemon/src/sync.rs#L85), [sync.rs:168](daemon/src/sync.rs#L168), [sync.rs:185](daemon/src/sync.rs#L185)). What changed: a title-*derived* sentence now does reach tenby10, in the daily work note (§2) — row 9 is what constrains it. Raw titles still go only to your own BYOK provider (row 5) |
+| 5 | Cloud sync (when enrolled) is count/category summaries + hashes + config + your daily work notes; your BYOK provider is the only other destination | ✅ Verified, scope corrected | Five endpoints, all inventoried in §2 — [sync.rs](daemon/src/sync.rs). BYOK calls live in [llm.rs](daemon/src/llm.rs), reached from slot scoring ([daemon.rs:762](daemon/src/daemon.rs#L762)) and from note writing ([daemon.rs:454](daemon/src/daemon.rs#L454)) |
 | 6 | No image is sent to your LLM provider, ever | ✅ Verified structurally | The provider trait takes text only ([llm.rs](daemon/src/llm.rs)); nothing in the client can produce an image to send |
 | 7 | Focus-scoring rules are deterministic and inspectable | ✅ Verified | [evaluator.rs](daemon/src/evaluator.rs), [entropy.rs](daemon/src/entropy.rs) |
-| 8 | Local logs are tamper-evident (full-payload hash chain) + self-signed when enrolled | ✅ Verified | [db.rs `insert_slot_summary`/`verify_ledger_integrity`](daemon/src/db.rs) |
+| 8 | Local logs are tamper-evident (full-payload hash chain) + self-signed when enrolled | ✅ Verified | [db.rs `insert_slot_summary`/`verify_ledger_integrity`](daemon/src/db.rs) — work notes have their own chain, same construction (§5) |
+| 9 | Your daily work note describes the task, not the window title | ⚠️ Prompt-enforced, not mechanism-enforced | The default prompt ([config.rs:34](daemon/src/config.rs#L34)) tells the model never to quote a window title, file path, URL, or third-party name. Nothing inspects the sentence afterwards: `sanitize_note` ([llm.rs:102](daemon/src/llm.rs#L102)) rejects empty or essay-length replies, not leaked content. The prompt's SHA-256 is bound into the signed record so a reader can check which rules applied — that is evidence of the rule, not proof the model obeyed it |
 | — | Secrets stored in OS keychain | ✅ Verified | [config.rs `save_config`/`load_config`](daemon/src/config.rs) — `private_key` & `llm_api_key` kept in the OS keychain via the `keyring` crate |
 | — | Local dashboard makes no third-party calls | ✅ Verified | [dashboard.rs](daemon/src/dashboard.rs) — Outfit font embedded as a data URI; no CDN `<link>` |
 | — | The installed app opens **no listening port** | ✅ Verified | The dashboard renders in-app over Tauri IPC. The loopback HTTP server is a debug-only escape hatch for the standalone `daemon` binary, off unless `TENBY10_DEBUG_HTTP` is set — [env.rs `debug_http_enabled`](daemon/src/env.rs) |
 
 Bottom line: the core privacy claims — **no keylogging; no screen capture; raw keystrokes never leave
-the machine; window titles never reach tenby10 or anyone you share a link with** — hold up against
-the code. When you enroll and sync, signed 10-minute *summaries* and your scoring configuration are
-uploaded to the cloud (§2); raw activity is not. Opt-in BYOK scoring sends activity text (window
-titles included) directly to the provider *you* configure — fully on-device with local Ollama.
+the machine; raw window titles never reach tenby10 or anyone you share a link with** — hold up
+against the code. When you enroll and sync, signed 10-minute *summaries* and your scoring
+configuration are uploaded to the cloud (§2); raw activity is not. Connect your own AI and one more
+thing is uploaded: a one-or-two-sentence *work note* per finished day, written on your machine from
+your own window titles and held for 12 hours so you can revise or withdraw it first. So the honest
+boundary is "raw titles stay here", not "nothing derived from a title ever travels" — rows 4 and 9
+say how far it goes. Opt-in BYOK inference sends activity text (window titles included) directly to
+the provider *you* configure — fully on-device with local Ollama.
 
 The gap previously logged here as **G1** (a `send_screenshots` toggle that never sent anything) is
 closed: rather than wire it up, the screenshot subsystem was removed outright
@@ -59,11 +67,11 @@ line of capture code.
 `KeyPress(_)` — the underscore **discards** the actual key/character. All it does is `+1` a counter
 and record the *timing gap* between presses (for bot detection), never *what* was typed.
 
-- [daemon.rs:145-155](daemon/src/daemon.rs#L145) — `KeyPress(_)` → increment `keystroke_count`, push
+- [daemon.rs:246-255](daemon/src/daemon.rs#L246) — `KeyPress(_)` → increment `keystroke_count`, push
   the inter-key interval in ms. The keycode is pattern-matched away.
-- [daemon.rs:156-161](daemon/src/daemon.rs#L156) — mouse buttons and scroll are counted the same way
+- [daemon.rs:257-262](daemon/src/daemon.rs#L257) — mouse buttons and scroll are counted the same way
   (counts only).
-- [daemon.rs:162-175](daemon/src/daemon.rs#L162) — mouse *movement* stores `(x, y, timestamp)` for
+- [daemon.rs:263-276](daemon/src/daemon.rs#L263) — mouse *movement* stores `(x, y, timestamp)` for
   entropy analysis. This is cursor coordinates, not content.
 - A **second, listen-only** tap in [provenance.rs](daemon/src/provenance.rs) (issue #87) — on macOS a
   `CGEventTap` reading only `kCGEventSourceStateID`, on Windows low-level hooks reading only the
@@ -74,7 +82,7 @@ An auditor should confirm there is **no** branch anywhere that reads the key val
 [How to verify](#how-to-verify).
 
 ### What a minute log actually contains
-Written once per 60s at [daemon.rs:334-343](daemon/src/daemon.rs#L334):
+Written once per 60s at [daemon.rs:414-423](daemon/src/daemon.rs#L414):
 
 | Field | Example | Sensitive? |
 |-------|---------|-----------|
@@ -88,9 +96,12 @@ Written once per 60s at [daemon.rs:334-343](daemon/src/daemon.rs#L334):
 | `low_entropy` | `false` | no |
 
 The one genuinely sensitive field is `active_window_title` (it can contain document names, email
-subjects, URLs). It is captured via [daemon.rs:104-121](daemon/src/daemon.rs#L104) (`active-win-pos-rs`)
-and stored **locally**. It only ever leaves the machine if you turn on BYOK LLM scoring (§2); it is
-**never** part of the signed summary uploaded to the cloud.
+subjects, URLs). It is captured via [daemon.rs:197-215](daemon/src/daemon.rs#L197)
+(`active-win-pos-rs`) and stored **locally**. The title itself only leaves the machine if you connect
+your own AI, and then it goes to *your* provider — for slot scoring, and for writing the daily work
+note (§2). It is **never** a field in anything uploaded to tenby10. What tenby10 does receive is the
+work note: a sentence written *from* titles, which is a weaker boundary than "no title ever travels"
+and is stated as such in rows 4 and 9.
 
 ---
 
@@ -101,37 +112,83 @@ Nothing leaves the machine until you **enroll** and sync. The complete list of o
 1. **tenby10 cloud sync — only when enrolled.** Once you pair a device,
    [sync.rs](daemon/src/sync.rs) uploads to the tenby10 cloud (`cloud_base_url()`,
    [sync.rs:16](daemon/src/sync.rs#L16), default `https://tenby10.pivotalpoint.io`). This is reached
-   only when `config.agent_id` is set (guarded in [daemon.rs](daemon/src/daemon.rs)). Three things go
-   up, and nothing else:
-   - **Signed slot summaries** (`sync_signed_slots`, `POST /api/v1/slots`): per 10-minute slot — a
-     focus score, active/idle segment counts, keystroke/click **counts**, app-category **counts**, a
-     SHA-256 **hash** of the LLM reasoning (not the text), the effective-config hash, and the
-     hash-chain link + Ed25519 signature.
+   only when `config.agent_id` is set ([daemon.rs:885](daemon/src/daemon.rs#L885)). **Five** requests
+   exist, and nothing else:
    - **Enrollment** (`enroll_with_cloud`, [sync.rs:22](daemon/src/sync.rs#L22), `POST /api/v1/enroll`):
      your pairing token and **public** key. The private key is generated locally and never leaves the
      keychain.
-   - **Scoring config, on change** (`upload_config_if_needed`, `POST /api/v1/config`): the effective
-     config — your auditing rules (app lists, engine mode, synthetic-detection flag) and the AI auditor
-     prompt — so a relying party can see which rubric produced each score (#62).
+   - **Signed slot summaries** (`slot_payload`, [sync.rs:85](daemon/src/sync.rs#L85),
+     `POST /api/v1/slots`): per 10-minute slot — a focus score, active/idle segment counts,
+     keystroke/click **counts**, app-category **counts**, a SHA-256 **hash** of the LLM reasoning
+     (not the text), the effective-config hash, and the hash-chain link + Ed25519 signature.
+   - **Signed daily work notes** (`summary_payload`, [sync.rs:168](daemon/src/sync.rs#L168),
+     `POST /api/v1/summaries`, [ADR 0019](../decisions/0019-worker-controlled-summary-sharing.md),
+     shipped 2026-08-14): one or two sentences per finished local day, **as text**. This is the only
+     upload that carries prose rather than counts and hashes.
+     Fields: `agent_id`, `scheme_version`, `period_start`, `period_end`, `generated_at`,
+     `revision`, `summary_text` (the note itself), `prompt_hash` (SHA-256 of the prompt that wrote
+     it), `ledger` (`hash` + `parent_hash`), `signature`. The note is written on your machine by
+     *your* AI from your own window titles (item 2 below), so this is where title-*derived* text
+     reaches tenby10 — see rows 4 and 9, and §5 for what the signature covers.
+   - **Withdrawals** (`withdrawal_payload`, [sync.rs:185](daemon/src/sync.rs#L185),
+     `POST /api/v1/summaries/withdraw`): `agent_id`, `scheme_version`, `period_start`,
+     `withdrawn_at`, `ledger` (`hash` + `parent_hash`), `signature`. Deliberately short — it names
+     *which* day is being taken back and *when*, and never restates the text, so a withdrawal cannot
+     smuggle a second version of a note into the record.
+   - **Blobs a record names** (`upload_config`, [sync.rs:57](daemon/src/sync.rs#L57),
+     `POST /api/v1/config`): `agent_id`, `config_hash`, `config_blob`. Two kinds of blob share this
+     endpoint, which is a plain SHA-256-keyed store: the effective config a slot was scored under
+     (your app lists, engine mode, synthetic-detection flag and the AI auditor prompt, #62/#80), and
+     the prompt a work note was written with (#147). A blob is sent **only after** the cloud rejects
+     the record that names it with HTTP 428 ([sync.rs:49](daemon/src/sync.rs#L49)) — no speculative
+     pre-upload — so a relying party can always resolve the rules behind a score or a sentence.
 
-   **Never sent:** raw keystrokes or window titles.
+   **Timing, and how a note can be stopped.** A note does not go up when it is written. It waits out
+   a 12-hour correction window (`SUMMARY_CORRECTION_WINDOW_SECS`,
+   [sync.rs:166](daemon/src/sync.rs#L166)) on your machine, visible in your own dashboard first:
+   `get_unsynced_summaries` ([db.rs:1316](daemon/src/db.rs#L1316)) will not return a note until
+   `generated_at` is older than that. **Withdraw it before the window closes and it never travels at
+   all** — the same query drops withdrawn notes. Withdrawal *records* are exempt from the wait and
+   upload immediately, because taking something back is useless if it queues. Unsigned rows are never
+   uploaded either, so nothing syncs before you enroll.
 
-2. **Your own LLM provider — opt-in, BYOK.** [llm.rs](daemon/src/llm.rs) posts directly to
-   `api.openai.com` ([llm.rs:35](daemon/src/llm.rs#L35)), `api.anthropic.com`
-   ([llm.rs:78](daemon/src/llm.rs#L78)), or `generativelanguage.googleapis.com`
-   ([llm.rs:132](daemon/src/llm.rs#L132)) using *your* API key — this goes to your provider, not to
-   tenby10. Reached **only** when `engine_mode == "llm"`
-   ([daemon.rs:570](daemon/src/daemon.rs#L570)) **and** a provider + key are configured
-   ([llm.rs:152-155](daemon/src/llm.rs#L152) returns `None` otherwise — default config ships empty, so
-   the default is off). The payload is the activity text (app names, **window titles**, key/click
-   counts) — built at [daemon.rs](daemon/src/daemon.rs). Text only; no image exists to send (§3).
+   **Never sent:** raw keystrokes, and raw window titles — no payload above has a title field. The
+   one thing that can carry information *derived* from a title is the work note's `summary_text`, and
+   what keeps a title out of that sentence is the prompt, not a filter (row 9).
+
+2. **Your own LLM provider — opt-in, BYOK.** [llm.rs](daemon/src/llm.rs) posts directly to the
+   provider *you* configure with *your* API key — this goes to your provider, not to tenby10. The
+   defaults are `api.openai.com` ([llm.rs:15](daemon/src/llm.rs#L15)), `api.anthropic.com`
+   ([llm.rs:17](daemon/src/llm.rs#L17)) and `generativelanguage.googleapis.com`
+   ([llm.rs:19](daemon/src/llm.rs#L19)); `llm_base_url` overrides any of them, so you can point the
+   client at an OpenAI-compatible gateway or at a local Ollama and keep inference on-device.
+   `validate_base_url` ([llm.rs:66](daemon/src/llm.rs#L66)) refuses plain `http` for anything that is
+   not loopback. Nothing is reachable unless a provider is configured: `get_llm_provider`
+   ([llm.rs:379](daemon/src/llm.rs#L379)) returns `None` on an empty provider, an invalid base URL,
+   or a missing key for a remote endpoint — and the default config ships empty, so the default is
+   off.
+
+   Two different calls reach it, on two different conditions:
+   - **Slot scoring** — only when `engine_mode == "llm"`
+     ([daemon.rs:762](daemon/src/daemon.rs#L762)). Payload: one line per minute of the slot with the
+     app name, the **window title**, and key/click counts.
+   - **Daily work note** — whenever a provider is configured and you have not opted out
+     (`disable_work_summaries`, [daemon.rs:454-470](daemon/src/daemon.rs#L454)). Note this is **not**
+     gated on `engine_mode`: connecting an AI is enough, by design (ADR 0019 — "setup once, then
+     invisible"). Payload: the day's activity digest (`activity_digest`,
+     [db.rs:1286](daemon/src/db.rs#L1286)) — up to 60 `"12m — App: Window title"` lines, drawn only
+     from slots that cleared the focus bar and only from minutes with real input, so an unbilled
+     personal browse never reaches the model.
+
+   Text only in both cases; no image exists to send (§3).
 
 3. **Dashboard webfont — self-hosted.** The dashboard font is embedded as a `data:` URI
    ([dashboard.rs](daemon/src/dashboard.rs)); opening the local dashboard makes **no** third-party
    requests.
 
-What the cloud receives is category- and count-level summaries plus hashes and your config — never the
-raw keystrokes, screens, or window titles behind them.
+What the cloud receives is category- and count-level summaries, hashes, your config, and — once you
+connect an AI — one or two sentences per day describing the work. It never receives the raw
+keystrokes, screens, or window titles behind any of it.
 
 ---
 
@@ -189,7 +246,7 @@ into exactly one state by a fixed priority order in
 6. **Idle** otherwise.
 
 The lists (`distracting_apps`, `productive_apps`, `meeting_apps`) are **user-configurable** and live
-in your local `config.json` ([config.rs:30-54](daemon/src/config.rs#L30)); defaults at
+in your local `config.json` ([config.rs:53-58](daemon/src/config.rs#L53)); defaults at
 [config.rs:8-18](daemon/src/config.rs#L8). Nothing is hard-coded against you.
 
 **Anti-cheat heuristics are explicit and inspectable** in [entropy.rs](daemon/src/entropy.rs) — and
@@ -206,14 +263,14 @@ and bias toward never flagging a real person:
 
 **Scoring is deterministic and forgiving of thinking time:**
 - Fixed 10-minute denominator so you can't game a 100% off one active minute
-  ([daemon.rs:562](daemon/src/daemon.rs#L562), [decisions/0006](../decisions/0006-focus-score-fixed-denominator.md)).
+  ([daemon.rs:753-754](daemon/src/daemon.rs#L753), [decisions/0006](../decisions/0006-focus-score-fixed-denominator.md)).
 - 5-minute delayed "idle forgiveness" for reading/thinking pauses at slot boundaries
-  ([daemon.rs:503-559](daemon/src/daemon.rs#L503), [decisions/0011](../decisions/0011-contextual-idle-forgiveness.md)).
+  ([daemon.rs:695-751](daemon/src/daemon.rs#L695), [decisions/0011](../decisions/0011-contextual-idle-forgiveness.md)).
 
 **The rules are locked by tests** — read these to see the intended behavior as executable spec:
-- [evaluator.rs:226-459](daemon/src/evaluator.rs#L226) — active / passive / idle / distraction / jiggler.
-- [entropy.rs:204-390](daemon/src/entropy.rs#L204) — human vs macro keyboard, human vs jiggler mouse.
-- [daemon.rs:714-1331](daemon/src/daemon.rs#L714) — full-slot aggregation, partial-slot ADR-0006,
+- [evaluator.rs:223-459](daemon/src/evaluator.rs#L223) — active / passive / idle / distraction / jiggler.
+- [entropy.rs:204-418](daemon/src/entropy.rs#L204) — human vs macro keyboard, human vs jiggler mouse.
+- [daemon.rs:908-1639](daemon/src/daemon.rs#L908) — full-slot aggregation, partial-slot ADR-0006,
   idle-forgiveness approved/rejected, and the v2 config-hash binding.
 
 Run them with `cd daemon && cargo test`.
@@ -230,7 +287,8 @@ Run them with `cd daemon && cargo test`.
   of the SQLite file breaks the chain; `verify_ledger_integrity` re-derives and compares it.
 - **The scoring rubric is bound in (v2, #62).** The payload includes a SHA-256 of the effective config
   (your auditing rules + AI auditor prompt), so a score can't be silently divorced from the rules that
-  produced it. The exact config is uploaded on change so a relying party can inspect it. Locked by
+  produced it. The exact config blob is uploaded on demand — the cloud refuses a slot naming a config
+  it does not hold, and sync backfills it then (§2) — so a relying party can always inspect it. Locked by
   `test_v2_payload_binds_config_hash` and the cross-language vector `test_v2_canonical_vector_matches_cloud`.
 - Once you enroll, each slot is also **Ed25519-signed with your key** (private key in the OS
   keychain). This closes the obvious hole in a bare hash chain: an attacker who edits a row and then
@@ -242,6 +300,49 @@ Run them with `cd daemon && cargo test`.
   counterparty who does not trust you* is out of scope for this local client and not part of this
   repository. Locked by tests in [db.rs](daemon/src/db.rs): `test_signature_defeats_the_recompute_attack`,
   `test_signed_slot_roundtrip_and_wrong_key_rejected`, `test_unsigned_row_recompute_is_not_detected`.
+
+### The work-note ledger
+
+Daily work notes (§2) are the one record type whose *text* leaves the machine, so they get the same
+construction as slots — hash-chained and, once enrolled, Ed25519-signed — on a **separate** chain, so
+a stalled note never blocks an hour from syncing or the reverse (`work_summaries` table,
+[db.rs:503](daemon/src/db.rs#L503); locked by `test_summary_chain_is_independent_of_slots`).
+
+- **The text is inside the signature.** `canonical_summary_payload`
+  ([db.rs:288](daemon/src/db.rs#L288)) folds `summary_text` to a SHA-256 and signs that, so the
+  signature covers the exact words without the signable string growing with the note. Edit the text
+  in SQLite and the row stops verifying (`test_edited_summary_text_is_detected`); recompute the hash
+  to hide the edit and the signature still fails
+  (`test_signature_defeats_summary_recompute_attack`). What lands in the cloud is therefore provably
+  the text that was signed.
+- **Lateness is visible.** `generated_at` is inside the signed payload, so what is being signed is
+  "this text described this period, and it was written at this moment". A note backdated to look
+  contemporaneous cannot be re-signed without your key.
+- **The prompt is bound in (v2).** The payload also carries the SHA-256 of the prompt that produced
+  the note (`SUMMARY_SCHEME_VERSION`, [db.rs:64](daemon/src/db.rs#L64)), and the cloud will not
+  accept a note until it holds that prompt (#147), so a reader can always see the rules behind the
+  words. That is what makes the limit in row 9 checkable rather than merely asserted — it evidences
+  the instruction, not the model's obedience to it.
+- **Corrections append, never edit.** A revision is a new row with a higher `revision` for the same
+  period (`revise_work_summary`, [db.rs:1032](daemon/src/db.rs#L1032)); the earlier revision stays in
+  the ledger and stays signed. Readers take the highest revision.
+- **Withdrawal is its own signed record, not a mutable flag.** `withdraw_work_summary`
+  ([db.rs:1144](daemon/src/db.rs#L1144)) appends a separate `kind = 'withdrawal'` row with its own
+  canonical form ([db.rs:337](daemon/src/db.rs#L337)) — period and moment only, never the text. The
+  local `withdrawn` column is deliberately **outside** the signed payload: withdrawing is a decision
+  about sharing from now on, not an assertion about the past, and the past is what a signature
+  covers. A flag on its own would be an instruction anyone could send about anyone's note; the
+  signature is what lets the cloud act on it. Locked by
+  `test_withdrawal_is_a_signed_record_on_the_same_chain` and `test_forged_withdrawal_fails_verification`.
+- `verify_summary_chain` ([db.rs:1380](daemon/src/db.rs#L1380)) walks the chain the way an auditor
+  would — every link, every hash, every signature — re-deriving each row under its own kind, so a
+  withdrawal that tried to pass as a note (or the reverse) fails there.
+- **Honest scope, same as above, plus one more limit.** This is still a ledger you sign with your own
+  key: it evidences integrity and authorship, not that the sentence is true. And withdrawal is a
+  signed *request* travelling upstream — the client can stop sending a note, and can tell the cloud
+  to stop showing one, but nothing in this repository can make a copy that has already left forget
+  it. Withdrawing inside the 12-hour window is the only case where the note demonstrably never
+  travelled (§2).
 
 ---
 
@@ -262,6 +363,17 @@ real mismatches to close:
   in-memory config *including* those secrets so the settings form can render them — an in-process
   transfer to the app you launched, not at-rest plaintext on disk.
 
+- **G3 — A work note's privacy rests on the prompt, not on a mechanism.** The daily note (§2) is
+  written from window titles by your own AI, and the only thing keeping a title, file path, URL or
+  third-party name out of it verbatim is the instruction in `default_summary_prompt`
+  ([config.rs:34](daemon/src/config.rs#L34)). There is no review step and no redaction pass:
+  `sanitize_note` ([llm.rs:102](daemon/src/llm.rs#L102)) rejects an empty or essay-length reply and
+  nothing more. Two things bound the risk without removing it — the prompt's hash is bound into the
+  signed record so a reader can see which rules were in force (§5), and the 12-hour correction window
+  means you see the note in your own dashboard before anyone else can (§2). ADR 0019 records this as
+  an accepted tradeoff rather than an oversight; an auditor should still count it as a gap, not a
+  control.
+
 ---
 
 ## How to verify
@@ -277,19 +389,33 @@ grep -rn "KeyPress" daemon/src/
 #    sync, only when enrolled). The dashboard font is inlined, so the dashboard makes no requests.
 grep -rniE "reqwest|\.post\(|\.get\(|https?://" daemon/src/
 
-# 3. What the cloud sync actually sends: inspect the upload payloads. Confirm they carry only counts,
-#    category counts, hashes (reasoning_hash, config_hash), the config blob, and signatures — never
-#    raw keystrokes or window titles.
+# 3. Every tenby10 endpoint the client can reach. §2 inventories exactly five; this must print those
+#    five and nothing more. A path listed here that §2 does not name means the egress inventory is
+#    incomplete — trust this output, not §2, and please open an issue.
+grep -rhoE "/api/v1/[a-z/]+" daemon/src/ | sort -u
+#    expect exactly: /api/v1/config  /api/v1/enroll  /api/v1/slots  /api/v1/summaries
+#                    /api/v1/summaries/withdraw
+
+# 4. What the cloud sync actually sends: inspect the upload payloads. Expect five `json!` blocks —
+#    enrollment, blob, slot, work note, withdrawal — carrying counts, category counts, hashes
+#    (reasoning_hash, config_hash, prompt_hash), the config/prompt blob, signatures, and the work
+#    note's own text. Nothing else.
 grep -n "json!" daemon/src/sync.rs
 
-# 4. No screen-capture code exists anywhere in the client (ADR 0018) — expect zero hits.
+# 5. The work note's text is the ONLY free-form string in any upload, and the only place where
+#    anything derived from a window title travels to tenby10 (rows 4 and 9). Expect three lines:
+#    `"summary_text": note.summary_text`; `llm_reasoning` wrapped in `sha256_hex_pub(...)`, never
+#    bare; and the doc comment above it. Zero hits for active_window_title. Anything else is a leak.
+grep -nE "summary_text|active_window_title|llm_reasoning" daemon/src/sync.rs
+
+# 6. No screen-capture code exists anywhere in the client (ADR 0018) — expect zero hits.
 grep -rniE "CGDisplay|BitBlt|screencapture|imageops::blur" daemon/src/ desktop/src-tauri/src/
 
-# 5. The scoring rules and their tests are all in these two files.
-sed -n '53,113p' daemon/src/evaluator.rs   # classification priority order
+# 7. The scoring rules and their tests are all in these two files.
+sed -n '114,167p' daemon/src/evaluator.rs  # classification priority order
 cargo test                                 # rules + entropy + aggregation locked by tests
 
-# 6. Secrets are NOT in config.json (G2). After enrolling, the file must contain
+# 8. Secrets are NOT in config.json (G2). After enrolling, the file must contain
 #    neither the private key nor the LLM API key value — they live in the keychain.
 grep -E '"(private_key|llm_api_key)"\s*:\s*"[^"]+"' ~/.tenby10/config.json && \
   echo "LEAK: plaintext secret found" || echo "OK: no plaintext secret in config.json"
@@ -327,4 +453,7 @@ as the source you can read above. It is a supply-chain control, not a behavioura
 ---
 
 *Maintainers: keep this file honest. When you change what is captured, what leaves the machine, or a
-scoring rule, update the relevant row here in the same PR.*
+scoring rule, update the relevant row here in the same PR. Adding an endpoint without touching §2 is
+how this guide last went stale (#84) — command 3 in "How to verify" now catches that.*
+
+*Last checked line-by-line against the code on 2026-08-19.*
