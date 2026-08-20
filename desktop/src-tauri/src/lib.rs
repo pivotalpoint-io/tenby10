@@ -493,10 +493,27 @@ async fn dashboard_work_notes(
 /// only appears to people who would actually gain something by acting on it.
 #[tauri::command]
 async fn work_notes_enabled() -> Result<bool, String> {
-    let mut config_path = daemon::env::get_app_home();
-    config_path.push("config.json");
-    let config = daemon::config::load_config(config_path).unwrap_or_default();
-    Ok(!config.disable_work_summaries && daemon::llm::get_llm_provider(&config).is_some())
+    // Off the async runtime: `get_llm_provider` builds a `reqwest::blocking::Client`,
+    // which blocks waiting on its own runtime. Doing that inside a tokio context panics
+    // the worker mid-command, and Tauri then neither resolves nor rejects the call — so
+    // the dashboard's `await invoke('work_notes_enabled')` hung forever and every render
+    // and event handler behind it never ran (#107). Only reachable with a provider
+    // configured, since `get_llm_provider` returns early before building a client.
+    tokio::task::spawn_blocking(|| {
+        let mut config_path = daemon::env::get_app_home();
+        config_path.push("config.json");
+        let config = daemon::config::load_config(config_path).unwrap_or_default();
+        // The shared predicate, not a second copy of the rule. This one had drifted: it
+        // still omitted the engine-mode gate (#96), so it answered "notes on" for a
+        // `static` install that will never receive one.
+        daemon::daemon::work_notes_enabled(
+            &config.engine_mode,
+            config.disable_work_summaries,
+            daemon::llm::get_llm_provider(&config).is_some(),
+        )
+    })
+    .await
+    .map_err(|err| format!("work-notes check panicked: {err}"))
 }
 
 /// Classified minute-by-minute activity for a single 10-minute slot.
@@ -1453,5 +1470,47 @@ mod window_geometry_tests {
 
         assert_eq!(size, (1600, 1200));
         assert_centered_inside(size, position, chrome(2.0), area_position, area_size);
+    }
+}
+
+#[cfg(test)]
+mod blocking_boundary_tests {
+    /// #107: `get_llm_provider` builds a `reqwest::blocking::Client`, which blocks
+    /// waiting on its own runtime. Constructing one on the async runtime panics the
+    /// tokio worker mid-command, and Tauri then neither resolves nor rejects the
+    /// call — so the dashboard's `await invoke('work_notes_enabled')` hung forever
+    /// and every render and handler behind it never ran.
+    ///
+    /// This asserts the safe shape rather than the bug: the probe belongs on a
+    /// blocking thread. Written as a `#[tokio::test]` on purpose — the async
+    /// context is the whole point, and the same body called directly here would
+    /// reproduce the panic.
+    ///
+    /// Uses a loopback base URL so the provider resolves without an API key and
+    /// without reading the OS keychain, which would make this test prompt or hang
+    /// depending on the machine it runs on.
+    #[tokio::test]
+    async fn test_provider_probe_runs_off_the_async_runtime() {
+        let mut config = daemon::config::AgentConfig {
+            llm_provider: "openai".to_string(),
+            llm_base_url: "http://localhost:11434/v1".to_string(),
+            ..Default::default()
+        };
+        config.engine_mode = "llm".to_string();
+
+        let enabled = tokio::task::spawn_blocking(move || {
+            daemon::daemon::work_notes_enabled(
+                &config.engine_mode,
+                config.disable_work_summaries,
+                daemon::llm::get_llm_provider(&config).is_some(),
+            )
+        })
+        .await
+        .expect("the provider probe must not panic on a blocking thread");
+
+        assert!(
+            enabled,
+            "engine llm + a loopback provider + notes not disabled means notes are on"
+        );
     }
 }
