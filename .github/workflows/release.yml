@@ -1,5 +1,12 @@
 name: Release
 
+# Third-party actions are pinned to a full commit SHA, with the human-readable
+# version in a trailing comment. A tag or branch ref can be repointed by whoever
+# controls the upstream repo; a SHA cannot. This matters most in the `publish`
+# job, which holds the Apple signing identity and a contents:write token.
+# To bump one: resolve the new SHA (`gh api repos/<owner>/<repo>/commits/<tag>
+# -q .sha`) and update both the SHA and the comment.
+
 on:
   push:
     tags:
@@ -23,14 +30,14 @@ jobs:
       run:
         working-directory: daemon
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Stage assets
         run: |
           cp desktop/src-tauri/icons_prod/128x128.png daemon/src/logo.png
           cp desktop/src-tauri/icons_prod/32x32.png daemon/src/favicon.png
         working-directory: .
       - name: Cache dependencies
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: daemon
       - name: Check Formatting
@@ -47,7 +54,7 @@ jobs:
       run:
         working-directory: desktop/src-tauri
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Stage assets
         run: |
           mkdir -p desktop/src-tauri/icons
@@ -57,7 +64,7 @@ jobs:
           cp desktop/src-tauri/icons_prod/32x32.png daemon/src/favicon.png
         working-directory: .
       - name: Cache dependencies
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: desktop/src-tauri
       - name: Check Formatting
@@ -85,10 +92,10 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: lts/*
           cache: 'npm'
@@ -98,11 +105,14 @@ jobs:
         run: npm ci
         working-directory: desktop
 
+      # Pinned to the head of the action's `stable` branch. That branch's
+      # action.yml defaults `toolchain: stable`, so pinning freezes the *action
+      # code*, not the Rust release: rustup still resolves "stable" at run time.
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable branch, 2026-08-05
 
       - name: Rust cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: |
             daemon
@@ -117,18 +127,27 @@ jobs:
           cp desktop/src-tauri/icons_prod/128x128.png daemon/src/logo.png
           cp desktop/src-tauri/icons_prod/32x32.png daemon/src/favicon.png
 
+      # The tag arrives through `env:` and is read as "$REF", so its text is
+      # never spliced into the script body. It is then checked against a strict
+      # numeric shape before being handed to jq via --arg.
       - name: Sync version from tag
         shell: bash
+        env:
+          REF: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
-          REF="${{ github.event.inputs.tag || github.ref_name }}"
-          VERSION=${REF#v}
+          set -euo pipefail
+          VERSION="${REF#v}"
           # Windows MSI builds require strictly numeric versions (no -dev or -beta suffixes allowed)
-          VERSION=${VERSION%%-*}
+          VERSION="${VERSION%%-*}"
+          if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::Tag '$REF' does not yield a MAJOR.MINOR.PATCH version (got '$VERSION')."
+            exit 1
+          fi
           echo "Syncing project files to version $VERSION"
           # Update tauri.conf.json
-          jq ".version = \"$VERSION\"" desktop/src-tauri/tauri.conf.json > tmp.json && mv tmp.json desktop/src-tauri/tauri.conf.json
+          jq --arg v "$VERSION" '.version = $v' desktop/src-tauri/tauri.conf.json > tmp.json && mv tmp.json desktop/src-tauri/tauri.conf.json
           # Update package.json
-          jq ".version = \"$VERSION\"" desktop/package.json > tmp.json && mv tmp.json desktop/package.json
+          jq --arg v "$VERSION" '.version = $v' desktop/package.json > tmp.json && mv tmp.json desktop/package.json
 
       # tauri-bundler notarizes only when APPLE_API_KEY_PATH points to the AuthKey .p8 on
       # disk; it does not consume APPLE_API_KEY_CONTENT. Materialize the key and export the
@@ -153,7 +172,7 @@ jobs:
 
       - name: Build and Publish Tauri Desktop App
         id: tauri
-        uses: tauri-apps/tauri-action@v0
+        uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0.6.2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
@@ -173,11 +192,110 @@ jobs:
           args: --verbose
 
       # Machine-verifiable link between each published artifact and the source
-      # commit + workflow that built it (issue #26). Each matrix leg attests the
-      # bundles it produced: macOS the .dmg/.app.tar.gz, Windows the .msi/.exe.
-      # Attests artifact *origin* only — it says nothing about runtime behaviour.
-      - name: Attest build provenance
-        if: steps.tauri.outputs.artifactPaths != '' && steps.tauri.outputs.artifactPaths != '[]'
-        uses: actions/attest-build-provenance@v4
+      # commit + workflow that built it (issue #26). Attests artifact *origin*
+      # only -- it says nothing about runtime behaviour.
+      #
+      # The subject set must be the files that land on the release, not the
+      # build tree (issue #91). macOS and Windows are attested separately
+      # because `artifactPaths` describes them differently:
+      #
+      #   Windows: ["...\msi\*.msi", "...\nsis\*-setup.exe"] -- two files, and
+      #            both are uploaded verbatim. Pass them straight through.
+      #   macOS:   [".../dmg/*.dmg", ".../macos/tenby10.app"] -- the second is a
+      #            *directory*. attest-build-provenance walks it and attests the
+      #            Mach-O files inside, none of which is a release asset. The
+      #            asset that ships is the updater tarball tauri-action builds
+      #            from that bundle (uploaded as tenby10_<arch>.app.tar.gz) and
+      #            it is absent from artifactPaths entirely. Glob the two
+      #            published files instead. The *.app.tar.gz pattern matches the
+      #            tarball whether or not tauri-action renamed it on disk before
+      #            upload; either way the bytes -- and so the digest that
+      #            `gh attestation verify` looks up -- are the published ones.
+      - name: Attest build provenance (macOS)
+        if: runner.os == 'macOS' && steps.tauri.outputs.artifactPaths != '' && steps.tauri.outputs.artifactPaths != '[]'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            desktop/src-tauri/target/release/bundle/dmg/*.dmg
+            desktop/src-tauri/target/release/bundle/macos/*.app.tar.gz
+
+      - name: Attest build provenance (Windows)
+        if: runner.os == 'Windows' && steps.tauri.outputs.artifactPaths != '' && steps.tauri.outputs.artifactPaths != '[]'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: ${{ join(fromJSON(steps.tauri.outputs.artifactPaths), ',') }}
+
+  # Downloads what the release actually serves and re-checks every asset with
+  # the same command a user would run. A build-side subject list can drift from
+  # the upload set without anyone noticing (that drift is issue #91); this job
+  # is the check that cannot drift, because its input is the release itself.
+  # Runs once, after both matrix legs have uploaded.
+  verify-attestations:
+    name: Verify Published Assets Are Attested
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      attestations: read
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+    steps:
+      - name: Download every published asset
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p published
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir published --clobber
+          ls -l published
+
+      - name: Verify provenance for every published asset
+        shell: bash
+        run: |
+          set -uo pipefail
+          shopt -s nullglob
+          files=(published/*)
+
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "::error::Release $TAG has no assets to verify."
+            exit 1
+          fi
+
+          {
+            echo "## Provenance verification for \`$TAG\`"
+            echo ""
+            echo "| Asset | Attestation |"
+            echo "| --- | --- |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          failed=0
+          for f in "${files[@]}"; do
+            name="$(basename "$f")"
+            ok=0
+            # The attestation is written moments earlier in the publish job, so
+            # allow for indexing lag before calling it a genuine miss.
+            for attempt in 1 2 3; do
+              if gh attestation verify "$f" --repo "$GITHUB_REPOSITORY"; then
+                ok=1
+                break
+              fi
+              if [ "$attempt" -lt 3 ]; then
+                echo "No attestation for $name yet (attempt $attempt/3); retrying in 15s."
+                sleep 15
+              fi
+            done
+            if [ "$ok" -eq 1 ]; then
+              echo "VERIFIED: $name"
+              echo "| \`$name\` | verified |" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "::error::$name is published without a valid build provenance attestation."
+              echo "| \`$name\` | **MISSING** |" >> "$GITHUB_STEP_SUMMARY"
+              failed=1
+            fi
+          done
+
+          if [ "$failed" -ne 0 ]; then
+            echo "::error::One or more published assets are not covered by a build provenance attestation."
+            exit 1
+          fi
+          echo "All ${#files[@]} published assets carry a valid attestation."
