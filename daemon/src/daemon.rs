@@ -857,7 +857,12 @@ pub fn aggregate_slot(db: &Database, config: &crate::config::AgentConfig, slot_s
                         if final_focus_score > ceiling {
                             final_focus_score = ceiling;
                         }
-                        final_reasoning = Some(reasoning);
+                        // Every built-in provider already contains its reply, so this is
+                        // the backstop, not the fix: `LlmProvider` is a public trait and
+                        // this is the last point before the text is stored and signed
+                        // (#95). `sanitize_reasoning` is idempotent, so applying it twice
+                        // costs a scan and changes nothing.
+                        final_reasoning = Some(crate::llm::sanitize_reasoning(&reasoning));
                     }
                     Err(e) => {
                         eprintln!("[LLM] Slot evaluation failed: {}", e);

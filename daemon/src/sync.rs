@@ -14,7 +14,39 @@ const DEFAULT_CLOUD_URL: &str = "https://tenby10.pivotalpoint.io";
 
 /// The portal base URL, honouring the `TENBY10_CLOUD_URL` override.
 pub fn cloud_base_url() -> String {
-    std::env::var("TENBY10_CLOUD_URL").unwrap_or_else(|_| DEFAULT_CLOUD_URL.to_string())
+    resolve_cloud_base_url(std::env::var("TENBY10_CLOUD_URL").ok().as_deref())
+}
+
+/// Pure form of [`cloud_base_url`], so the fallback is testable without mutating process
+/// environment from a test (the same shape as `env::debug_http_enabled_from`).
+///
+/// The override runs through [`crate::llm::validate_base_url`] — the check already written
+/// for the LLM endpoint, reused rather than rewritten, because the two carry the same class
+/// of data. What goes to this URL is signed slots, work-note prose and, at enrollment, the
+/// pairing token, so it gets the same rule: https everywhere, plain http only for loopback.
+/// Loopback matters — running the portal locally against `http://localhost:3000` is how cloud
+/// development works, and that stays exactly as it was.
+///
+/// Setting an environment variable already implies code execution as this user, so this is a
+/// guard rail rather than a boundary: it catches a stale export or a typo'd host, not an
+/// attacker who is already inside. A rejected value falls back to production instead of
+/// failing the sync, because refusing to run would be a worse answer than uploading to the
+/// place the records were always meant to go — but it says so loudly, since a developer who
+/// set the variable on purpose needs to know it was ignored.
+fn resolve_cloud_base_url(override_value: Option<&str>) -> String {
+    let Some(raw) = override_value.map(str::trim).filter(|v| !v.is_empty()) else {
+        return DEFAULT_CLOUD_URL.to_string();
+    };
+    match crate::llm::validate_base_url(raw) {
+        Ok(()) => raw.to_string(),
+        Err(err) => {
+            eprintln!(
+                "[WARN] Ignoring TENBY10_CLOUD_URL={raw}: {err}. Signed slots, work notes and \
+                 the enrollment token travel to this URL. Using {DEFAULT_CLOUD_URL} instead."
+            );
+            DEFAULT_CLOUD_URL.to_string()
+        }
+    }
 }
 
 /// Exchange the pairing token + hex public key for the cloud agent id.
@@ -267,4 +299,51 @@ pub fn sync_work_summaries(
         uploaded += 1;
     }
     Ok(uploaded)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cloud_url_override_is_validated_before_it_is_used() {
+        // Unset, or set to nothing, is production.
+        assert_eq!(resolve_cloud_base_url(None), DEFAULT_CLOUD_URL);
+        assert_eq!(resolve_cloud_base_url(Some("   ")), DEFAULT_CLOUD_URL);
+
+        // A real override still works, whitespace and all.
+        assert_eq!(
+            resolve_cloud_base_url(Some("  https://staging.example.com  ")),
+            "https://staging.example.com"
+        );
+
+        // Local cloud development runs the portal on loopback over plain http. That is
+        // the workflow this must not break, and it is the one place http is safe.
+        assert_eq!(
+            resolve_cloud_base_url(Some("http://localhost:3000")),
+            "http://localhost:3000"
+        );
+        assert_eq!(
+            resolve_cloud_base_url(Some("http://127.0.0.1:3000")),
+            "http://127.0.0.1:3000"
+        );
+
+        // Everything else falls back to production rather than sending signed slots,
+        // work notes and the enrollment token somewhere else — in the clear, for the
+        // http cases.
+        assert_eq!(
+            resolve_cloud_base_url(Some("http://cloud.example.com")),
+            DEFAULT_CLOUD_URL
+        );
+        assert_eq!(
+            resolve_cloud_base_url(Some("ftp://cloud.example.com")),
+            DEFAULT_CLOUD_URL
+        );
+        assert_eq!(resolve_cloud_base_url(Some("not a url")), DEFAULT_CLOUD_URL);
+        // A hostname that merely starts with "localhost" is a remote host.
+        assert_eq!(
+            resolve_cloud_base_url(Some("http://localhost.example.com")),
+            DEFAULT_CLOUD_URL
+        );
+    }
 }
