@@ -34,6 +34,12 @@ function goHome() {
         // an AI configured the log still shows hours, categories and rules.
         let workNotes = {};
         let workNotesEnabled = false;
+        // Whether the AI engine itself is on. Since #96 the engine switch decides
+        // whether the AI runs at all, notes included, so "AI configured" is no longer
+        // enough to know a note is coming. Tracked separately because the
+        // work_notes_enabled command does not account for the engine yet; when it
+        // does, this can go and workNotesEnabled alone will be right again.
+        let aiEngineOn = false;
 
         function dateKeyOf(unixSeconds) {
             const d = new Date(unixSeconds * 1000);
@@ -46,6 +52,10 @@ function goHome() {
         async function fetchWorkNotes() {
             try {
                 workNotesEnabled = await invoke('work_notes_enabled');
+                // Only the engine mode is read here; the rest of the config is dropped
+                // on the next line and nothing else is kept.
+                const engineMode = (await invoke('get_agent_config')).engine_mode;
+                aiEngineOn = engineMode === 'llm';
                 // One fetch covers every view; the volume is one row per worked day.
                 const notes = await invoke('dashboard_work_notes', { from: 0, to: 4102444800 });
                 workNotes = {};
@@ -82,6 +92,17 @@ function goHome() {
                     <div class="work-note-card work-note-empty">
                         <p class="work-note-text">Connect your own AI in Settings and tenby10 writes a short note of each day's work, in plain words.</p>
                         <span class="work-note-meta">Without it, your log shows hours and categories only.</span>
+                    </div>
+                `;
+            }
+            // An AI is connected and notes are switched on, but the engine is off, so
+            // no note is coming (#96). Anyone who was getting notes with the engine on
+            // static stops after this change; a blank space would leave them guessing.
+            if (!aiEngineOn) {
+                return `
+                    <div class="work-note-card work-note-empty">
+                        <p class="work-note-text">Your AI is connected, but the AI Auditor is switched off, so no note is written for this day.</p>
+                        <span class="work-note-meta">Turn the AI Auditor on in Settings to start notes again. Your hours and categories are unaffected.</span>
                     </div>
                 `;
             }
