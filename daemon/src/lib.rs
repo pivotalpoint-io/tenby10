@@ -9,3 +9,4 @@ pub mod llm;
 pub mod provenance;
 pub mod sync;
 pub mod sys_state;
+pub mod untrusted;

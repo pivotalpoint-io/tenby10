@@ -17,31 +17,52 @@ pub fn default_meeting_apps() -> String {
     "zoom, meet, teams, webex, slack | huddle".to_string()
 }
 
+/// Prompt for the slot auditor.
+///
+/// Carries [`crate::untrusted::PROMPT_RULE`] (#83): the activity log is built from
+/// window titles, which the focused application writes, so the prompt has to say
+/// what the fence markers around them mean. A user who replaces this prompt
+/// wholesale drops that sentence — the fence, the storage cap and the note echo
+/// check do not depend on it, but the model's instruction to ignore what is inside
+/// the fence does.
 pub fn default_llm_prompt() -> String {
-    "You are an AI productivity auditor. \
-    Review the following 10-minute activity log (containing apps, window titles, keystrokes, and clicks). \
-    Evaluate the user's focus on a scale of 0 to 100. \
-    - Engineering, designing, writing, and active research are highly productive (80-100). \
-    - Social media, entertainment, and casual browsing are distracted (0-30). \
-    - A meeting with genuine engagement (e.g. Zoom, Teams) is productive; do NOT grant full focus to a completely inactive window merely because its title mentions a meeting app. \
-    Output ONLY a JSON object with two fields: 'score' (integer) and 'reasoning' (1-2 sentences).".to_string()
+    format!(
+        "You are an AI productivity auditor. \
+        Review the following 10-minute activity log (containing apps, window titles, keystrokes, and clicks). \
+        Evaluate the user's focus on a scale of 0 to 100. \
+        - Engineering, designing, writing, and active research are highly productive (80-100). \
+        - Social media, entertainment, and casual browsing are distracted (0-30). \
+        - A meeting with genuine engagement (e.g. Zoom, Teams) is productive; do NOT grant full focus to a completely inactive window merely because its title mentions a meeting app. \
+        {} \
+        Output ONLY a JSON object with two fields: 'score' (integer) and 'reasoning' (1-2 sentences).",
+        crate::untrusted::PROMPT_RULE
+    )
 }
 
 /// Prompt for the daily work note (ADR 0019). Unlike the scoring prompt, whatever this
 /// produces is meant to be read by the client, so the constraints are the privacy
 /// mechanism: describe the task, never the window title, never a third party. There is
-/// no review step before it publishes, so the prompt is what keeps the note safe.
+/// no review step before it publishes, so the prompt is most of what keeps the note safe.
+///
+/// Most, not all: the no-quoting rule is also checked in code before a note is signed
+/// (#83, [`crate::untrusted::note_quotes_a_title`]), because a rule a client's privacy
+/// depends on should not rest on a model choosing to follow it. The prompt says so, so
+/// the model knows a quoted title costs the note rather than passing unnoticed.
 pub fn default_summary_prompt() -> String {
-    "You are writing a short work note that a client will read next to an invoice. \
-    From the activity log below (apps and window titles), write one or two sentences \
-    describing what was worked on, in plain professional language. \
-    - Describe the task, not the tools: \"reworked the checkout flow\", not \"was in VSCode\". \
-    - Never quote a window title, file path, or URL. \
-    - Never name a person, company, or any third party. \
-    - Do not mention hours, focus scores, or productivity. \
-    - If the activity is too unclear to describe honestly, say that plainly instead of guessing. \
-    Output ONLY the sentences, with no preamble."
-        .to_string()
+    format!(
+        "You are writing a short work note that a client will read next to an invoice. \
+        From the activity log below (apps and window titles), write one or two sentences \
+        describing what was worked on, in plain professional language. \
+        - Describe the task, not the tools: \"reworked the checkout flow\", not \"was in VSCode\". \
+        - Never quote a window title, file path, or URL. A note that reproduces one is \
+        discarded unread and the day is left without a note. \
+        - Never name a person, company, or any third party. \
+        - Do not mention hours, focus scores, or productivity. \
+        - If the activity is too unclear to describe honestly, say that plainly instead of guessing. \
+        {} \
+        Output ONLY the sentences, with no preamble.",
+        crate::untrusted::PROMPT_RULE
+    )
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -762,6 +783,26 @@ mod tests {
         );
 
         let _ = fs::remove_file(&path);
+    }
+
+    /// Both defaults tell the model what the fence markers mean, and both still fit
+    /// under the ceiling that keeps a record's blob uploadable (#83). The second half
+    /// matters as much as the first: a prompt the cloud would refuse stalls the chain
+    /// that carries it, so growing the defaults has a hard limit.
+    #[test]
+    fn test_default_prompts_carry_the_untrusted_data_rule() {
+        for prompt in [default_llm_prompt(), default_summary_prompt()] {
+            assert!(
+                prompt.contains(crate::untrusted::FENCE_OPEN)
+                    && prompt.contains(crate::untrusted::FENCE_CLOSE),
+                "a default prompt must name both markers: {prompt}"
+            );
+            assert!(validate_prompt("Prompt", &prompt).is_ok());
+        }
+        assert!(
+            AgentConfig::default().validate().is_ok(),
+            "the shipped defaults must produce an uploadable blob"
+        );
     }
 
     #[test]
