@@ -33,13 +33,13 @@ auditable; the cloud portal is not part of this repository.
 |---|-------|--------|------------------|
 | 1 | No key **content** is captured (not a keylogger) | ✅ Verified in code | [daemon.rs:246](daemon/src/daemon.rs#L246) — `KeyPress(_)` discards the key value |
 | 2 | Only counts/metadata are stored per minute | ✅ Verified | [daemon.rs:414](daemon/src/daemon.rs#L414), [db.rs schema](daemon/src/db.rs) |
-| 3 | No screen capture exists at all | ✅ Verified | No capture code in the client — `grep -rn "CGDisplay\|BitBlt\|screencapture" daemon/src/` returns nothing (ADR 0018) |
+| 3 | No screen capture exists at all | ✅ Verified | No capture code in the client (ADR 0018) — §3 has the grep and names the two lookalike symbols it deliberately excludes |
 | 4 | Raw keystrokes never leave the machine; **raw** window titles never reach tenby10 | ⚠️ Verified, but narrowed on 2026-08-14 | Still true of raw titles: no upload payload has a title field ([sync.rs:85](daemon/src/sync.rs#L85), [sync.rs:168](daemon/src/sync.rs#L168), [sync.rs:185](daemon/src/sync.rs#L185)). What changed: a title-*derived* sentence now does reach tenby10, in the daily work note (§2) — row 9 is what constrains it. Raw titles still go only to your own BYOK provider (row 5) |
-| 5 | Cloud sync (when enrolled) is count/category summaries + hashes + config + your daily work notes; your BYOK provider is the only other destination | ✅ Verified, scope corrected | Five endpoints, all inventoried in §2 — [sync.rs](daemon/src/sync.rs). BYOK calls live in [llm.rs](daemon/src/llm.rs), reached from slot scoring ([daemon.rs:762](daemon/src/daemon.rs#L762)) and from note writing ([daemon.rs:454](daemon/src/daemon.rs#L454)) |
+| 5 | Cloud sync (when enrolled) is count/category summaries + hashes + config + your daily work notes; your BYOK provider is the only other destination | ✅ Verified, scope corrected | Five endpoints, all inventoried in §2 — [sync.rs](daemon/src/sync.rs). BYOK calls live in [llm.rs](daemon/src/llm.rs), reached from slot scoring ([daemon.rs:794](daemon/src/daemon.rs#L794)) and from note writing ([daemon.rs:454](daemon/src/daemon.rs#L454)) |
 | 6 | No image is sent to your LLM provider, ever | ✅ Verified structurally | The provider trait takes text only ([llm.rs](daemon/src/llm.rs)); nothing in the client can produce an image to send |
 | 7 | Focus-scoring rules are deterministic and inspectable | ✅ Verified | [evaluator.rs](daemon/src/evaluator.rs), [entropy.rs](daemon/src/entropy.rs) |
 | 8 | Local logs are tamper-evident (full-payload hash chain) + self-signed when enrolled | ✅ Verified | [db.rs `insert_slot_summary`/`verify_ledger_integrity`](daemon/src/db.rs) — work notes have their own chain, same construction (§5) |
-| 9 | Your daily work note describes the task, not the window title | ⚠️ Prompt-enforced, not mechanism-enforced | The default prompt ([config.rs:34](daemon/src/config.rs#L34)) tells the model never to quote a window title, file path, URL, or third-party name. Nothing inspects the sentence afterwards: `sanitize_note` ([llm.rs:102](daemon/src/llm.rs#L102)) rejects empty or essay-length replies, not leaked content. The prompt's SHA-256 is bound into the signed record so a reader can check which rules applied — that is evidence of the rule, not proof the model obeyed it |
+| 9 | Your daily work note describes the task, not the window title | ⚠️ Prompt-enforced, not mechanism-enforced | The default prompt ([config.rs:51](daemon/src/config.rs#L51)) tells the model never to quote a window title, file path, URL, or third-party name. Nothing inspects the sentence afterwards: `sanitize_note` ([llm.rs:108](daemon/src/llm.rs#L108)) rejects empty or essay-length replies, not leaked content. The prompt's SHA-256 is bound into the signed record so a reader can check which rules applied — that is evidence of the rule, not proof the model obeyed it |
 | — | Secrets stored in OS keychain | ✅ Verified | [config.rs `save_config`/`load_config`](daemon/src/config.rs) — `private_key` & `llm_api_key` kept in the OS keychain via the `keyring` crate |
 | — | Local dashboard makes no third-party calls | ✅ Verified | [dashboard.rs](daemon/src/dashboard.rs) — Outfit font embedded as a data URI; no CDN `<link>` |
 | — | The installed app opens **no listening port** | ✅ Verified | The dashboard renders in-app over Tauri IPC. The loopback HTTP server is a debug-only escape hatch for the standalone `daemon` binary, off unless `TENBY10_DEBUG_HTTP` is set — [env.rs `debug_http_enabled`](daemon/src/env.rs) |
@@ -112,7 +112,7 @@ Nothing leaves the machine until you **enroll** and sync. The complete list of o
 1. **tenby10 cloud sync — only when enrolled.** Once you pair a device,
    [sync.rs](daemon/src/sync.rs) uploads to the tenby10 cloud (`cloud_base_url()`,
    [sync.rs:16](daemon/src/sync.rs#L16), default `https://tenby10.pivotalpoint.io`). This is reached
-   only when `config.agent_id` is set ([daemon.rs:885](daemon/src/daemon.rs#L885)). **Five** requests
+   only when `config.agent_id` is set ([daemon.rs:923](daemon/src/daemon.rs#L923)). **Five** requests
    exist, and nothing else:
    - **Enrollment** (`enroll_with_cloud`, [sync.rs:22](daemon/src/sync.rs#L22), `POST /api/v1/enroll`):
      your pairing token and **public** key. The private key is generated locally and never leaves the
@@ -146,7 +146,7 @@ Nothing leaves the machine until you **enroll** and sync. The complete list of o
    **Timing, and how a note can be stopped.** A note does not go up when it is written. It waits out
    a 12-hour correction window (`SUMMARY_CORRECTION_WINDOW_SECS`,
    [sync.rs:166](daemon/src/sync.rs#L166)) on your machine, visible in your own dashboard first:
-   `get_unsynced_summaries` ([db.rs:1316](daemon/src/db.rs#L1316)) will not return a note until
+   `get_unsynced_summaries` ([db.rs:1355](daemon/src/db.rs#L1355)) will not return a note until
    `generated_at` is older than that. **Withdraw it before the window closes and it never travels at
    all** — the same query drops withdrawn notes. Withdrawal *records* are exempt from the wait and
    upload immediately, because taking something back is useless if it queues. Unsigned rows are never
@@ -164,19 +164,19 @@ Nothing leaves the machine until you **enroll** and sync. The complete list of o
    client at an OpenAI-compatible gateway or at a local Ollama and keep inference on-device.
    `validate_base_url` ([llm.rs:66](daemon/src/llm.rs#L66)) refuses plain `http` for anything that is
    not loopback. Nothing is reachable unless a provider is configured: `get_llm_provider`
-   ([llm.rs:379](daemon/src/llm.rs#L379)) returns `None` on an empty provider, an invalid base URL,
+   ([llm.rs:398](daemon/src/llm.rs#L398)) returns `None` on an empty provider, an invalid base URL,
    or a missing key for a remote endpoint — and the default config ships empty, so the default is
    off.
 
    Two different calls reach it, on two different conditions:
    - **Slot scoring** — only when `engine_mode == "llm"`
-     ([daemon.rs:762](daemon/src/daemon.rs#L762)). Payload: one line per minute of the slot with the
+     ([daemon.rs:794](daemon/src/daemon.rs#L794)). Payload: one line per minute of the slot with the
      app name, the **window title**, and key/click counts.
    - **Daily work note** — whenever a provider is configured and you have not opted out
      (`disable_work_summaries`, [daemon.rs:454-470](daemon/src/daemon.rs#L454)). Note this is **not**
      gated on `engine_mode`: connecting an AI is enough, by design (ADR 0019 — "setup once, then
      invisible"). Payload: the day's activity digest (`activity_digest`,
-     [db.rs:1286](daemon/src/db.rs#L1286)) — up to 60 `"12m — App: Window title"` lines, drawn only
+     [db.rs:1308](daemon/src/db.rs#L1308)) — up to 60 `"12m — App: Window title"` lines, drawn only
      from slots that cleared the focus bar and only from minutes with real input, so an unbilled
      personal browse never reaches the model.
 
@@ -200,7 +200,17 @@ the client, so there is nothing to enable, misconfigure, or push down from a man
 Verify it yourself; all three return nothing:
 
 ```bash
-grep -rniE "CGDisplay|CGWindowListCreateImage|BitBlt|GetDIBits|screencapture" daemon/src/ desktop/src-tauri/src/
+# Capture APIs, case-sensitively. Two symbols look like capture and are not, so a looser
+# pattern reports hits and reads like a caught lie — run the second grep and read all five
+# lines it returns rather than taking this on trust:
+#   CGDisplayIsAsleep            (sys_state.rs)  asks whether the screen is powered off, so the
+#                                                daemon can skip that minute. Reads no pixels.
+#   CGPreflightScreenCaptureAccess, Privacy_ScreenCapture  (platform/macos.rs)  ask whether the
+#                                                Screen Recording permission was granted, and
+#                                                open the pane where you grant it. macOS
+#                                                withholds *window titles* without it (§1).
+grep -rnE "CGDisplayCreateImage|CGWindowListCreateImage|CGDisplayStream|BitBlt|GetDIBits|screencapture|imageops" daemon/src/ desktop/src-tauri/src/
+grep -rniE "CGDisplay|ScreenCapture" daemon/src/ desktop/src-tauri/src/   # the five benign lines
 grep -rn "image" daemon/Cargo.toml         # no imaging crate is even a dependency
 ls ~/.tenby10/screenshots 2>/dev/null      # removed on upgrade; never recreated
 ```
@@ -246,7 +256,7 @@ into exactly one state by a fixed priority order in
 6. **Idle** otherwise.
 
 The lists (`distracting_apps`, `productive_apps`, `meeting_apps`) are **user-configurable** and live
-in your local `config.json` ([config.rs:53-58](daemon/src/config.rs#L53)); defaults at
+in your local `config.json` ([config.rs:74-100](daemon/src/config.rs#L74)); defaults at
 [config.rs:8-18](daemon/src/config.rs#L8). Nothing is hard-coded against you.
 
 **Anti-cheat heuristics are explicit and inspectable** in [entropy.rs](daemon/src/entropy.rs) — and
@@ -263,14 +273,14 @@ and bias toward never flagging a real person:
 
 **Scoring is deterministic and forgiving of thinking time:**
 - Fixed 10-minute denominator so you can't game a 100% off one active minute
-  ([daemon.rs:753-754](daemon/src/daemon.rs#L753), [decisions/0006](../decisions/0006-focus-score-fixed-denominator.md)).
+  ([daemon.rs:785-786](daemon/src/daemon.rs#L785), [decisions/0006](../decisions/0006-focus-score-fixed-denominator.md)).
 - 5-minute delayed "idle forgiveness" for reading/thinking pauses at slot boundaries
-  ([daemon.rs:695-751](daemon/src/daemon.rs#L695), [decisions/0011](../decisions/0011-contextual-idle-forgiveness.md)).
+  ([daemon.rs:727-783](daemon/src/daemon.rs#L727), [decisions/0011](../decisions/0011-contextual-idle-forgiveness.md)).
 
 **The rules are locked by tests** — read these to see the intended behavior as executable spec:
 - [evaluator.rs:223-459](daemon/src/evaluator.rs#L223) — active / passive / idle / distraction / jiggler.
 - [entropy.rs:204-418](daemon/src/entropy.rs#L204) — human vs macro keyboard, human vs jiggler mouse.
-- [daemon.rs:908-1639](daemon/src/daemon.rs#L908) — full-slot aggregation, partial-slot ADR-0006,
+- [daemon.rs:946-1677](daemon/src/daemon.rs#L946) — full-slot aggregation, partial-slot ADR-0006,
   idle-forgiveness approved/rejected, and the v2 config-hash binding.
 
 Run them with `cd daemon && cargo test`.
@@ -324,17 +334,17 @@ a stalled note never blocks an hour from syncing or the reverse (`work_summaries
   words. That is what makes the limit in row 9 checkable rather than merely asserted — it evidences
   the instruction, not the model's obedience to it.
 - **Corrections append, never edit.** A revision is a new row with a higher `revision` for the same
-  period (`revise_work_summary`, [db.rs:1032](daemon/src/db.rs#L1032)); the earlier revision stays in
+  period (`revise_work_summary`, [db.rs:1048](daemon/src/db.rs#L1048)); the earlier revision stays in
   the ledger and stays signed. Readers take the highest revision.
 - **Withdrawal is its own signed record, not a mutable flag.** `withdraw_work_summary`
-  ([db.rs:1144](daemon/src/db.rs#L1144)) appends a separate `kind = 'withdrawal'` row with its own
+  ([db.rs:1160](daemon/src/db.rs#L1160)) appends a separate `kind = 'withdrawal'` row with its own
   canonical form ([db.rs:337](daemon/src/db.rs#L337)) — period and moment only, never the text. The
   local `withdrawn` column is deliberately **outside** the signed payload: withdrawing is a decision
   about sharing from now on, not an assertion about the past, and the past is what a signature
   covers. A flag on its own would be an instruction anyone could send about anyone's note; the
   signature is what lets the cloud act on it. Locked by
   `test_withdrawal_is_a_signed_record_on_the_same_chain` and `test_forged_withdrawal_fails_verification`.
-- `verify_summary_chain` ([db.rs:1380](daemon/src/db.rs#L1380)) walks the chain the way an auditor
+- `verify_summary_chain` ([db.rs:1419](daemon/src/db.rs#L1419)) walks the chain the way an auditor
   would — every link, every hash, every signature — re-deriving each row under its own kind, so a
   withdrawal that tried to pass as a note (or the reverse) fails there.
 - **Honest scope, same as above, plus one more limit.** This is still a ledger you sign with your own
@@ -363,16 +373,22 @@ real mismatches to close:
   in-memory config *including* those secrets so the settings form can render them — an in-process
   transfer to the app you launched, not at-rest plaintext on disk.
 
-- **G3 — A work note's privacy rests on the prompt, not on a mechanism.** The daily note (§2) is
-  written from window titles by your own AI, and the only thing keeping a title, file path, URL or
-  third-party name out of it verbatim is the instruction in `default_summary_prompt`
-  ([config.rs:34](daemon/src/config.rs#L34)). There is no review step and no redaction pass:
-  `sanitize_note` ([llm.rs:102](daemon/src/llm.rs#L102)) rejects an empty or essay-length reply and
-  nothing more. Two things bound the risk without removing it — the prompt's hash is bound into the
-  signed record so a reader can see which rules were in force (§5), and the 12-hour correction window
-  means you see the note in your own dashboard before anyone else can (§2). ADR 0019 records this as
-  an accepted tradeoff rather than an oversight; an auditor should still count it as a gap, not a
-  control.
+- **G3 — NARROWED (#83).** A work note (§2) is written from window titles by your own AI, and this
+  used to rest entirely on `default_summary_prompt` asking the model not to quote one
+  ([config.rs:51](daemon/src/config.rs#L51)) — a model behaviour, not a mechanism. Two mechanisms now
+  sit under it. Captured text is wrapped in explicit untrusted-data markers before it reaches either
+  prompt, and the daemon refuses to sign a note that reproduces a run of any window title from the
+  period ([untrusted.rs](daemon/src/untrusted.rs)); a refused note is simply left unwritten, the same
+  honest failure as the AI being unreachable. `sanitize_note` ([llm.rs](daemon/src/llm.rs)) also now
+  rejects a reply carrying those markers back.
+
+  What remains a gap: the echo check catches a verbatim run, not a paraphrase, so a model that
+  *describes* a client's name rather than quoting a title can still put it in the note. The markers
+  are a strong instruction to a model, not a guarantee — this client is source-available, so the
+  marker text is public. Two things still bound the rest: the prompt's hash is bound into the signed
+  record so a reader can see which rules were in force (§5), and the 12-hour correction window means
+  you see the note in your own dashboard before anyone else can (§2). Count it as narrowed, not
+  closed.
 
 ---
 
@@ -409,7 +425,10 @@ grep -n "json!" daemon/src/sync.rs
 grep -nE "summary_text|active_window_title|llm_reasoning" daemon/src/sync.rs
 
 # 6. No screen-capture code exists anywhere in the client (ADR 0018) — expect zero hits.
-grep -rniE "CGDisplay|BitBlt|screencapture|imageops::blur" daemon/src/ desktop/src-tauri/src/
+#    Case-sensitive, and matching capture APIs only. A looser pattern also catches the display
+#    sleep check and the Screen Recording *permission* preflight, neither of which reads a
+#    pixel — §3 names all five lines and explains why they are there.
+grep -rnE "CGDisplayCreateImage|CGWindowListCreateImage|CGDisplayStream|BitBlt|GetDIBits|screencapture|imageops" daemon/src/ desktop/src-tauri/src/
 
 # 7. The scoring rules and their tests are all in these two files.
 sed -n '114,167p' daemon/src/evaluator.rs  # classification priority order
