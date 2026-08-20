@@ -5,7 +5,13 @@ edition = "2024"
 
 [dependencies]
 rusqlite = { version = "0.40", features = ["bundled"] }
-rdev = { git = "https://github.com/fufesou/rdev" }
+# rdev installs the global keyboard/mouse hooks, so it is the single most
+# security-sensitive dependency in the tree: a personal fork, not on crates.io.
+# It MUST stay pinned to an exact commit. Without `rev` the manifest resolves to
+# whatever that fork's default branch holds whenever a lockfile is regenerated,
+# and the two workspaces had already drifted apart on exactly that (issue #93).
+# Changing this SHA is a review-worthy change on its own; do not bump it casually.
+rdev = { git = "https://github.com/fufesou/rdev", rev = "23e24dd6b35452a495dae0ae6d99395e9755ab0f" }
 chrono = "0.4"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

@@ -75,6 +75,23 @@ Releases are tag-driven and fully automated:
 
 ## 4. Local Development & Testing
 
+### First, once per clone: stage the icons
+
+`desktop/src-tauri/icons/` is gitignored. The desktop crate `include_bytes!`s several
+files out of it, so in a fresh clone (or a fresh `git worktree`) the desktop build fails
+with a confusing "no such file" compile error until the directory is populated.
+
+Run this once from the repo root:
+
+```bash
+mkdir -p desktop/src-tauri/icons && cp -r desktop/src-tauri/icons_prod/. desktop/src-tauri/icons/
+```
+
+`scripts/dev.sh` and `scripts/prod.sh` also stage the icons, but they launch the app
+straight afterwards, so they are not a substitute if you only want to build or commit.
+The `pre-commit` hook checks for the icons first and prints the command above if they
+are missing, rather than letting you hit the compile error.
+
 Before committing your code, please verify that your changes build and pass all local tests.
 
 ### Telemetry Daemon (Rust)
@@ -99,3 +116,32 @@ npm install
 # Run the Tauri app tests
 cd src-tauri && cargo test
 ```
+
+### Dependency advisories
+
+The `Advisories` workflow runs `cargo audit` over both lockfiles on every PR, nightly
+against `main`, and fails the build on a vulnerability or an unsoundness advisory. To
+reproduce it locally:
+
+```bash
+cargo install cargo-audit --locked
+cargo audit --file daemon/Cargo.lock
+cargo audit --file desktop/src-tauri/Cargo.lock
+```
+
+Fix a hit with a **targeted** update in the affected workspace, e.g. `cargo update -p h2`.
+Avoid a bare `cargo update`: it re-resolves hundreds of unrelated crates and makes the
+lockfile diff unreviewable.
+
+Two things the gate deliberately does not block on, both reported on every run and never
+suppressed silently:
+
+* `unmaintained` advisories, which by definition have no fixed version to move to. Ours
+  are the Linux-only GTK3 stack that Tauri pulls in and which never compiles into a macOS
+  or Windows artifact.
+* Anything on the explicit ignore list in `.github/workflows/audit.yml`. Each entry
+  carries a written reason and is reviewed like any other diff.
+
+The `rdev` dependency is pinned to an exact commit in `daemon/Cargo.toml`. It installs the
+global keyboard and mouse hooks and lives on a personal fork rather than crates.io, so
+changing that SHA is a security-relevant change and belongs in its own PR.

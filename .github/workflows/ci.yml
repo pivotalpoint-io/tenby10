@@ -6,6 +6,11 @@ on:
   pull_request:
     branches: [ "main" ]
 
+# This workflow only reads the tree: fmt, clippy and tests. It writes nothing
+# back to the repo, so it does not need the repo's default token grant.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
