@@ -602,7 +602,7 @@ function goHome() {
                     tooltipStr = `${hourStr} - Idle`;
                 }
                 
-                return `<div class="heatmap-cell" onclick="document.getElementById('hour-row-${currentDateKey}-${hour}').scrollIntoView({behavior: 'smooth'})" style="cursor:pointer; display:flex; gap:2px; padding:3px;" data-tooltip="${tooltipStr}">
+                return `<div class="heatmap-cell" data-scroll-to="hour-row-${currentDateKey}-${hour}" style="cursor:pointer; display:flex; gap:2px; padding:3px;" data-tooltip="${tooltipStr}">
                     ${sliversHtml}
                 </div>`;
             }).join('');
@@ -668,7 +668,7 @@ function goHome() {
                                     <div class="slot-compact-stats">
                                         ${statsHtml}
                                     </div>
-                                    <button class="view-slot-compact-btn" onclick="showSlotDetails(${slot.slot_start}, event)">
+                                    <button type="button" class="view-slot-compact-btn" data-slot-start="${slot.slot_start}">
                                         📋 Details
                                     </button>
                                 </div>
@@ -931,7 +931,7 @@ function goHome() {
             }
             
             return `
-                <div class="month-day-cell ${colorClass}" onclick="switchView('daily'); navigateToDate('${dateKey}');">
+                <div class="month-day-cell ${colorClass}" data-goto-date="${dateKey}">
                     <div class="month-day-header">
                         <span>${headerText}</span>
                         <span style="color: var(--text-main);">${dayNum}</span>
@@ -1074,6 +1074,69 @@ function goHome() {
         }
 
 
+
+        // --- Control wiring ---
+        //
+        // The app runs under script-src 'self' (see tauri.conf.json), which blocks
+        // inline on* handlers and javascript: URLs. Everything this document reacts
+        // to is therefore bound here instead. Nothing about the behaviour changed —
+        // the same functions run on the same events.
+
+        function on(id, event, handler) {
+            const el = document.getElementById(id);
+            if (el) el.addEventListener(event, handler);
+        }
+
+        document.querySelectorAll('.view-tab[data-view]').forEach(tab => {
+            tab.addEventListener('click', () => switchView(tab.getAttribute('data-view')));
+        });
+
+        on('prev-day-btn', 'click', prevDay);
+        on('next-day-btn', 'click', nextDay);
+        on('week-start-select', 'change', (e) => updateWeekStart(e.target.value));
+        on('date-picker', 'change', (e) => datePickerChanged(e.target));
+        on('today-btn', 'click', (e) => {
+            // An <a> rather than a button, so keep it from adding a #fragment.
+            e.preventDefault();
+            navigateToToday();
+        });
+
+        on('export-open-btn', 'click', openExportModal);
+        on('export-dialog-close', 'click', closeExportModal);
+        on('export-btn', 'click', exportCsv);
+        on('export-range', 'change', (e) => {
+            const custom = document.getElementById('custom-range-inputs');
+            if (custom) custom.style.display = e.target.value === 'custom' ? 'flex' : 'none';
+        });
+
+        on('slot-dialog-close', 'click', closeSlotDialog);
+
+        // The day/week/month grids are re-rendered from scratch on every poll, so the
+        // cells they contain declare what they do in data-* attributes and one
+        // delegated listener carries it out. Nothing to rebind after a re-render.
+        document.addEventListener('click', (event) => {
+            const target = event.target;
+            if (!(target instanceof Element)) return;
+
+            const scroller = target.closest('[data-scroll-to]');
+            if (scroller) {
+                const row = document.getElementById(scroller.getAttribute('data-scroll-to'));
+                if (row) row.scrollIntoView({ behavior: 'smooth' });
+                return;
+            }
+
+            const slotButton = target.closest('[data-slot-start]');
+            if (slotButton) {
+                showSlotDetails(Number(slotButton.getAttribute('data-slot-start')), event);
+                return;
+            }
+
+            const dayCell = target.closest('[data-goto-date]');
+            if (dayCell) {
+                switchView('daily');
+                navigateToDate(dayCell.getAttribute('data-goto-date'));
+            }
+        });
 
         // When embedded in the app window (iframe), add a Back control to the
         // header that returns to the metrics home. Standalone, this is skipped.

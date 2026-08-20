@@ -548,12 +548,167 @@ async fn export_dashboard_csv(
     Ok(Some(path.to_string_lossy().to_string()))
 }
 
-#[tauri::command]
-async fn get_agent_config() -> Result<daemon::config::AgentConfig, String> {
-    let app_home = daemon::env::get_app_home();
-    let mut config_path = app_home.clone();
+/// Everything the settings form needs to render itself — and nothing else.
+///
+/// The Ed25519 signing key is deliberately absent: it never crosses the IPC
+/// boundary into the webview at all, so no amount of markup injection in that
+/// window can read it. Stealing it would mean forging the ledger this product
+/// exists to sell. The BYOK API key is absent for the same reason, replaced by
+/// [`Self::llm_api_key_set`] so the form can say "a key is saved" without
+/// holding one. `enrollment_token` is left out too: the form never shows it, and
+/// what is not sent cannot leak.
+///
+/// See AUDIT.md gap G2.
+#[derive(serde::Serialize)]
+struct RedactedAgentConfig {
+    agent_id: String,
+    public_key: String,
+    distracting_apps: String,
+    productive_apps: String,
+    meeting_apps: String,
+    engine_mode: String,
+    llm_provider: String,
+    /// Whether a BYOK API key is stored in the OS keychain. The value itself is
+    /// write-only (see [`AgentConfigUpdate::llm_api_key`]) and is never returned.
+    llm_api_key_set: bool,
+    llm_base_url: String,
+    llm_model: String,
+    llm_prompt: String,
+    summary_prompt: String,
+    disable_work_summaries: bool,
+    enforce_synthetic_detection: bool,
+}
+
+impl From<&daemon::config::AgentConfig> for RedactedAgentConfig {
+    fn from(config: &daemon::config::AgentConfig) -> Self {
+        Self {
+            agent_id: config.agent_id.clone(),
+            public_key: config.public_key.clone(),
+            distracting_apps: config.distracting_apps.clone(),
+            productive_apps: config.productive_apps.clone(),
+            meeting_apps: config.meeting_apps.clone(),
+            engine_mode: config.engine_mode.clone(),
+            llm_provider: config.llm_provider.clone(),
+            llm_api_key_set: !config.llm_api_key.is_empty(),
+            llm_base_url: config.llm_base_url.clone(),
+            llm_model: config.llm_model.clone(),
+            llm_prompt: config.llm_prompt.clone(),
+            summary_prompt: config.summary_prompt.clone(),
+            disable_work_summaries: config.disable_work_summaries,
+            enforce_synthetic_detection: config.enforce_synthetic_detection,
+        }
+    }
+}
+
+/// The fields the settings form owns, as the form sends them.
+///
+/// This payload structurally cannot carry the signing key — that is the point.
+/// [`save_agent_config`] merges it into the stored configuration, so identity and
+/// secrets survive a save because nothing in the message could have expressed
+/// them in the first place.
+#[derive(serde::Deserialize)]
+struct AgentConfigUpdate {
+    distracting_apps: String,
+    productive_apps: String,
+    meeting_apps: String,
+    engine_mode: String,
+    llm_provider: String,
+    /// Write-only: the BYOK API key only ever travels app → backend, never back.
+    /// `None` (omitted, or JSON `null`) keeps whatever is in the keychain, which
+    /// is what an untouched field means now that the form never receives the
+    /// stored value. `Some("")` deletes it. `Some(key)` replaces it.
+    #[serde(default)]
+    llm_api_key: Option<String>,
+    llm_base_url: String,
+    llm_model: String,
+    llm_prompt: String,
+    summary_prompt: String,
+    disable_work_summaries: bool,
+}
+
+fn agent_config_path() -> std::path::PathBuf {
+    let mut config_path = daemon::env::get_app_home();
     config_path.push("config.json");
-    daemon::config::load_config(config_path)
+    config_path
+}
+
+#[tauri::command]
+async fn get_agent_config() -> Result<RedactedAgentConfig, String> {
+    daemon::config::load_config(agent_config_path())
+        .map(|config| RedactedAgentConfig::from(&config))
+}
+
+/// Fold a settings update into an already-loaded configuration.
+///
+/// Everything absent from `update` is left exactly as it was, which is what keeps
+/// `private_key`, `agent_id`, `public_key` and `enrollment_token` intact across a
+/// save. `llm_api_key` is the one secret the form can write, and only when it
+/// actually says so.
+fn apply_settings_update(config: &mut daemon::config::AgentConfig, update: AgentConfigUpdate) {
+    config.distracting_apps = update.distracting_apps;
+    config.productive_apps = update.productive_apps;
+    config.meeting_apps = update.meeting_apps;
+    config.engine_mode = update.engine_mode;
+    config.llm_provider = update.llm_provider;
+    config.llm_base_url = update.llm_base_url;
+    config.llm_model = update.llm_model;
+    config.llm_prompt = update.llm_prompt;
+    config.summary_prompt = update.summary_prompt;
+    config.disable_work_summaries = update.disable_work_summaries;
+    if let Some(api_key) = update.llm_api_key {
+        // An empty string here is a deliberate delete — `save_config` clears the
+        // keychain entry for an empty secret. That is only ever reached when the
+        // user emptied the field on purpose; an untouched field sends `None`.
+        config.llm_api_key = api_key;
+    }
+}
+
+/// Make sure `config.json` exists before a settings save reads it.
+///
+/// `load_config` short-circuits to `AgentConfig::default()` when the file is
+/// missing and — on that path only — never consults the OS keychain. Handing that
+/// default to `save_config` would pass an empty `private_key`, which `save_config`
+/// reads as "delete the keychain entry": a settings save made while the file
+/// happened to be absent would destroy a signing identity that was still sitting
+/// in the keychain, orphaning every slot already signed under it.
+///
+/// Seeding an empty skeleton first sends the load down its normal overlay path, so
+/// any stored secret comes back with it and is written straight back out. The
+/// skeleton carries no secrets and is exactly what `save_config` writes for a
+/// brand-new install, so this is a no-op on first run.
+///
+/// This guard belongs in `daemon::config::load_config`; it lives here because that
+/// file is owned by another change in flight (see the PR for #94).
+fn ensure_agent_config_file(config_path: &std::path::Path) -> Result<(), String> {
+    if config_path.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = config_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|err| format!("Failed to create config directory: {}", err))?;
+    }
+    // The four fields `AgentConfig` has no serde default for. Everything else fills
+    // in from the struct's own defaults.
+    let skeleton = serde_json::json!({
+        "agent_id": "",
+        "enrollment_token": "",
+        "public_key": "",
+        "private_key": "",
+    });
+    std::fs::write(config_path, skeleton.to_string())
+        .map_err(|err| format!("Failed to create config file: {}", err))
+}
+
+/// Path-parameterised form of [`save_agent_config`], so the merge can be tested
+/// without pointing the whole app at a temp directory.
+fn save_agent_config_at(
+    config_path: std::path::PathBuf,
+    update: AgentConfigUpdate,
+) -> Result<(), String> {
+    ensure_agent_config_file(&config_path)?;
+    let mut config = daemon::config::load_config(config_path.clone())?;
+    apply_settings_update(&mut config, update);
+    daemon::config::save_config(config_path, &config)
 }
 
 /// The endpoint and model each provider actually calls when the user leaves
@@ -589,11 +744,8 @@ async fn get_max_prompt_bytes() -> Result<usize, String> {
 }
 
 #[tauri::command]
-async fn save_agent_config(new_config: daemon::config::AgentConfig) -> Result<(), String> {
-    let app_home = daemon::env::get_app_home();
-    let mut config_path = app_home.clone();
-    config_path.push("config.json");
-    daemon::config::save_config(config_path, &new_config)
+async fn save_agent_config(new_config: AgentConfigUpdate) -> Result<(), String> {
+    save_agent_config_at(agent_config_path(), new_config)
 }
 
 #[tauri::command]
@@ -838,6 +990,305 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+/// The settings form no longer sees the signing key, so nothing on the round trip
+/// can put it back. That makes these tests the only thing standing between a
+/// settings save and a destroyed signing identity: `save_config` treats an empty
+/// secret as a keychain *delete*, and a deleted signing key orphans every slot the
+/// ledger already carries. Read them as a safety interlock, not as coverage.
+#[cfg(test)]
+mod settings_save_tests {
+    use super::{save_agent_config_at, AgentConfigUpdate, RedactedAgentConfig};
+    use daemon::config::{load_config, save_config, AgentConfig};
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::{Mutex, MutexGuard, Once};
+
+    static INIT_KEYCHAIN: Once = Once::new();
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    /// One process-wide store keyed by service + account, exactly like the real
+    /// thing — so every test in here writes to the same two slots. Serialise them
+    /// rather than let cargo's thread pool interleave a save with another test's
+    /// assertion.
+    static KEYCHAIN: Mutex<()> = Mutex::new(());
+    static STORE: Mutex<Option<HashMap<String, Vec<u8>>>> = Mutex::new(None);
+
+    /// A stand-in keychain that actually remembers what was written to it.
+    ///
+    /// `keyring::mock` cannot be used here: it hands out a fresh, empty credential
+    /// per `Entry::new`, so a value written through one entry is invisible to the
+    /// next one — which would make "the stored key survived" pass whether or not it
+    /// did. These tests exist to catch a *deleted* signing key, so the store has to
+    /// distinguish "still there" from "gone", and that needs real persistence keyed
+    /// by service and account.
+    #[derive(Debug)]
+    struct StoreCredential(String);
+
+    impl keyring::credential::CredentialApi for StoreCredential {
+        fn set_secret(&self, secret: &[u8]) -> keyring::Result<()> {
+            let mut store = STORE.lock().unwrap_or_else(|e| e.into_inner());
+            store
+                .get_or_insert_with(HashMap::new)
+                .insert(self.0.clone(), secret.to_vec());
+            Ok(())
+        }
+
+        fn get_secret(&self) -> keyring::Result<Vec<u8>> {
+            let store = STORE.lock().unwrap_or_else(|e| e.into_inner());
+            match store.as_ref().and_then(|s| s.get(&self.0)) {
+                Some(secret) => Ok(secret.clone()),
+                None => Err(keyring::Error::NoEntry),
+            }
+        }
+
+        fn delete_credential(&self) -> keyring::Result<()> {
+            let mut store = STORE.lock().unwrap_or_else(|e| e.into_inner());
+            match store.as_mut().and_then(|s| s.remove(&self.0)) {
+                Some(_) => Ok(()),
+                None => Err(keyring::Error::NoEntry),
+            }
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[derive(Debug)]
+    struct StoreBuilder;
+
+    impl keyring::credential::CredentialBuilderApi for StoreBuilder {
+        fn build(
+            &self,
+            _target: Option<&str>,
+            service: &str,
+            user: &str,
+        ) -> keyring::Result<Box<keyring::Credential>> {
+            Ok(Box::new(StoreCredential(format!("{service}\u{0}{user}"))))
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn persistence(&self) -> keyring::credential::CredentialPersistence {
+            keyring::credential::CredentialPersistence::ProcessOnly
+        }
+    }
+
+    /// Route keychain access to the in-process store so tests never touch — or
+    /// prompt for — the real OS keychain.
+    fn keychain() -> MutexGuard<'static, ()> {
+        INIT_KEYCHAIN.call_once(|| {
+            keyring::set_default_credential_builder(Box::new(StoreBuilder));
+        });
+        KEYCHAIN
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn temp_config_path() -> PathBuf {
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "tenby10_desktop_cfg_test_{}_{}.json",
+            std::process::id(),
+            n
+        ));
+        path
+    }
+
+    /// An enrolled device: identity and both secrets stored the way the app stores
+    /// them (keychain for the secrets, sanitized JSON on disk).
+    fn enrolled(path: &PathBuf) -> AgentConfig {
+        let mut config = daemon::config::generate_enrollment_keys("tok");
+        config.agent_id = "agent_under_test".to_string();
+        config.llm_provider = "openai".to_string();
+        config.llm_api_key = "sk-the-users-own-key".to_string();
+        save_config(path.clone(), &config).expect("the baseline save should succeed");
+        config
+    }
+
+    /// What the settings form sends: rules and prompts, no secrets, `llm_api_key`
+    /// left as `None` because the user did not touch the field.
+    fn settings_only_update() -> AgentConfigUpdate {
+        AgentConfigUpdate {
+            distracting_apps: "youtube".to_string(),
+            productive_apps: "vscode".to_string(),
+            meeting_apps: "zoom".to_string(),
+            engine_mode: "llm".to_string(),
+            llm_provider: "anthropic".to_string(),
+            llm_api_key: None,
+            llm_base_url: String::new(),
+            llm_model: String::new(),
+            llm_prompt: daemon::config::default_llm_prompt(),
+            summary_prompt: daemon::config::default_summary_prompt(),
+            disable_work_summaries: false,
+        }
+    }
+
+    /// The one that matters. A save carrying no secrets must leave the keychain
+    /// entries exactly as they were — the signing key above all, since losing it
+    /// orphans the ledger it signed.
+    #[test]
+    fn a_save_without_secrets_leaves_the_keychain_intact() {
+        let _guard = keychain();
+        let path = temp_config_path();
+        let before = enrolled(&path);
+
+        save_agent_config_at(path.clone(), settings_only_update())
+            .expect("the save should succeed");
+
+        let after = load_config(path.clone()).expect("the config should still load");
+        assert_eq!(
+            after.private_key, before.private_key,
+            "the signing key must survive a settings save"
+        );
+        assert_eq!(
+            after.llm_api_key, before.llm_api_key,
+            "an untouched API key field must keep the stored key"
+        );
+        // Identity the form never sees is preserved for the same reason.
+        assert_eq!(after.public_key, before.public_key);
+        assert_eq!(after.agent_id, "agent_under_test");
+        assert_eq!(after.enrollment_token, before.enrollment_token);
+        // And the settings the form *did* send actually landed.
+        assert_eq!(after.productive_apps, "vscode");
+        assert_eq!(after.engine_mode, "llm");
+        assert_eq!(after.llm_provider, "anthropic");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `load_config` skips the keychain overlay entirely when `config.json` is
+    /// missing, so without the skeleton guard this exact sequence would hand
+    /// `save_config` an empty `private_key` and delete a live signing key.
+    #[test]
+    fn a_save_with_no_config_file_still_keeps_a_stored_signing_key() {
+        let _guard = keychain();
+        let path = temp_config_path();
+        let before = enrolled(&path);
+        std::fs::remove_file(&path).expect("the config file should exist to be removed");
+
+        save_agent_config_at(path.clone(), settings_only_update())
+            .expect("the save should succeed");
+
+        let after = load_config(path.clone()).expect("the config should load");
+        assert_eq!(
+            after.private_key, before.private_key,
+            "a missing config.json must not cost the user their signing key"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Clearing the field is the one way the form deletes a stored API key — and it
+    /// must still be the only secret that moves.
+    #[test]
+    fn clearing_the_api_key_deletes_only_the_api_key() {
+        let _guard = keychain();
+        let path = temp_config_path();
+        let before = enrolled(&path);
+
+        let update = AgentConfigUpdate {
+            llm_api_key: Some(String::new()),
+            ..settings_only_update()
+        };
+        save_agent_config_at(path.clone(), update).expect("the save should succeed");
+
+        let after = load_config(path.clone()).expect("the config should load");
+        assert!(
+            after.llm_api_key.is_empty(),
+            "an emptied field must remove the stored key"
+        );
+        assert_eq!(
+            after.private_key, before.private_key,
+            "clearing the API key must not touch the signing key"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_typed_api_key_replaces_the_stored_one() {
+        let _guard = keychain();
+        let path = temp_config_path();
+        let before = enrolled(&path);
+
+        let update = AgentConfigUpdate {
+            llm_api_key: Some("sk-a-brand-new-key".to_string()),
+            ..settings_only_update()
+        };
+        save_agent_config_at(path.clone(), update).expect("the save should succeed");
+
+        let after = load_config(path.clone()).expect("the config should load");
+        assert_eq!(after.llm_api_key, "sk-a-brand-new-key");
+        assert_eq!(after.private_key, before.private_key);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A rejected save must not half-apply: the API key is written by the same
+    /// `save_config` call that validates the prompts, so a refusal leaves both alone.
+    #[test]
+    fn a_rejected_save_changes_no_secret() {
+        let _guard = keychain();
+        let path = temp_config_path();
+        let before = enrolled(&path);
+
+        let update = AgentConfigUpdate {
+            llm_prompt: "x".repeat(daemon::config::MAX_PROMPT_BYTES + 1),
+            llm_api_key: Some("sk-should-never-land".to_string()),
+            ..settings_only_update()
+        };
+        save_agent_config_at(path.clone(), update)
+            .expect_err("an over-long prompt must be refused");
+
+        let after = load_config(path.clone()).expect("the config should load");
+        assert_eq!(after.llm_api_key, before.llm_api_key);
+        assert_eq!(after.private_key, before.private_key);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The reason all of the above is safe to rely on: the webview is never sent a
+    /// secret it could hand back. Asserted on the serialized JSON, since that is
+    /// what actually crosses the IPC boundary.
+    #[test]
+    fn the_redacted_config_carries_no_secret_over_ipc() {
+        let mut config = daemon::config::generate_enrollment_keys("tok_secret");
+        config.llm_api_key = "sk-super-secret-key".to_string();
+        let private_key = config.private_key.clone();
+        assert!(!private_key.is_empty());
+
+        let json = serde_json::to_string(&RedactedAgentConfig::from(&config))
+            .expect("the redacted config should serialize");
+
+        assert!(
+            !json.contains(&private_key),
+            "the signing key must never cross into the webview: {json}"
+        );
+        assert!(
+            !json.contains("private_key"),
+            "not even the field should exist: {json}"
+        );
+        assert!(
+            !json.contains("sk-super-secret-key"),
+            "the API key value must never cross into the webview: {json}"
+        );
+        assert!(
+            !json.contains("tok_secret"),
+            "the enrollment token is not the form's business either: {json}"
+        );
+        // What the form does get: enough to say "a key is saved".
+        assert!(json.contains("\"llm_api_key_set\":true"), "was: {json}");
+
+        config.llm_api_key = String::new();
+        let json = serde_json::to_string(&RedactedAgentConfig::from(&config)).expect("serializes");
+        assert!(json.contains("\"llm_api_key_set\":false"), "was: {json}");
+    }
 }
 
 #[cfg(test)]

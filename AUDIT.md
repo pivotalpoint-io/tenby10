@@ -40,7 +40,7 @@ auditable; the cloud portal is not part of this repository.
 | 7 | Focus-scoring rules are deterministic and inspectable | ✅ Verified | [evaluator.rs](daemon/src/evaluator.rs), [entropy.rs](daemon/src/entropy.rs) |
 | 8 | Local logs are tamper-evident (full-payload hash chain) + self-signed when enrolled | ✅ Verified | [db.rs `insert_slot_summary`/`verify_ledger_integrity`](daemon/src/db.rs) — work notes have their own chain, same construction (§5) |
 | 9 | Your daily work note describes the task, not the window title | ⚠️ Prompt-enforced, not mechanism-enforced | The default prompt ([config.rs:51](daemon/src/config.rs#L51)) tells the model never to quote a window title, file path, URL, or third-party name. Nothing inspects the sentence afterwards: `sanitize_note` ([llm.rs:108](daemon/src/llm.rs#L108)) rejects empty or essay-length replies, not leaked content. The prompt's SHA-256 is bound into the signed record so a reader can check which rules applied — that is evidence of the rule, not proof the model obeyed it |
-| — | Secrets stored in OS keychain | ✅ Verified | [config.rs `save_config`/`load_config`](daemon/src/config.rs) — `private_key` & `llm_api_key` kept in the OS keychain via the `keyring` crate |
+| — | Secrets stored in OS keychain, and the signing key never reaches the app window | ✅ Verified | [config.rs `save_config`/`load_config`](daemon/src/config.rs) — `private_key` & `llm_api_key` kept in the OS keychain via the `keyring` crate. Since #94 the settings UI is sent a redacted config with no `private_key` and no API key value ([lib.rs](desktop/src-tauri/src/lib.rs)); the API key is write-only and the app runs under a `default-src 'self'` CSP — see G2 |
 | — | Local dashboard makes no third-party calls | ✅ Verified | [dashboard.rs](daemon/src/dashboard.rs) — Outfit font embedded as a data URI; no CDN `<link>` |
 | — | The installed app opens **no listening port** | ✅ Verified | The dashboard renders in-app over Tauri IPC. The loopback HTTP server is a debug-only escape hatch for the standalone `daemon` binary, off unless `TENBY10_DEBUG_HTTP` is set — [env.rs `debug_http_enabled`](daemon/src/env.rs) |
 
@@ -366,12 +366,34 @@ real mismatches to close:
   deleted ([ADR 0018](../decisions/0018-remove-screenshot-subsystem.md)): no toggle, no capture code,
   no image path to any provider. See §3.
 
-- **G2 — Secrets are handed to the settings UI over local IPC.** `private_key` and `llm_api_key`
-  live in the OS keychain and `config.json` is written sanitized with those fields blanked
-  ([config.rs](daemon/src/config.rs)), so nothing sensitive is at rest in plaintext. The one caveat
-  an auditor should note: over the local Tauri IPC channel, `get_agent_config` still returns the
-  in-memory config *including* those secrets so the settings form can render them — an in-process
-  transfer to the app you launched, not at-rest plaintext on disk.
+- **G2 — CLOSED for the signing key; narrowed for the API key (#94).** `private_key` and
+  `llm_api_key` live in the OS keychain and `config.json` is written sanitized with those fields
+  blanked ([config.rs](daemon/src/config.rs)), so nothing sensitive is at rest in plaintext. What
+  used to be the caveat here — `get_agent_config` returning the in-memory config *including* both
+  secrets so the settings form could render them — is gone. `get_agent_config` now returns a
+  redacted view ([lib.rs](desktop/src-tauri/src/lib.rs)) with no `private_key` field at all and no
+  API key value, only a boolean `llm_api_key_set`. The Ed25519 signing key never crosses the IPC
+  boundary into the webview in either direction, so no markup-injection bug in that window could
+  reach it. The BYOK API key is write-only: it travels app → backend when you type one and is
+  never handed back.
+
+  Two things an auditor should still weigh. First, the API key does cross that boundary on the way
+  in, which is unavoidable — you have to type it somewhere. Second, `withGlobalTauri` is still on,
+  so `window.__TAURI__` is present; note that turning it off would not remove the IPC surface,
+  because `window.__TAURI_INTERNALS__.invoke` is injected by Tauri regardless and can call any
+  registered command. What actually bounds that surface now is the Content-Security-Policy the app
+  ships with (`default-src 'self'`, `script-src 'self'` with no `unsafe-inline`, `connect-src`
+  limited to Tauri's own IPC scheme) — injected script cannot load, and cannot reach any remote
+  host to send anything to.
+
+  One related failure was closed with it. `save_config` treats an empty secret as a keychain
+  *delete*, and the settings form used to avoid wiping the signing key only by re-fetching the
+  whole config and posting it back. Now that the form never receives it, `save_agent_config` takes
+  a payload that structurally cannot express a secret and merges it into the stored configuration,
+  so anything the form does not own is preserved by never leaving the backend. Locked by
+  `a_save_without_secrets_leaves_the_keychain_intact` and
+  `a_save_with_no_config_file_still_keeps_a_stored_signing_key`
+  ([lib.rs](desktop/src-tauri/src/lib.rs)).
 
 - **G3 — NARROWED (#83).** A work note (§2) is written from window titles by your own AI, and this
   used to rest entirely on `default_summary_prompt` asking the model not to quote one

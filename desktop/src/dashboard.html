@@ -6,8 +6,11 @@
     <title>tenby10 Dashboard</title>
     <link rel="icon" type="image/png" href="favicon.png">
     <link rel="stylesheet" href="dashboard.css">
-    <!-- Classic (non-module) script so inline on* handlers resolve to globals,
-         and window.__TAURI__ (withGlobalTauri) is available. -->
+    <!-- Classic (non-module) script: this document is loaded in an iframe, where
+         Tauri injects nothing (its init scripts are main-frame only), so dashboard.js
+         reaches the bridge through window.parent. Every control below is wired up
+         there with addEventListener — the app sets script-src 'self', which blocks
+         inline on* handlers and javascript: URLs outright. -->
     <script src="dashboard.js" defer></script>
 </head>
 <body>
@@ -22,7 +25,7 @@
             </div>
         </div>
         <div style="display: flex; gap: 1rem; align-items: center;">
-            <button class="nav-btn" onclick="openExportModal()">📥 Export Data</button>
+            <button type="button" class="nav-btn" id="export-open-btn">📥 Export Data</button>
             <div class="status-badge">Active Local Agent</div>
         </div>
     </header>
@@ -54,28 +57,28 @@
             <div class="day-navigation" style="display: flex; justify-content: space-between; align-items: center; background: var(--bg-card); border: 1px solid var(--border-card); border-radius: 16px; padding: 1rem 1.5rem; backdrop-filter: blur(20px); flex-wrap: wrap; gap: 1rem;">
                 <div style="display: flex; gap: 1rem; align-items: center;">
                     <div style="display: flex; background: rgba(0,0,0,0.2); border-radius: 8px; padding: 2px;">
-                        <button class="nav-btn view-tab" id="tab-monthly" onclick="switchView('monthly')" style="padding: 0.4rem 1rem; border: none; background: transparent;">Monthly</button>
-                        <button class="nav-btn view-tab" id="tab-weekly" onclick="switchView('weekly')" style="padding: 0.4rem 1rem; border: none; background: transparent;">Weekly</button>
-                        <button class="nav-btn view-tab active" id="tab-daily" onclick="switchView('daily')" style="padding: 0.4rem 1rem; border: none; background: transparent;">Daily</button>
+                        <button type="button" class="nav-btn view-tab" id="tab-monthly" data-view="monthly" style="padding: 0.4rem 1rem; border: none; background: transparent;">Monthly</button>
+                        <button type="button" class="nav-btn view-tab" id="tab-weekly" data-view="weekly" style="padding: 0.4rem 1rem; border: none; background: transparent;">Weekly</button>
+                        <button type="button" class="nav-btn view-tab active" id="tab-daily" data-view="daily" style="padding: 0.4rem 1rem; border: none; background: transparent;">Daily</button>
                     </div>
                     <div style="display: flex; gap: 0.8rem;">
-                        <button class="nav-btn" id="prev-day-btn" onclick="prevDay()">◀ Prev</button>
-                        <button class="nav-btn" id="next-day-btn" onclick="nextDay()">Next ▶</button>
+                        <button type="button" class="nav-btn" id="prev-day-btn">◀ Prev</button>
+                        <button type="button" class="nav-btn" id="next-day-btn">Next ▶</button>
                     </div>
                 </div>
                 
                 <div style="display: flex; align-items: center; gap: 1.5rem;">
                     <div id="week-start-container" style="display: flex; align-items: center; gap: 0.5rem; display: none;">
                         <span style="font-size: 0.75rem; color: var(--text-muted); font-weight: 600;">Week Start:</span>
-                        <select id="week-start-select" onchange="updateWeekStart(this.value)" class="custom-date-picker" style="padding: 0.3rem 0.5rem; font-size: 0.75rem;">
+                        <select id="week-start-select" class="custom-date-picker" style="padding: 0.3rem 0.5rem; font-size: 0.75rem;">
                             <option value="1">Monday</option>
                             <option value="0">Sunday</option>
                         </select>
                     </div>
                     <div style="display: flex; align-items: center; gap: 0.8rem;">
-                        <a href="javascript:void(0)" id="today-btn" onclick="navigateToToday()" style="font-size: 0.8rem; color: var(--accent-green); text-decoration: none; font-weight: 600; padding: 0.3rem 0.5rem; border-radius: 4px; background: rgba(16, 185, 129, 0.1);">Today</a>
+                        <a href="#" id="today-btn" style="font-size: 0.8rem; color: var(--accent-green); text-decoration: none; font-weight: 600; padding: 0.3rem 0.5rem; border-radius: 4px; background: rgba(16, 185, 129, 0.1);">Today</a>
                         <span id="date-picker-label" style="font-size: 0.8rem; color: var(--text-muted); font-weight: 600;">Select Date:</span>
-                        <input type="date" id="date-picker" onchange="datePickerChanged(this)" class="custom-date-picker" />
+                        <input type="date" id="date-picker" class="custom-date-picker" />
                     </div>
                 </div>
             </div>
@@ -121,7 +124,7 @@
         <div class="dialog-content">
             <div class="dialog-header">
                 <h3 id="dialog-slot-title">Slot Details</h3>
-                <button class="close-btn" onclick="closeSlotDialog()">✕</button>
+                <button type="button" class="close-btn" id="slot-dialog-close">✕</button>
             </div>
             <div class="dialog-body-grid">
                 <div style="display: flex; flex-direction: column; gap: 0.5rem; flex: 1;">
@@ -142,14 +145,14 @@
         <div class="dialog-content">
             <div class="dialog-header">
                 <h3>Export Telemetry Data</h3>
-                <button class="close-btn" onclick="closeExportModal()">✕</button>
+                <button type="button" class="close-btn" id="export-dialog-close">✕</button>
             </div>
             <div style="display: flex; flex-direction: column; gap: 1rem; margin-top: 1rem;">
                 <p style="font-size: 0.85rem; color: var(--text-muted);">Export a CSV containing your unaggregated, minute-by-minute telemetry logs.</p>
                 
                 <div style="display: flex; flex-direction: column; gap: 0.8rem; margin-top: 0.5rem;">
                     <label style="font-size: 0.8rem; color: var(--text-muted); font-weight: 600;">Time Range</label>
-                    <select id="export-range" onchange="document.getElementById('custom-range-inputs').style.display = this.value === 'custom' ? 'flex' : 'none'" class="custom-date-picker" style="width: 100%; padding: 0.5rem; background: rgba(0,0,0,0.2); border: 1px solid rgba(255,255,255,0.1); color: var(--text-primary); border-radius: 4px;">
+                    <select id="export-range" class="custom-date-picker" style="width: 100%; padding: 0.5rem; background: rgba(0,0,0,0.2); border: 1px solid rgba(255,255,255,0.1); color: var(--text-primary); border-radius: 4px;">
                         <option value="24h">Last 24 Hours</option>
                         <option value="7d">Last 7 Days</option>
                         <option value="30d">Last 30 Days (1 Month)</option>
@@ -171,7 +174,7 @@
                     </div>
                 </div>
                 
-                <button class="scribe-btn" id="export-btn" onclick="exportCsv()" style="margin-top: 0.5rem;">
+                <button type="button" class="scribe-btn" id="export-btn" style="margin-top: 0.5rem;">
                     <span>Download CSV</span>
                 </button>
             </div>
