@@ -326,6 +326,10 @@ pub fn load_config(config_path: PathBuf) -> Result<AgentConfig, String> {
     if !config_path.exists() {
         return Ok(AgentConfig::default());
     }
+    // Startup reads this file, and a save may not happen for weeks, so a read is where
+    // an upgrade gets to fix the mode an older build left behind (#95).
+    crate::env::secure_app_home_for(&config_path);
+    crate::env::secure_file(&config_path);
     let data = fs::read_to_string(&config_path)
         .map_err(|err| format!("Failed to read config file: {}", err))?;
     let mut config: AgentConfig = serde_json::from_str(&data)
@@ -428,6 +432,7 @@ pub fn save_config(config_path: PathBuf, config: &AgentConfig) -> Result<(), Str
         fs::create_dir_all(parent)
             .map_err(|err| format!("Failed to create config directory: {}", err))?;
     }
+    crate::env::secure_app_home_for(&config_path);
 
     // Persist secrets to the OS keychain first.
     store_secret(KR_PRIVATE_KEY, &config.private_key)?;
@@ -440,7 +445,10 @@ pub fn save_config(config_path: PathBuf, config: &AgentConfig) -> Result<(), Str
 
     let data = serde_json::to_string_pretty(&on_disk)
         .map_err(|err| format!("Failed to serialize config: {}", err))?;
-    fs::write(config_path, data).map_err(|err| format!("Failed to write config file: {}", err))?;
+    fs::write(&config_path, data).map_err(|err| format!("Failed to write config file: {}", err))?;
+    // The secrets are in the keychain, but the file still names the agent, its public
+    // key and the endpoint it talks to, and it is the file a hand edit reaches (#95).
+    crate::env::secure_file(&config_path);
     Ok(())
 }
 

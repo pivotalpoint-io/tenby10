@@ -385,13 +385,22 @@ pub struct Database {
 impl Database {
     /// Create a new Database instance at the specified file path.
     /// Creates parent directories if they don't exist.
+    ///
+    /// Also tightens the app data directory and this database to owner-only (#95). It
+    /// runs on every open, not just the first, because an install made by an earlier
+    /// build already has a `0755` directory and a `0644` database, and an upgrade that
+    /// only hardened new files would leave every existing user where they were.
     pub fn new(db_path: PathBuf) -> Result<Self> {
         if let Some(parent) = db_path.parent() {
             fs::create_dir_all(parent).unwrap_or_else(|err| {
                 eprintln!("Warning: Failed to create database directory: {}", err);
             });
         }
-        let conn = Connection::open(db_path)?;
+        crate::env::secure_app_home_for(&db_path);
+        let conn = Connection::open(&db_path)?;
+        // Before `init_tables` writes anything: the first write creates a journal, and
+        // SQLite copies the database file's mode onto it.
+        crate::env::secure_db_files(&db_path);
         let db = Database {
             conn: Mutex::new(conn),
         };
@@ -1773,6 +1782,43 @@ mod tests {
         let path = PathBuf::from(format!("/tmp/tenby10_test_{unique}.db"));
         let _ = std::fs::remove_file(&path); // clear any stale file (pid reuse across runs)
         Database::new(path).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_a_fresh_database_is_owner_only_on_disk() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = PathBuf::from(format!("/tmp/tenby10_dbperm_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("tenby10.db");
+
+        let db = Database::new(path.clone()).unwrap();
+        // Write something, so any journal SQLite keeps beside the database has existed
+        // under the mode we set rather than only ever in theory.
+        db.insert_slot_summary(1000, 85, 8, 2, 150, 20, "{}", Some("Focused"), "", None)
+            .unwrap();
+
+        let mode_of =
+            |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode_of(&path),
+            0o600,
+            "the database holds every window title ever observed; it must be owner-only"
+        );
+        // Sidecars carry the same rows. In the default rollback-journal mode they are
+        // gone once the transaction commits, so this asserts about whichever exist.
+        for suffix in ["-journal", "-wal", "-shm"] {
+            let mut sidecar = path.as_os_str().to_os_string();
+            sidecar.push(suffix);
+            let sidecar = PathBuf::from(sidecar);
+            if sidecar.exists() {
+                assert_eq!(mode_of(&sidecar), 0o600, "{suffix} must be owner-only too");
+            }
+        }
+
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
