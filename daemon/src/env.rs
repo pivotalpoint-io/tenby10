@@ -134,15 +134,19 @@ fn set_owner_only(path: &Path, mode: u32) {
     }
 }
 
-/// Windows has no mode bits, and this is **not** covered there.
+/// Windows has no mode bits, and this is **not** covered there. Windows is a released
+/// platform, so that is a real gap and not a hypothetical one.
 ///
 /// The honest equivalent is an explicit DACL on `%USERPROFILE%\.tenby10` granting only
-/// the owner, written with `SetNamedSecurityInfoW` — a chunk of `windows-sys` and a
-/// hand-built ACL for a platform this app is not yet shipped on. Rather than pretend,
-/// this says plainly that the protection is missing, once per process so it is visible
-/// without being noise. A Windows user's data is protected only by the default ACL on
-/// their profile directory, which on a stock install does keep other standard users out
-/// but is not something we set or check.
+/// the owner, written with `SetNamedSecurityInfoW`: a hand-built ACL, inheritance flags
+/// and all. Getting it wrong does not fail safe — a DACL missing the owner locks the app
+/// out of its own database on a user's machine — and nothing here can test the result,
+/// since CI compiles and runs unit tests on Windows but does not check ACL semantics.
+/// Shipping an untested ACL would be worse than shipping none, so this says plainly that
+/// the protection is missing, once per process so it is visible without becoming noise.
+/// A Windows user's data is protected only by the default ACL on their profile directory,
+/// which on a stock single-user install does keep other standard users out — but that is
+/// inherited, not something we set or verify.
 #[cfg(not(unix))]
 fn warn_permissions_not_enforced(path: &Path) {
     use std::sync::Once;
