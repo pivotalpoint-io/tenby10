@@ -1,0 +1,199 @@
+name: Advisories
+
+# Supply-chain gate for issue #93.
+#
+# Dependabot already bumps versions weekly, but nothing failed the build on a
+# known-vulnerable lockfile, so CI went green on one. This job is that gate. It
+# audits BOTH workspaces (daemon/Cargo.lock and desktop/src-tauri/Cargo.lock)
+# against the RustSec advisory database. It only reads lockfiles: no toolchain
+# build, no staged icons, no npm install.
+#
+# ── Blocking policy, stated up front ────────────────────────────────────────
+# A brand-new upstream advisory WILL fail otherwise-unrelated PRs. That is the
+# deliberate choice, because:
+#   * the fix is nearly always one line (`cargo update -p <crate>`);
+#   * this repo ships a signed desktop agent that installs global keyboard and
+#     mouse hooks, so a vulnerable dependency reaching a release costs far more
+#     than a temporarily blocked PR;
+#   * the nightly `schedule:` run below normally catches a new advisory against
+#     `main` before it ever lands on somebody's branch.
+# The only escape hatch is the IGNORED_IDS list in the audit step: an explicit,
+# commented, code-reviewed entry. There is no silent bypass and no soft-fail on
+# a *found* advisory. The one soft-fail in this workflow is documented inline
+# and can only fire when the advisory database itself could not be downloaded.
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  # Advisories arrive by calendar, not by commit. Catch them against main.
+  schedule:
+    - cron: "27 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: advisories-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Pinned so the gate's behaviour does not change under us.
+  CARGO_AUDIT_VERSION: "0.22.2"
+  # Scratch clone of RustSec/advisory-db. Nothing in this job writes to the
+  # repo, so it is only ever untracked scratch space.
+  ADVISORY_DB: ${{ github.workspace }}/.advisory-db
+
+jobs:
+  advisories:
+    name: Advisory gate
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Cache cargo-audit
+      uses: actions/cache@v4
+      with:
+        path: ~/.cargo/bin/cargo-audit
+        key: cargo-audit-${{ runner.os }}-${{ env.CARGO_AUDIT_VERSION }}
+
+    - name: Install cargo-audit
+      run: |
+        if [ -x "$HOME/.cargo/bin/cargo-audit" ] \
+           && cargo audit --version | grep -qF "$CARGO_AUDIT_VERSION"; then
+          echo "cargo-audit $CARGO_AUDIT_VERSION restored from cache."
+          exit 0
+        fi
+        cargo install cargo-audit --version "$CARGO_AUDIT_VERSION" --locked
+
+    - name: Fetch RustSec advisory database
+      id: db
+      run: |
+        # Cloned fresh on every run and never cached: a stale advisory DB is a
+        # gate that quietly stops catching things. Retried, because a single
+        # failed clone of a third-party repo must not fail somebody's PR.
+        for attempt in 1 2 3; do
+          rm -rf "$ADVISORY_DB"
+          if git clone --depth 1 --quiet \
+               https://github.com/RustSec/advisory-db.git "$ADVISORY_DB"; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "advisory-db clone attempt $attempt/3 failed"
+          sleep $((attempt * 10))
+        done
+        echo "ok=false" >> "$GITHUB_OUTPUT"
+
+    # THE ONE SOFT-FAIL. Reachable only when the advisory database could not be
+    # cloned three times in a row, i.e. GitHub was unreachable. It cannot mask a
+    # found advisory, because in this branch no audit ran at all — and it says
+    # so loudly, in both the annotation and the job summary.
+    - name: Advisory database unavailable (soft-fail, announced)
+      if: steps.db.outputs.ok != 'true'
+      run: |
+        echo "::warning title=Advisory gate skipped::Could not clone the RustSec advisory database after 3 attempts. The lockfiles were NOT audited on this run. Re-run the job."
+        {
+          echo "### :warning: Advisory gate SKIPPED — nothing was audited"
+          echo
+          echo "Cloning \`RustSec/advisory-db\` failed three times, so \`cargo audit\`"
+          echo "never ran. This is the only condition under which this job passes"
+          echo "without auditing, and it cannot hide a found advisory: no audit was"
+          echo "performed at all."
+          echo
+          echo "**Re-run this job** once GitHub is reachable again."
+        } >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Audit both workspaces
+      if: steps.db.outputs.ok == 'true'
+      run: |
+        # ── Ignore list ─────────────────────────────────────────────────────
+        # Every entry needs a written reason and is reviewed like any other
+        # diff. cargo-audit prints each ignored advisory in its own report, and
+        # the list is echoed into the job summary below, so nothing here is
+        # suppressed silently.
+        #
+        # RUSTSEC-2024-0429 — glib 0.18.5, unsound `VariantStrIter` iterator
+        #   impls. Reached only through tauri -> tray-icon -> libappindicator
+        #   -> gtk, which is the Linux GTK3 backend. Both
+        #       cargo tree -i glib --target aarch64-apple-darwin
+        #       cargo tree -i glib --target x86_64-pc-windows-msvc
+        #   print nothing, so this crate is not compiled into anything we ship.
+        #   The gtk-rs GTK3 bindings are retired: there is no fixed release to
+        #   upgrade to, so denying it would be permanently unactionable.
+        IGNORED_IDS=(
+          RUSTSEC-2024-0429
+        )
+
+        IGNORE_ARGS=()
+        for id in "${IGNORED_IDS[@]}"; do
+          IGNORE_ARGS+=( --ignore "$id" )
+        done
+
+        {
+          echo "### Advisory gate"
+          echo
+          echo "Explicitly ignored advisories (see the comment in \`.github/workflows/audit.yml\`):"
+          echo
+          for id in "${IGNORED_IDS[@]}"; do
+            echo "- \`$id\`"
+          done
+          echo
+          echo "\`unmaintained\` advisories are reported but do not block — see the"
+          echo "non-blocking report below for the current list."
+        } >> "$GITHUB_STEP_SUMMARY"
+
+        status=0
+        for lock in daemon/Cargo.lock desktop/src-tauri/Cargo.lock; do
+          echo "::group::cargo audit $lock"
+          # --no-fetch + --db: hermetic, the DB was cloned in the step above.
+          # --no-yanked: yanked detection needs a live crates.io index fetch,
+          #   which is the flakiest thing cargo-audit does. It is kept out of
+          #   the blocking gate and runs in the non-blocking report instead.
+          # --deny unsound: unsoundness is a real defect class (this issue's
+          #   RUSTSEC-2026-0221 was one) and cargo-audit does not fail on it by
+          #   default.
+          # `unmaintained` is deliberately NOT denied: by definition there is no
+          #   fixed version to move to, so a blocking gate on it could only be
+          #   satisfied by ignoring it. It stays visible in every report.
+          cargo audit \
+            --no-fetch --db "$ADVISORY_DB" \
+            --no-yanked \
+            --deny unsound \
+            "${IGNORE_ARGS[@]}" \
+            --file "$lock" || status=1
+          echo "::endgroup::"
+        done
+
+        if [ "$status" -ne 0 ]; then
+          echo "::error title=Advisory found::cargo audit failed. Fix with a targeted 'cargo update -p <crate>' in the affected workspace, or add an explicitly justified entry to IGNORED_IDS in .github/workflows/audit.yml."
+        fi
+        exit $status
+
+    - name: Non-blocking advisory report
+      if: always() && steps.db.outputs.ok == 'true'
+      continue-on-error: true
+      run: |
+        # Full, unfiltered picture — unmaintained crates and yanked versions
+        # included. This step never fails the build; it exists so the things the
+        # gate deliberately does not block on stay in front of us.
+        {
+          echo "### Non-blocking advisory report"
+          echo
+          echo "Full \`cargo audit\` output, nothing ignored or denied. Informational only."
+          for lock in daemon/Cargo.lock desktop/src-tauri/Cargo.lock; do
+            echo
+            echo "<details><summary><code>$lock</code></summary>"
+            echo
+            echo '```'
+            # --color never: this output is embedded in markdown, not a terminal.
+            cargo audit --color never --no-fetch --db "$ADVISORY_DB" \
+              --file "$lock" 2>&1 || true
+            echo '```'
+            echo
+            echo "</details>"
+          done
+        } >> "$GITHUB_STEP_SUMMARY"

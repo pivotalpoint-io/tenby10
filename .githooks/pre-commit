@@ -1,7 +1,58 @@
 #!/bin/bash
 set -e
 
+cd "$(git rev-parse --show-toplevel)"
+
 echo "=== Running Pre-Commit Hooks ==="
+
+# 0. Fresh-clone guard (issue #93).
+#
+# desktop/src-tauri/icons/ is gitignored and staged by scripts/dev.sh or
+# scripts/prod.sh. In a fresh clone or a new worktree it does not exist, and the
+# desktop clippy step below then dies on missing include_bytes! targets with a
+# compile error that names a path nobody has ever seen in the repo.
+#
+# We fail here instead of staging the icons ourselves, on purpose:
+#   * a commit hook must not mutate the working tree behind the author's back,
+#     and staging would mean picking icons_dev or icons_prod — overwriting a
+#     dev-staged icons/ with prod branding mid-commit is exactly the kind of
+#     surprise that costs an hour to notice;
+#   * the advice people were missing ("run scripts/dev.sh") does not actually
+#     work as an instruction, because that script stages the icons *and then*
+#     launches the app and blocks. There was no staging-only command to point
+#     at, so this prints the two lines that do it.
+REQUIRED_ICONS=(
+  desktop/src-tauri/icons/32x32.png
+  desktop/src-tauri/icons/32x32_paused.png
+  desktop/src-tauri/icons/128x128.png
+  desktop/src-tauri/icons/128x128@2x.png
+  desktop/src-tauri/icons/icon.icns
+  desktop/src-tauri/icons/icon.ico
+)
+MISSING_ICONS=()
+for icon in "${REQUIRED_ICONS[@]}"; do
+  [ -f "$icon" ] || MISSING_ICONS+=("$icon")
+done
+
+if [ ${#MISSING_ICONS[@]} -ne 0 ]; then
+  echo ""
+  echo "ERROR: desktop/src-tauri/icons/ is not staged, so the desktop crate cannot build."
+  echo ""
+  echo "That directory is gitignored and populated from icons_prod/ or icons_dev/."
+  echo "Missing:"
+  for icon in "${MISSING_ICONS[@]}"; do
+    echo "  - $icon"
+  done
+  echo ""
+  echo "Stage the production icons (what CI uses) by running this from the repo root:"
+  echo ""
+  echo "  mkdir -p desktop/src-tauri/icons && cp -r desktop/src-tauri/icons_prod/. desktop/src-tauri/icons/"
+  echo ""
+  echo "Then commit again. To run the app locally instead, scripts/dev.sh and"
+  echo "scripts/prod.sh stage the icons for you before launching."
+  echo ""
+  exit 1
+fi
 
 # 1. Daemon Checks
 echo "Checking daemon formatting..."
@@ -27,4 +78,3 @@ cargo test
 
 cd ../..
 echo "=== All checks passed! ==="
-
