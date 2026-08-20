@@ -23,7 +23,18 @@ const tabContents = document.querySelectorAll(".tab-content");
 const saveSettingsBtn = document.getElementById("save-settings-btn");
 const aiEngineToggle = document.getElementById("ai-engine-toggle");
 
+// The redacted configuration this window is allowed to see. It carries no signing
+// key and no API key value — see get_agent_config in src-tauri/src/lib.rs.
 let currentConfig = null;
+
+// A saved API key never comes back to this window; it stays in the OS keychain and
+// `get_agent_config` reports only whether one exists. So the field shows a fixed
+// stand-in instead, and the save path reads it as three different intentions:
+//   the stand-in, untouched -> keep the stored key (nothing is sent)
+//   anything else typed in  -> replace it with what was typed
+//   an empty field          -> delete the stored key
+const SAVED_API_KEY_STANDIN = "••••••••••••••••";
+let llmApiKeyIsSet = false;
 
 
 
@@ -187,6 +198,14 @@ if (aiApiKeyInput) {
       errorEl.style.display = "none";
     }
   });
+  // Focusing the stand-in selects it, so typing replaces the saved key in one go
+  // and backspacing clears the field — the two things the field can mean. Selecting
+  // is not editing, so simply clicking in and out still counts as untouched.
+  aiApiKeyInput.addEventListener("focus", () => {
+    if (llmApiKeyIsSet && aiApiKeyInput.value === SAVED_API_KEY_STANDIN) {
+      aiApiKeyInput.select();
+    }
+  });
 }
 
 // Per-provider endpoint/model defaults, read from the daemon (see llm.rs) so
@@ -261,9 +280,17 @@ function updateLlmProviderHints() {
   }
   if (apiKeyHint) {
     const local = baseUrlInput && isLoopbackUrl(baseUrlInput.value.trim());
-    apiKeyHint.innerText = local
-      ? "Not required for a local endpoint."
-      : "Stored in your OS keychain, never in a file and never sent to tenby10.";
+    if (local) {
+      apiKeyHint.innerText = "Not required for a local endpoint.";
+    } else if (llmApiKeyIsSet) {
+      apiKeyHint.innerText =
+        "A key is saved in your OS keychain. It is never read back into this window, " +
+        "so leave this field as it is to keep it, type a new key to replace it, or " +
+        "clear the field to delete it.";
+    } else {
+      apiKeyHint.innerText =
+        "Stored in your OS keychain, never in a file and never sent to tenby10.";
+    }
   }
 }
 
@@ -386,7 +413,8 @@ async function loadAgentConfig() {
       aiEngineToggle.checked = isLlm;
     }
     document.getElementById("ai-provider").value = currentConfig.llm_provider || "openai";
-    document.getElementById("ai-api-key").value = currentConfig.llm_api_key || "";
+    llmApiKeyIsSet = currentConfig.llm_api_key_set === true;
+    document.getElementById("ai-api-key").value = llmApiKeyIsSet ? SAVED_API_KEY_STANDIN : "";
     document.getElementById("ai-model").value = currentConfig.llm_model || "";
     document.getElementById("ai-base-url").value = currentConfig.llm_base_url || "";
     await loadLlmProviderDefaults();
@@ -472,8 +500,10 @@ if (saveSettingsBtn) {
     saveSettingsBtn.innerText = "Saving...";
 
     try {
-      // Re-fetch configuration to preserve SaaS credentials
-      const config = await invoke("get_agent_config");
+      // No re-fetch: the payload below carries only the fields this form owns, and
+      // the backend merges it into the stored configuration. Identity, the signing
+      // key and an untouched API key are preserved there, by never leaving there.
+      const config = {};
 
       // Evaluation Rules
       config.productive_apps = document.getElementById("rules-productive").value.trim();
@@ -489,7 +519,16 @@ if (saveSettingsBtn) {
 
       // AI Settings
       const isLlmEnabled = (aiEngineToggle && aiEngineToggle.checked);
-      const apiKey = document.getElementById("ai-api-key").value.trim();
+
+      // The API key field, read as an intention rather than a value (see
+      // SAVED_API_KEY_STANDIN). `null` means "send nothing, keep what is stored".
+      const apiKeyField = document.getElementById("ai-api-key").value;
+      const apiKeyUntouched = llmApiKeyIsSet && apiKeyField === SAVED_API_KEY_STANDIN;
+      const apiKeyUpdate = apiKeyUntouched ? null : apiKeyField.trim();
+      // Whether a key will be in place once this save lands — which is what the
+      // "AI needs a key" check has to ask, now that the field can be a stand-in.
+      const willHaveApiKey = apiKeyUntouched || apiKeyUpdate !== "";
+
       const prompt = document.getElementById("ai-prompt").value.trim();
       const baseUrl = document.getElementById("ai-base-url").value.trim();
       const model = document.getElementById("ai-model").value.trim();
@@ -510,7 +549,7 @@ if (saveSettingsBtn) {
           return;
         }
         // A local endpoint needs no key (Ollama ignores it); every remote one does.
-        if (!apiKey && !isLoopbackUrl(baseUrl)) {
+        if (!willHaveApiKey && !isLoopbackUrl(baseUrl)) {
           rejectSave("⚠️ API Key is required when AI Auditor is enabled.");
           return;
         }
@@ -551,17 +590,22 @@ if (saveSettingsBtn) {
 
       config.engine_mode = isLlmEnabled ? "llm" : "static";
       config.disable_work_summaries = !(summaryToggleEl && summaryToggleEl.checked);
-      if (summaryPromptEl) {
-        config.summary_prompt = summaryPromptText;
-      }
+      // Every field the payload carries is authoritative, so a missing textarea must
+      // resend what is stored rather than blank the prompt every note is signed against.
+      config.summary_prompt = summaryPromptEl ? summaryPromptText : (currentConfig.summary_prompt || "");
       config.llm_provider = document.getElementById("ai-provider").value;
-      config.llm_api_key = apiKey;
+      // Write-only: null keeps the stored key, "" deletes it, anything else replaces it.
+      config.llm_api_key = apiKeyUpdate;
       config.llm_base_url = baseUrl;
       config.llm_model = model;
       config.llm_prompt = prompt;
 
       await invoke("save_agent_config", { newConfig: config });
-      currentConfig = config;
+
+      // Re-read the redacted config so the form reflects what was actually stored,
+      // and so the API key field goes back to a stand-in rather than sitting there
+      // holding the key the user just typed.
+      await loadAgentConfig();
 
       saveSettingsBtn.innerText = "✓ Saved!";
       setTimeout(() => {

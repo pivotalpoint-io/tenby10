@@ -5088,6 +5088,7 @@ version = "0.1.0"
 dependencies = [
  "daemon",
  "fs2",
+ "keyring",
  "reqwest",
  "serde",
  "serde_json",

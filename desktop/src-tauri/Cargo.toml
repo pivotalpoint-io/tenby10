@@ -28,3 +28,9 @@ tokio = { version = "1.37", features = ["full"] }
 reqwest = { version = "0.13", features = ["json"] }
 fs2 = "0.4.3"
 
+[dev-dependencies]
+# Only so the settings-save tests can swap in the in-memory mock credential store.
+# Must track the version `daemon` uses, or `set_default_credential_builder` would be
+# configuring a different keyring than the one `daemon::config` reads and writes.
+keyring = { version = "3", features = ["apple-native", "windows-native"] }
+
