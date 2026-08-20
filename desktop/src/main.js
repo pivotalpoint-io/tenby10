@@ -154,6 +154,17 @@ function toggleLlmFields(isEnabled) {
   if (llmFields) {
     llmFields.style.display = isEnabled ? "flex" : "none";
   }
+  // The daily-work-note switch is inside #llm-fields, so turning the engine off takes
+  // it off screen along with the fields. Since the engine now decides whether notes
+  // are written at all (#96), the off state has to say so in the switch's place.
+  const engineScopeNote = document.getElementById("engine-scope-note");
+  if (engineScopeNote) {
+    engineScopeNote.style.display = isEnabled ? "block" : "none";
+  }
+  const engineOffNotice = document.getElementById("engine-off-notice");
+  if (engineOffNotice) {
+    engineOffNotice.style.display = isEnabled ? "none" : "block";
+  }
 }
 
 if (aiEngineToggle) {

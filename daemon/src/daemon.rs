@@ -445,23 +445,82 @@ pub fn start_daemon_loop(db: Arc<Database>, state: Arc<TelemetryState>) {
 /// user's own API budget summarizing history nobody asked for.
 const SUMMARY_LOOKBACK_DAYS: i64 = 7;
 
+/// Whether a daily work note should be written at all, as one decision (#96).
+///
+/// Three conditions, all required:
+/// - **The AI engine is on.** Writing a note *is* the AI running: it sends the day's
+///   window titles to the user's own provider. A switch presented as the AI has to
+///   govern that, or "AI off" is not off. Before #96 only slot scoring was gated
+///   here, so an install set to `static` still talked to the network once a day —
+///   surprising in the one direction that matters, data leaving the machine.
+/// - **Notes are not opted out** (`disable_work_summaries`, ADR 0019 §2).
+/// - **An AI is actually configured**, which the caller establishes by asking
+///   [`crate::llm::get_llm_provider`] for one.
+///
+/// Pure so the rule is testable without a config file on disk, a database, or a
+/// provider on the network — the same shape as `debug_http_enabled_from` in
+/// [`crate::env`]. `has_provider` is passed in rather than derived because deriving
+/// it needs the key and URL validation this function deliberately does not do.
+///
+/// Limit worth knowing: `work_notes_enabled` in `desktop/src-tauri/src/lib.rs`
+/// answers the same question for the dashboard's empty state and still carries its
+/// own copy of the rule. It should call this instead; until it does, the two can
+/// disagree about an install whose engine is `static`.
+pub fn work_notes_enabled(
+    engine_mode: &str,
+    disable_work_summaries: bool,
+    has_provider: bool,
+) -> bool {
+    engine_mode == "llm" && !disable_work_summaries && has_provider
+}
+
+/// Say once per run — not once per 60-second loop — that an install which used to
+/// receive work notes no longer does (#96).
+///
+/// Honest about its reach: this is a log line, so it is only seen by someone reading
+/// the daemon's output. The dashboard carries the same message where the note would
+/// have been, which is where a user actually notices the absence.
+fn warn_work_notes_gated_by_engine(engine_mode: &str) {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        println!(
+            "[Summary] An AI is configured and daily work notes are switched on, but the AI \
+             engine is set to \"{engine_mode}\" — so no note will be written, and no window \
+             title is sent to your provider. Turn the AI Auditor on in Settings to resume \
+             notes. Hours, categories and rules are unaffected."
+        );
+    });
+}
+
 /// Write the daily work note for any finished local day that doesn't have one yet
 /// (ADR 0019).
 ///
-/// Runs off the same 60-second loop as aggregation and requires nothing from the user:
-/// notes exist because their AI is configured, which is what the AI is for. A day is
-/// only summarized once it is over, and only once — so this is safe to call repeatedly.
+/// Runs off the same 60-second loop as aggregation and requires nothing from the user
+/// beyond switching the AI on: notes exist because their AI is running, which is what
+/// the AI is for. A day is only summarized once it is over, and only once — so this is
+/// safe to call repeatedly.
 pub fn generate_pending_summaries(db: &Database) {
     let mut config_path = crate::env::get_app_home();
     config_path.push("config.json");
     let config = crate::config::load_config(config_path).unwrap_or_default();
 
-    if config.disable_work_summaries {
-        return;
-    }
-    let Some(provider) = crate::llm::get_llm_provider(&config) else {
-        // No AI configured: hours, categories and rules still work, there is just no
-        // note. Nothing to warn about on every loop.
+    // The provider lookup comes first because "is an AI configured" is part of the
+    // decision, not a step after it. It builds a client; it sends nothing.
+    let provider = crate::llm::get_llm_provider(&config);
+    let has_provider = provider.is_some();
+    let notes_on = work_notes_enabled(
+        &config.engine_mode,
+        config.disable_work_summaries,
+        has_provider,
+    );
+    let Some(provider) = provider.filter(|_| notes_on) else {
+        // No AI configured, or notes opted out: hours, categories and rules still work,
+        // there is just no note, and neither case is worth a line every loop. The one
+        // case worth saying out loud is what #96 changes — a configured AI, notes on,
+        // and the engine off — where this install used to get notes and now will not.
+        if has_provider && !config.disable_work_summaries {
+            warn_work_notes_gated_by_engine(&config.engine_mode);
+        }
         return;
     };
 
@@ -1678,5 +1737,39 @@ mod tests {
         let buf = state.keystroke_intervals.lock().unwrap();
         assert_eq!(buf.len(), KEY_INTERVAL_WINDOW, "capped to the window size");
         assert_eq!(*buf.first().unwrap(), 50, "oldest samples dropped");
+    }
+
+    #[test]
+    fn test_work_notes_follow_the_ai_engine_switch() {
+        // #96, stated as the scenario it came from: a provider and key are configured,
+        // so the note path *would* have called out to the network. Whether it does is
+        // now the engine switch's decision.
+        let mut config = AgentConfig::default();
+        config.llm_provider = "openai".to_string();
+        config.llm_api_key = "test_key".to_string();
+        assert!(
+            crate::llm::get_llm_provider(&config).is_some(),
+            "the scenario requires an AI that would actually have been called"
+        );
+        let has_provider = true;
+
+        assert!(
+            work_notes_enabled("llm", false, has_provider),
+            "engine on, notes on, AI configured -> the note is written"
+        );
+        assert!(
+            !work_notes_enabled("static", false, has_provider),
+            "engine off -> no note and no request, however well configured the AI is"
+        );
+
+        // The two pre-existing gates still hold on their own terms.
+        assert!(
+            !work_notes_enabled("llm", true, has_provider),
+            "an explicit opt-out still wins with the engine on"
+        );
+        assert!(
+            !work_notes_enabled("llm", false, false),
+            "no AI configured -> nothing to call"
+        );
     }
 }
