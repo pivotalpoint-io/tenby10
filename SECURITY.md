@@ -1,8 +1,13 @@
 # Security Policy
 
-tenby10's desktop client runs as a background process that hooks global input and captures the
-screen, so we take security reports seriously and want them to reach us **privately** before they
-reach the public.
+tenby10's desktop client runs as a background process that hooks global input and reads the title
+of the active window, so we take security reports seriously and want them to reach us **privately**
+before they reach the public.
+
+It takes no screenshots — the screen-capture subsystem was removed outright rather than left
+switchable (ADR 0018), and there is no capture code in the client to report a bug in. macOS still
+asks for Screen Recording because it withholds *window titles* without it; the app reads titles, not
+pixels. See [`AUDIT.md`](AUDIT.md) §3 if you want to verify that before reporting anything.
 
 ## Reporting a vulnerability
 
@@ -35,7 +40,9 @@ steps or a proof-of-concept, and the impact you observed.
 
 - the background telemetry **daemon** (`daemon/`),
 - the **Tauri desktop app** (`desktop/`),
-- the local dashboard and local HTTP server,
+- the in-app dashboard, and the debug-only loopback HTTP server — note the installed app starts no
+  server and opens no port; it runs only for the standalone `daemon` binary with
+  `TENBY10_DEBUG_HTTP` set, and is in scope anyway,
 - local key handling, the signing/hash-chain ledger, and the anti-cheat / provenance code.
 
 **Out of scope:**
