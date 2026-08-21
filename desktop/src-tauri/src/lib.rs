@@ -655,13 +655,17 @@ async fn get_agent_config() -> Result<RedactedAgentConfig, String> {
         .map(|config| RedactedAgentConfig::from(&config))
 }
 
-/// Fold a settings update into an already-loaded configuration.
+/// Fold a settings update into an already-loaded configuration, returning the
+/// secrets the user asked to delete.
 ///
 /// Everything absent from `update` is left exactly as it was, which is what keeps
 /// `private_key`, `agent_id`, `public_key` and `enrollment_token` intact across a
 /// save. `llm_api_key` is the one secret the form can write, and only when it
 /// actually says so.
-fn apply_settings_update(config: &mut daemon::config::AgentConfig, update: AgentConfigUpdate) {
+fn apply_settings_update(
+    config: &mut daemon::config::AgentConfig,
+    update: AgentConfigUpdate,
+) -> daemon::config::ClearSecrets {
     config.distracting_apps = update.distracting_apps;
     config.productive_apps = update.productive_apps;
     config.meeting_apps = update.meeting_apps;
@@ -672,48 +676,16 @@ fn apply_settings_update(config: &mut daemon::config::AgentConfig, update: Agent
     config.llm_prompt = update.llm_prompt;
     config.summary_prompt = update.summary_prompt;
     config.disable_work_summaries = update.disable_work_summaries;
+
+    let mut clear = daemon::config::ClearSecrets::NONE;
     if let Some(api_key) = update.llm_api_key {
-        // An empty string here is a deliberate delete — `save_config` clears the
-        // keychain entry for an empty secret. That is only ever reached when the
-        // user emptied the field on purpose; an untouched field sends `None`.
+        // This form is the only place that can tell an emptied field from an
+        // untouched one — an untouched field sends `None` — so it is the only place
+        // that may ask for a stored secret to be deleted.
+        clear.llm_api_key = api_key.is_empty();
         config.llm_api_key = api_key;
     }
-}
-
-/// Make sure `config.json` exists before a settings save reads it.
-///
-/// `load_config` short-circuits to `AgentConfig::default()` when the file is
-/// missing and — on that path only — never consults the OS keychain. Handing that
-/// default to `save_config` would pass an empty `private_key`, which `save_config`
-/// reads as "delete the keychain entry": a settings save made while the file
-/// happened to be absent would destroy a signing identity that was still sitting
-/// in the keychain, orphaning every slot already signed under it.
-///
-/// Seeding an empty skeleton first sends the load down its normal overlay path, so
-/// any stored secret comes back with it and is written straight back out. The
-/// skeleton carries no secrets and is exactly what `save_config` writes for a
-/// brand-new install, so this is a no-op on first run.
-///
-/// This guard belongs in `daemon::config::load_config`; it lives here because that
-/// file is owned by another change in flight (see the PR for #94).
-fn ensure_agent_config_file(config_path: &std::path::Path) -> Result<(), String> {
-    if config_path.exists() {
-        return Ok(());
-    }
-    if let Some(parent) = config_path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|err| format!("Failed to create config directory: {}", err))?;
-    }
-    // The four fields `AgentConfig` has no serde default for. Everything else fills
-    // in from the struct's own defaults.
-    let skeleton = serde_json::json!({
-        "agent_id": "",
-        "enrollment_token": "",
-        "public_key": "",
-        "private_key": "",
-    });
-    std::fs::write(config_path, skeleton.to_string())
-        .map_err(|err| format!("Failed to create config file: {}", err))
+    clear
 }
 
 /// Path-parameterised form of [`save_agent_config`], so the merge can be tested
@@ -722,10 +694,9 @@ fn save_agent_config_at(
     config_path: std::path::PathBuf,
     update: AgentConfigUpdate,
 ) -> Result<(), String> {
-    ensure_agent_config_file(&config_path)?;
     let mut config = daemon::config::load_config(config_path.clone())?;
-    apply_settings_update(&mut config, update);
-    daemon::config::save_config(config_path, &config)
+    let clear = apply_settings_update(&mut config, update);
+    daemon::config::save_config_clearing(config_path, &config, clear)
 }
 
 /// The endpoint and model each provider actually calls when the user leaves
@@ -1010,10 +981,11 @@ pub fn run() {
 }
 
 /// The settings form no longer sees the signing key, so nothing on the round trip
-/// can put it back. That makes these tests the only thing standing between a
-/// settings save and a destroyed signing identity: `save_config` treats an empty
-/// secret as a keychain *delete*, and a deleted signing key orphans every slot the
-/// ledger already carries. Read them as a safety interlock, not as coverage.
+/// can put it back: every save reaches `save_config` carrying whatever the load
+/// found, and a signing key lost on the way orphans every slot the ledger already
+/// carries. The daemon holds the guard that makes that safe (#109) — these tests
+/// check this crate's half, that a save asks to delete only what the user emptied.
+/// Read them as a safety interlock, not as coverage.
 #[cfg(test)]
 mod settings_save_tests {
     use super::{save_agent_config_at, AgentConfigUpdate, RedactedAgentConfig};
@@ -1179,9 +1151,11 @@ mod settings_save_tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// `load_config` skips the keychain overlay entirely when `config.json` is
-    /// missing, so without the skeleton guard this exact sequence would hand
-    /// `save_config` an empty `private_key` and delete a live signing key.
+    /// A settings save made while `config.json` happens to be absent. `load_config`
+    /// used to skip the keychain overlay on that path, so this exact sequence handed
+    /// `save_config` an empty `private_key` and deleted a live signing key. Both ends
+    /// of that are fixed in the daemon now (#109); this holds the app-level behaviour
+    /// those two fixes exist for.
     #[test]
     fn a_save_with_no_config_file_still_keeps_a_stored_signing_key() {
         let _guard = keychain();

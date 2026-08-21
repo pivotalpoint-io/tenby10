@@ -280,10 +280,38 @@ fn keyring_service() -> String {
     }
 }
 
-/// Write a secret to the OS keychain. An empty value *deletes* any existing
-/// entry, so clearing a key in the UI actually removes it from the keychain
-/// rather than leaving a stale secret behind.
-fn store_secret(account: &str, value: &str) -> Result<(), String> {
+/// Which stored secrets a save is *explicitly* asked to remove.
+///
+/// [`save_config`] is handed a whole [`AgentConfig`], so an empty secret field on it
+/// means "this caller isn't carrying that secret" far more often than it means "the
+/// user deleted it". Reading the first as the second is how a settings save could
+/// destroy a live Ed25519 signing key and orphan every slot already signed under it
+/// (#109). So an empty field never deletes anything; removal has to be said out loud,
+/// here, by the one layer that actually knows the user asked for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClearSecrets {
+    pub private_key: bool,
+    pub llm_api_key: bool,
+}
+
+impl ClearSecrets {
+    /// Remove nothing — what a save means unless the user emptied the field themselves.
+    pub const NONE: Self = Self {
+        private_key: false,
+        llm_api_key: false,
+    };
+}
+
+/// Write a secret to the OS keychain.
+///
+/// A non-empty value is always written. An empty one is left alone unless `clear` says
+/// the caller means to delete it, in which case any existing entry is removed rather
+/// than left behind as a stale secret.
+fn store_secret(account: &str, value: &str, clear: bool) -> Result<(), String> {
+    if value.is_empty() && !clear {
+        // Not supplied. Say nothing to the keychain rather than destroy what is in it.
+        return Ok(());
+    }
     let entry = Entry::new(&keyring_service(), account)
         .map_err(|err| format!("Failed to open keychain entry '{}': {}", account, err))?;
     if value.is_empty() {
@@ -319,21 +347,27 @@ fn load_secret(account: &str) -> Result<String, String> {
 /// Load configuration from path. Returns default config if not found.
 ///
 /// Non-secret fields come from `config.json`; the `private_key` and
-/// `llm_api_key` secrets are overlaid from the OS keychain. Legacy config files
-/// that still hold plaintext secrets are transparently migrated into the
-/// keychain and rewritten without them.
+/// `llm_api_key` secrets are overlaid from the OS keychain — whether or not the
+/// file exists, since a missing `config.json` means "nothing configured yet",
+/// not "nothing stored anywhere". Legacy config files that still hold plaintext
+/// secrets are transparently migrated into the keychain and rewritten without them.
 pub fn load_config(config_path: PathBuf) -> Result<AgentConfig, String> {
-    if !config_path.exists() {
-        return Ok(AgentConfig::default());
-    }
-    // Startup reads this file, and a save may not happen for weeks, so a read is where
-    // an upgrade gets to fix the mode an older build left behind (#95).
-    crate::env::secure_app_home_for(&config_path);
-    crate::env::secure_file(&config_path);
-    let data = fs::read_to_string(&config_path)
-        .map_err(|err| format!("Failed to read config file: {}", err))?;
-    let mut config: AgentConfig = serde_json::from_str(&data)
-        .map_err(|err| format!("Failed to parse config file: {}", err))?;
+    // Falling through to the keychain overlay below rather than returning the
+    // defaults here is deliberate: a caller that loaded while the file was absent
+    // used to get a config carrying no secrets, and handing that back to
+    // `save_config` is what deleted stored ones (#109).
+    let mut config: AgentConfig = if config_path.exists() {
+        // Startup reads this file, and a save may not happen for weeks, so a read is where
+        // an upgrade gets to fix the mode an older build left behind (#95).
+        crate::env::secure_app_home_for(&config_path);
+        crate::env::secure_file(&config_path);
+        let data = fs::read_to_string(&config_path)
+            .map_err(|err| format!("Failed to read config file: {}", err))?;
+        serde_json::from_str(&data)
+            .map_err(|err| format!("Failed to parse config file: {}", err))?
+    } else {
+        AgentConfig::default()
+    };
 
     // Detect any legacy plaintext secrets still present in the file so we can
     // migrate them into the keychain below.
@@ -417,15 +451,30 @@ pub fn load_config(config_path: PathBuf) -> Result<AgentConfig, String> {
     Ok(config)
 }
 
-/// Save configuration to path.
+/// Save configuration to path, removing no stored secret.
 ///
 /// Secrets (`private_key`, `llm_api_key`) are written to the OS keychain; a
 /// sanitized copy of the config — with those fields blanked — is written to
 /// `config.json` so no secret ever lands in plaintext on disk.
 ///
+/// A secret left empty on `config` is one this caller is not carrying, and is left
+/// in the keychain untouched. Deleting one takes [`save_config_clearing`].
+///
 /// A configuration whose blobs the cloud would refuse is rejected before anything is
 /// written, so a save either lands whole or leaves the previous one untouched.
 pub fn save_config(config_path: PathBuf, config: &AgentConfig) -> Result<(), String> {
+    save_config_clearing(config_path, config, ClearSecrets::NONE)
+}
+
+/// [`save_config`], plus the secrets this save is deliberately removing.
+///
+/// Only a layer that knows the user emptied the field has any business passing
+/// anything but [`ClearSecrets::NONE`] here — see [`ClearSecrets`] for why.
+pub fn save_config_clearing(
+    config_path: PathBuf,
+    config: &AgentConfig,
+    clear: ClearSecrets,
+) -> Result<(), String> {
     config.validate()?;
 
     if let Some(parent) = config_path.parent() {
@@ -435,8 +484,8 @@ pub fn save_config(config_path: PathBuf, config: &AgentConfig) -> Result<(), Str
     crate::env::secure_app_home_for(&config_path);
 
     // Persist secrets to the OS keychain first.
-    store_secret(KR_PRIVATE_KEY, &config.private_key)?;
-    store_secret(KR_LLM_API_KEY, &config.llm_api_key)?;
+    store_secret(KR_PRIVATE_KEY, &config.private_key, clear.private_key)?;
+    store_secret(KR_LLM_API_KEY, &config.llm_api_key, clear.llm_api_key)?;
 
     // Serialize a sanitized copy so secrets never touch config.json.
     let mut on_disk = config.clone();
@@ -511,18 +560,92 @@ pub fn config_for_enrollment(config_path: PathBuf, enrollment_token: &str) -> Ag
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Once;
+    use std::collections::HashMap;
     use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::{Mutex, MutexGuard, Once};
 
-    static INIT_MOCK: Once = Once::new();
+    static INIT_KEYCHAIN: Once = Once::new();
     static COUNTER: AtomicU32 = AtomicU32::new(0);
+    /// The credential builder is process-wide, so its store is too. Serialise the
+    /// tests that touch it rather than let cargo's thread pool interleave one test's
+    /// save with another's assertion.
+    static KEYCHAIN: Mutex<()> = Mutex::new(());
+    static STORE: Mutex<Option<HashMap<String, Vec<u8>>>> = Mutex::new(None);
 
-    /// Route keychain access to the in-memory mock store so tests never touch
-    /// (or prompt for) the real OS keychain.
-    fn use_mock_keychain() {
-        INIT_MOCK.call_once(|| {
-            keyring::set_default_credential_builder(keyring::mock::default_credential_builder());
+    /// A stand-in keychain that actually remembers what was written to it.
+    ///
+    /// `keyring::mock` cannot be used here: it hands out a fresh, empty credential
+    /// per `Entry::new`, so a value written through one entry is invisible to the
+    /// next. Every assertion below about a secret *surviving* a save would then pass
+    /// whether or not it did. Telling "still there" from "deleted" needs real
+    /// persistence, keyed by service and account the way the OS keychain is.
+    #[derive(Debug)]
+    struct StoreCredential(String);
+
+    impl keyring::credential::CredentialApi for StoreCredential {
+        fn set_secret(&self, secret: &[u8]) -> keyring::Result<()> {
+            let mut store = STORE.lock().unwrap_or_else(|e| e.into_inner());
+            store
+                .get_or_insert_with(HashMap::new)
+                .insert(self.0.clone(), secret.to_vec());
+            Ok(())
+        }
+
+        fn get_secret(&self) -> keyring::Result<Vec<u8>> {
+            let store = STORE.lock().unwrap_or_else(|e| e.into_inner());
+            match store.as_ref().and_then(|s| s.get(&self.0)) {
+                Some(secret) => Ok(secret.clone()),
+                None => Err(keyring::Error::NoEntry),
+            }
+        }
+
+        fn delete_credential(&self) -> keyring::Result<()> {
+            let mut store = STORE.lock().unwrap_or_else(|e| e.into_inner());
+            match store.as_mut().and_then(|s| s.remove(&self.0)) {
+                Some(_) => Ok(()),
+                None => Err(keyring::Error::NoEntry),
+            }
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[derive(Debug)]
+    struct StoreBuilder;
+
+    impl keyring::credential::CredentialBuilderApi for StoreBuilder {
+        fn build(
+            &self,
+            _target: Option<&str>,
+            service: &str,
+            user: &str,
+        ) -> keyring::Result<Box<keyring::Credential>> {
+            Ok(Box::new(StoreCredential(format!("{service}\u{0}{user}"))))
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn persistence(&self) -> keyring::credential::CredentialPersistence {
+            keyring::credential::CredentialPersistence::ProcessOnly
+        }
+    }
+
+    /// Route keychain access to the in-process store so tests never touch — or
+    /// prompt for — the real OS keychain. Empties it first: the store outlives each
+    /// test, and a leftover secret would let one test satisfy another's assertion.
+    fn keychain() -> MutexGuard<'static, ()> {
+        INIT_KEYCHAIN.call_once(|| {
+            keyring::set_default_credential_builder(Box::new(StoreBuilder));
         });
+        let guard = KEYCHAIN
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        STORE.lock().unwrap_or_else(|e| e.into_inner()).take();
+        guard
     }
 
     /// A unique temp path per call so parallel tests don't collide on disk.
@@ -596,7 +719,7 @@ mod tests {
 
     #[test]
     fn test_save_config_writes_no_secrets_to_disk() {
-        use_mock_keychain();
+        let _keychain = keychain();
         let path = temp_config_path();
 
         let mut config = generate_enrollment_keys("tok");
@@ -624,9 +747,127 @@ mod tests {
         let _ = fs::remove_file(&path);
     }
 
+    /// The interlock (#109). `save_config` is handed a whole `AgentConfig`, and plenty
+    /// of callers assemble one without ever holding the signing key — a settings save
+    /// merging a form into a freshly loaded config, most of all. None of them may cost
+    /// the user that key: deleting it orphans every slot already signed under it, and
+    /// no re-pair brings it back.
+    #[test]
+    fn a_save_cannot_delete_a_signing_key_it_never_received() {
+        let _keychain = keychain();
+        let path = temp_config_path();
+
+        let enrolled = generate_enrollment_keys("tok");
+        save_config(path.clone(), &enrolled).expect("the baseline save should succeed");
+        assert_eq!(
+            load_secret(KR_PRIVATE_KEY).expect("the keychain should read"),
+            enrolled.private_key,
+            "the baseline save should have stored the signing key"
+        );
+
+        // A config carrying no secrets at all — exactly what a caller used to get back
+        // from `load_config` when `config.json` had gone missing.
+        let no_secrets = AgentConfig {
+            agent_id: enrolled.agent_id.clone(),
+            public_key: enrolled.public_key.clone(),
+            ..Default::default()
+        };
+        save_config(path.clone(), &no_secrets).expect("the save should succeed");
+
+        assert_eq!(
+            load_secret(KR_PRIVATE_KEY).expect("the keychain should read"),
+            enrolled.private_key,
+            "a save that was never given the signing key must not delete it"
+        );
+
+        let _ = fs::remove_file(&path);
+    }
+
+    /// The other end of the same hazard: a load with no `config.json` skipped the
+    /// keychain overlay entirely, so the caller never saw the secrets it was about to
+    /// write back out.
+    #[test]
+    fn a_missing_config_file_still_overlays_the_stored_secrets() {
+        let _keychain = keychain();
+        let path = temp_config_path();
+
+        let mut enrolled = generate_enrollment_keys("tok");
+        enrolled.llm_api_key = "sk-the-users-own-key".to_string();
+        save_config(path.clone(), &enrolled).expect("the baseline save should succeed");
+        fs::remove_file(&path).expect("the config file should exist to be removed");
+
+        let loaded = load_config(path.clone()).expect("load_config should succeed");
+        assert_eq!(
+            loaded.private_key, enrolled.private_key,
+            "a missing config.json must not hide the stored signing key"
+        );
+        assert_eq!(loaded.llm_api_key, enrolled.llm_api_key);
+        // Everything that lived only in the file is gone, as it should be.
+        assert!(loaded.agent_id.is_empty());
+
+        let _ = fs::remove_file(&path);
+    }
+
+    /// Removing a secret is still possible — it just has to be asked for by name, by
+    /// the one layer that knows the user emptied the field.
+    #[test]
+    fn only_an_explicit_clear_removes_a_secret() {
+        let _keychain = keychain();
+        let path = temp_config_path();
+
+        let mut enrolled = generate_enrollment_keys("tok");
+        enrolled.llm_api_key = "sk-the-users-own-key".to_string();
+        save_config(path.clone(), &enrolled).expect("the baseline save should succeed");
+
+        // The user cleared the API key field: that secret goes, the signing key stays.
+        let mut cleared = enrolled.clone();
+        cleared.llm_api_key = String::new();
+        save_config_clearing(
+            path.clone(),
+            &cleared,
+            ClearSecrets {
+                llm_api_key: true,
+                ..ClearSecrets::NONE
+            },
+        )
+        .expect("the save should succeed");
+        assert!(
+            load_secret(KR_LLM_API_KEY)
+                .expect("the keychain should read")
+                .is_empty(),
+            "an explicitly cleared API key must be removed"
+        );
+        assert_eq!(
+            load_secret(KR_PRIVATE_KEY).expect("the keychain should read"),
+            enrolled.private_key,
+            "clearing the API key must not touch the signing key"
+        );
+
+        // And the signing key itself, when that is what was asked for and nothing else.
+        let mut wiped = cleared.clone();
+        wiped.private_key = String::new();
+        save_config_clearing(
+            path.clone(),
+            &wiped,
+            ClearSecrets {
+                private_key: true,
+                ..ClearSecrets::NONE
+            },
+        )
+        .expect("the save should succeed");
+        assert!(
+            load_secret(KR_PRIVATE_KEY)
+                .expect("the keychain should read")
+                .is_empty(),
+            "an explicit clear is the one thing that removes the signing key"
+        );
+
+        let _ = fs::remove_file(&path);
+    }
+
     #[test]
     fn test_legacy_plaintext_config_is_migrated() {
-        use_mock_keychain();
+        let _keychain = keychain();
         let path = temp_config_path();
 
         // A pre-keychain config file that still holds plaintext secrets.
@@ -663,12 +904,12 @@ mod tests {
 
     #[test]
     fn test_config_for_enrollment_reuses_existing_keypair() {
-        use_mock_keychain();
+        let _keychain = keychain();
         let path = temp_config_path();
 
-        // An already-enrolled device. Keys are written inline so the reused values come from the
-        // file (the legacy-plaintext path takes precedence over the shared mock keychain slot),
-        // keeping the test deterministic under parallel runs.
+        // An already-enrolled device. Keys are written inline so the reused values come from
+        // the file rather than the keychain — the legacy-plaintext path takes precedence over
+        // the overlay — which pins what this test is about to the bytes right here.
         let existing = r#"{
             "agent_id": "agent_old",
             "enrollment_token": "first_token",
@@ -732,7 +973,7 @@ mod tests {
     /// save leaves the previous configuration intact rather than half-applied.
     #[test]
     fn test_save_config_rejects_oversized_prompts() {
-        use_mock_keychain();
+        let _keychain = keychain();
 
         for (field, mutate) in [
             (
@@ -766,7 +1007,7 @@ mod tests {
     /// will never accept stalls that hash chain permanently.
     #[test]
     fn test_load_config_falls_back_on_oversized_prompts() {
-        use_mock_keychain();
+        let _keychain = keychain();
         let path = temp_config_path();
 
         let huge = "x".repeat(MAX_PROMPT_BYTES + 1);
@@ -815,7 +1056,7 @@ mod tests {
 
     #[test]
     fn test_config_for_enrollment_generates_when_no_key_stored() {
-        use_mock_keychain();
+        let _keychain = keychain();
         let path = temp_config_path();
 
         // No config on disk yet (first-ever pair) → a fresh keypair is minted.
