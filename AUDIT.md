@@ -386,11 +386,17 @@ real mismatches to close:
   limited to Tauri's own IPC scheme) — injected script cannot load, and cannot reach any remote
   host to send anything to.
 
-  One related failure was closed with it. `save_config` treats an empty secret as a keychain
-  *delete*, and the settings form used to avoid wiping the signing key only by re-fetching the
-  whole config and posting it back. Now that the form never receives it, `save_agent_config` takes
-  a payload that structurally cannot express a secret and merges it into the stored configuration,
-  so anything the form does not own is preserved by never leaving the backend. Locked by
+  One related failure was closed with it. `save_config` used to read an empty secret as a keychain
+  *delete*, and the settings form avoided wiping the signing key only by re-fetching the whole
+  config and posting it back. Now that the form never receives it, `save_agent_config` takes a
+  payload that structurally cannot express a secret and merges it into the stored configuration,
+  so anything the form does not own is preserved by never leaving the backend. The delete-by-
+  omission hazard underneath it is gone as well (#109): a secret left empty is one the caller is
+  not carrying, so `save_config` leaves the stored one alone, and removing one takes an explicit
+  `ClearSecrets` from the layer that knows the user emptied the field. `load_config` also overlays
+  the keychain when `config.json` is missing, rather than handing back a config with no secrets on
+  it. Locked by `a_save_cannot_delete_a_signing_key_it_never_received` and
+  `only_an_explicit_clear_removes_a_secret` ([config.rs](daemon/src/config.rs)), and by
   `a_save_without_secrets_leaves_the_keychain_intact` and
   `a_save_with_no_config_file_still_keeps_a_stored_signing_key`
   ([lib.rs](desktop/src-tauri/src/lib.rs)).
