@@ -39,7 +39,7 @@ auditable; the cloud portal is not part of this repository.
 | 6 | No image is sent to your LLM provider, ever | ✅ Verified structurally | The provider trait takes text only ([llm.rs](daemon/src/llm.rs)); nothing in the client can produce an image to send |
 | 7 | Focus-scoring rules are deterministic and inspectable | ✅ Verified | [evaluator.rs](daemon/src/evaluator.rs), [entropy.rs](daemon/src/entropy.rs) |
 | 8 | Local logs are tamper-evident (full-payload hash chain) + self-signed when enrolled | ✅ Verified | [db.rs `insert_slot_summary`/`verify_ledger_integrity`](daemon/src/db.rs) — work notes have their own chain, same construction (§5) |
-| 9 | Your daily work note describes the task, not the window title | ⚠️ Prompt-enforced, not mechanism-enforced | The default prompt ([config.rs:51](daemon/src/config.rs#L51)) tells the model never to quote a window title, file path, URL, or third-party name. Nothing inspects the sentence afterwards: `sanitize_note` ([llm.rs:108](daemon/src/llm.rs#L108)) rejects empty or essay-length replies, not leaked content. The prompt's SHA-256 is bound into the signed record so a reader can check which rules applied — that is evidence of the rule, not proof the model obeyed it |
+| 9 | Your daily work note names the work in its own words — never a verbatim window title, never a person | ⚠️ Mechanism-enforced for verbatim titles; prompt-steered for the rest | The default prompt ([config.rs:60](daemon/src/config.rs#L60)) instructs the model to name the project, document, or feature in its own words, and to reproduce no window title, file path, or URL verbatim and no person's name (ADR 0019 §4). The verbatim rule does not rest on the model: before a note is signed, `note_quotes_a_title` ([untrusted.rs](daemon/src/untrusted.rs), called from [daemon.rs:594](daemon/src/daemon.rs#L594)) refuses a note that echoes a ≥32-normalized-character run of any title captured that day, and `sanitize_note` ([llm.rs:108](daemon/src/llm.rs#L108)) rejects empty or essay-length replies. Short names (a repo, a product) pass the echo check by design. The person-name rule and the naming instruction remain prompt-steered; the prompt's SHA-256 is bound into the signed record so a reader can check which rules applied |
 | — | Secrets stored in OS keychain, and the signing key never reaches the app window | ✅ Verified | [config.rs `save_config`/`load_config`](daemon/src/config.rs) — `private_key` & `llm_api_key` kept in the OS keychain via the `keyring` crate. Since #94 the settings UI is sent a redacted config with no `private_key` and no API key value ([lib.rs](desktop/src-tauri/src/lib.rs)); the API key is write-only and the app runs under a `default-src 'self'` CSP — see G2 |
 | — | Local dashboard makes no third-party calls | ✅ Verified | [dashboard.rs](daemon/src/dashboard.rs) — Outfit font embedded as a data URI; no CDN `<link>` |
 | — | The installed app opens **no listening port** | ✅ Verified | The dashboard renders in-app over Tauri IPC. The loopback HTTP server is a debug-only escape hatch for the standalone `daemon` binary, off unless `TENBY10_DEBUG_HTTP` is set — [env.rs `debug_http_enabled`](daemon/src/env.rs) |
@@ -170,8 +170,10 @@ Nothing leaves the machine until you **enroll** and sync. The complete list of o
 
    Two different calls reach it, on two different conditions:
    - **Slot scoring** — only when `engine_mode == "llm"`
-     ([daemon.rs:794](daemon/src/daemon.rs#L794)). Payload: one line per minute of the slot with the
-     app name, the **window title**, and key/click counts.
+     ([daemon.rs:896](daemon/src/daemon.rs#L896)). Payload: one line per minute of the slot with its
+     local wall-clock time (HH:MM), the app name, the **window title**, key/click/scroll counts,
+     cursor travel in pixels, and the daemon's own rule-based state for that minute (#111). All of
+     it goes to the provider *you* configured; nothing new is sent to tenby10.
    - **Daily work note** — whenever a provider is configured and you have not opted out
      (`disable_work_summaries`, [daemon.rs:454-470](daemon/src/daemon.rs#L454)). Note this is **not**
      gated on `engine_mode`: connecting an AI is enough, by design (ADR 0019 — "setup once, then

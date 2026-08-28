@@ -15,8 +15,10 @@
 //!      markers inside it; [`fence`] then wraps the assembled block in those
 //!      markers so the prompt can say where untrusted text starts and stops.
 //!   3. [`note_quotes_a_title`] refuses a finished note that reproduces a run of
-//!      a title verbatim — the prompt's "never quote a window title" rule,
-//!      enforced by the daemon instead of asked for.
+//!      a title verbatim — the prompt's "never reproduce a title verbatim" rule,
+//!      enforced by the daemon instead of asked for. (Short names — the
+//!      project, the document — belong in the note; the check only bites on
+//!      long runs, so specificity and the no-echo rule coexist. ADR 0019 §4.)
 //!
 //! **Honest limits.** A fence plus an instruction is a strong hint to a model,
 //! not a guarantee. This client is source-available, so anyone can read the
@@ -136,7 +138,7 @@ pub fn contains_fence_marker(text: &str) -> bool {
 /// Whether `note` reproduces at least [`MIN_ECHOED_TITLE_CHARS`] contiguous
 /// normalised characters of any of `titles`.
 ///
-/// This is the mechanical form of "never quote a window title". It is blunt on
+/// This is the mechanical form of "never reproduce a title verbatim". It is blunt on
 /// purpose: it cannot tell a leaked document name from a paraphrase that happened
 /// to land on six of the same words in the same order, and it refuses both. A
 /// refused note is left unwritten, which is the same honest failure as the AI

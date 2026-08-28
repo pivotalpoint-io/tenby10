@@ -28,21 +28,30 @@ pub fn default_meeting_apps() -> String {
 pub fn default_llm_prompt() -> String {
     format!(
         "You are an AI productivity auditor. \
-        Review the following 10-minute activity log (containing apps, window titles, keystrokes, and clicks). \
+        Review the following 10-minute activity log. Each line is one minute: local time, app, \
+        window title, keystroke/click/scroll counts, mouse travel in pixels, and the daemon's own \
+        rule-based state for that minute. \
         Evaluate the user's focus on a scale of 0 to 100. \
         - Engineering, designing, writing, and active research are highly productive (80-100). \
         - Social media, entertainment, and casual browsing are distracted (0-30). \
         - A meeting with genuine engagement (e.g. Zoom, Teams) is productive; do NOT grant full focus to a completely inactive window merely because its title mentions a meeting app. \
+        - Scrolling or mouse travel without keystrokes usually means reading; no input and no travel means absence. \
         {} \
-        Output ONLY a JSON object with two fields: 'score' (integer) and 'reasoning' (1-2 sentences).",
+        Output ONLY a JSON object with two fields: 'score' (integer) and 'reasoning' (1-2 sentences). \
+        The reasoning is stored as this slot's explanation, so be concrete: name the work the \
+        titles show (project, document, or page) in your own words, and cite minute times for \
+        whatever moved the score (e.g. 'idle 08:42-08:47'). Never pad with generic filler like \
+        'focused work with brief idle moments'.",
         crate::untrusted::PROMPT_RULE
     )
 }
 
-/// Prompt for the daily work note (ADR 0019). Unlike the scoring prompt, whatever this
-/// produces is meant to be read by the client, so the constraints are the privacy
-/// mechanism: describe the task, never the window title, never a third party. There is
-/// no review step before it publishes, so the prompt is most of what keeps the note safe.
+/// Prompt for the daily work note (ADR 0019 §4). Whatever this
+/// produces is meant to be read by the client, and its value is that it names the work —
+/// the project, the document, the feature — in the model's own words. The constraints
+/// that remain are the privacy mechanism: never a verbatim window title, never a person.
+/// There is no review step before it publishes, so the prompt is most of what keeps the
+/// note safe.
 ///
 /// Most, not all: the no-quoting rule is also checked in code before a note is signed
 /// (#83, [`crate::untrusted::note_quotes_a_title`]), because a rule a client's privacy
@@ -53,16 +62,84 @@ pub fn default_summary_prompt() -> String {
         "You are writing a short work note that a client will read next to an invoice. \
         From the activity log below (apps and window titles), write one or two sentences \
         describing what was worked on, in plain professional language. \
-        - Describe the task, not the tools: \"reworked the checkout flow\", not \"was in VSCode\". \
-        - Never quote a window title, file path, or URL. A note that reproduces one is \
-        discarded unread and the day is left without a note. \
-        - Never name a person, company, or any third party. \
+        - Be specific: name the project, repository, document, or feature the titles show, and \
+        what was done to it — \"fixed the sync retries in the fleet-pilot repo and reviewed the \
+        billing pull request\", not \"worked on development tasks\". Name the work, not the tools \
+        it was done in. \
+        - Use your own words. Never reproduce a whole window title, file path, or URL verbatim: \
+        a note that does is discarded unread and the day is left without a note. \
+        - Never name a person. Projects, products, and companies are fine; people are not. \
         - Do not mention hours, focus scores, or productivity. \
         - If the activity is too unclear to describe honestly, say that plainly instead of guessing. \
         {} \
         Output ONLY the sentences, with no preamble.",
         crate::untrusted::PROMPT_RULE
     )
+}
+
+/// Every built-in auditor prompt this daemon ever shipped as the default, verbatim,
+/// oldest first — excluding the current one. Consumed only by `load_config`'s
+/// prompt-upgrade check (see the comment there). When `default_llm_prompt` changes,
+/// append the exact text it replaced here, or installs that saved settings under it
+/// keep scoring by the old rubric forever.
+fn retired_llm_prompts() -> [String; 2] {
+    [
+        // v1, initial import — before the untrusted-data rule existed (#83).
+        "You are an AI productivity auditor. \
+        Review the following 10-minute activity log (containing apps, window titles, keystrokes, and clicks). \
+        Evaluate the user's focus on a scale of 0 to 100. \
+        - Engineering, designing, writing, and active research are highly productive (80-100). \
+        - Social media, entertainment, and casual browsing are distracted (0-30). \
+        - A meeting with genuine engagement (e.g. Zoom, Teams) is productive; do NOT grant full focus to a completely inactive window merely because its title mentions a meeting app. \
+        Output ONLY a JSON object with two fields: 'score' (integer) and 'reasoning' (1-2 sentences)."
+            .to_string(),
+        // v2, #83..#111 — fence rule added; activity lines still untimed and the
+        // reasoning not yet required to be concrete.
+        format!(
+            "You are an AI productivity auditor. \
+            Review the following 10-minute activity log (containing apps, window titles, keystrokes, and clicks). \
+            Evaluate the user's focus on a scale of 0 to 100. \
+            - Engineering, designing, writing, and active research are highly productive (80-100). \
+            - Social media, entertainment, and casual browsing are distracted (0-30). \
+            - A meeting with genuine engagement (e.g. Zoom, Teams) is productive; do NOT grant full focus to a completely inactive window merely because its title mentions a meeting app. \
+            {} \
+            Output ONLY a JSON object with two fields: 'score' (integer) and 'reasoning' (1-2 sentences).",
+            crate::untrusted::PROMPT_RULE
+        ),
+    ]
+}
+
+/// The retired work-note prompts, mirror of [`retired_llm_prompts`].
+fn retired_summary_prompts() -> [String; 2] {
+    [
+        // v1, ADR 0019 initial — before the untrusted-data rule (#83).
+        "You are writing a short work note that a client will read next to an invoice. \
+        From the activity log below (apps and window titles), write one or two sentences \
+        describing what was worked on, in plain professional language. \
+        - Describe the task, not the tools: \"reworked the checkout flow\", not \"was in VSCode\". \
+        - Never quote a window title, file path, or URL. \
+        - Never name a person, company, or any third party. \
+        - Do not mention hours, focus scores, or productivity. \
+        - If the activity is too unclear to describe honestly, say that plainly instead of guessing. \
+        Output ONLY the sentences, with no preamble."
+            .to_string(),
+        // v2, #83..#111 — fence rule and the discard warning added; predates the
+        // ADR 0019 §4 revision that asks the note to name the work.
+        format!(
+            "You are writing a short work note that a client will read next to an invoice. \
+            From the activity log below (apps and window titles), write one or two sentences \
+            describing what was worked on, in plain professional language. \
+            - Describe the task, not the tools: \"reworked the checkout flow\", not \"was in VSCode\". \
+            - Never quote a window title, file path, or URL. A note that reproduces one is \
+            discarded unread and the day is left without a note. \
+            - Never name a person, company, or any third party. \
+            - Do not mention hours, focus scores, or productivity. \
+            - If the activity is too unclear to describe honestly, say that plainly instead of guessing. \
+            {} \
+            Output ONLY the sentences, with no preamble.",
+            crate::untrusted::PROMPT_RULE
+        ),
+    ]
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -397,6 +474,20 @@ pub fn load_config(config_path: PathBuf) -> Result<AgentConfig, String> {
         config.llm_prompt = default_llm_prompt();
     }
 
+    // A stored prompt equal to a retired built-in default was frozen there by an old
+    // save — `save_config` persists whole prompt strings — not chosen by the user, so
+    // an improved default would otherwise never reach any install that had opened
+    // Settings once (#111). Upgrade those in memory; a genuinely customized prompt
+    // matches none of the retired texts and is left exactly as written. The next slot
+    // then signs under the new config hash, which is the honest record: it is the
+    // rubric that actually scored it (#62).
+    if retired_llm_prompts().contains(&config.llm_prompt) {
+        config.llm_prompt = default_llm_prompt();
+    }
+    if retired_summary_prompts().contains(&config.summary_prompt) {
+        config.summary_prompt = default_summary_prompt();
+    }
+
     // Settings refuses to save an over-long prompt, but `config.json` can be edited by hand.
     // Signing a record against a blob the cloud will never accept stalls that hash chain for
     // good, so fall back to the built-in prompt rather than sign something unuploadable. The
@@ -658,6 +749,55 @@ mod tests {
             n
         ));
         path
+    }
+
+    /// A default prompt frozen into `config.json` by an old save upgrades to the
+    /// current default on load; a prompt the user actually wrote is never touched
+    /// (#111). Also pins the bookkeeping rule: the current defaults must not appear
+    /// in the retired lists.
+    #[test]
+    fn retired_default_prompts_upgrade_on_load_and_custom_ones_do_not() {
+        let _keychain = keychain();
+
+        assert!(!retired_llm_prompts().contains(&default_llm_prompt()));
+        assert!(!retired_summary_prompts().contains(&default_summary_prompt()));
+
+        for (retired_llm, retired_sum) in retired_llm_prompts()
+            .into_iter()
+            .zip(retired_summary_prompts())
+        {
+            let path = temp_config_path();
+            let json = serde_json::json!({
+                "agent_id": "a", "enrollment_token": "", "public_key": "", "private_key": "",
+                "llm_prompt": retired_llm,
+                "summary_prompt": retired_sum,
+            });
+            fs::write(&path, serde_json::to_string(&json).unwrap()).unwrap();
+            let loaded = load_config(path.clone()).expect("load_config should succeed");
+            assert_eq!(
+                loaded.llm_prompt,
+                default_llm_prompt(),
+                "a retired auditor default should upgrade"
+            );
+            assert_eq!(
+                loaded.summary_prompt,
+                default_summary_prompt(),
+                "a retired note default should upgrade"
+            );
+            let _ = fs::remove_file(&path);
+        }
+
+        let path = temp_config_path();
+        let json = serde_json::json!({
+            "agent_id": "a", "enrollment_token": "", "public_key": "", "private_key": "",
+            "llm_prompt": "My own rubric.",
+            "summary_prompt": "My own note style.",
+        });
+        fs::write(&path, serde_json::to_string(&json).unwrap()).unwrap();
+        let loaded = load_config(path.clone()).expect("load_config should succeed");
+        assert_eq!(loaded.llm_prompt, "My own rubric.");
+        assert_eq!(loaded.summary_prompt, "My own note style.");
+        let _ = fs::remove_file(&path);
     }
 
     #[test]
