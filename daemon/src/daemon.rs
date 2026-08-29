@@ -695,6 +695,35 @@ fn meeting_creditable_ceiling(total_minutes: u32, demoted_meeting_minutes: u32) 
     ((creditable * 100) / 10).min(100)
 }
 
+/// Local wall-clock label (HH:MM) for a minute timestamp. The auditor is asked to
+/// cite these in its reasoning, so they must match the clock the user (and anyone
+/// reading the dashboard beside them) actually saw — hence local time, not UTC.
+fn minute_label(ts: i64) -> String {
+    use chrono::TimeZone;
+    chrono::Local
+        .timestamp_opt(ts, 0)
+        .single()
+        .map(|dt| dt.format("%H:%M").to_string())
+        .unwrap_or_else(|| ts.to_string())
+}
+
+/// One activity line for the slot auditor. App name and title are written by
+/// whoever owns the window, so both are scrubbed and the whole line rides inside
+/// the fence (#83); the time, the counts, and the state verdict are ours.
+fn format_activity_line(log: &crate::db::MinuteLogData, state: &str) -> String {
+    format!(
+        "[{}] App: '{}', Title: '{}', Keys: {}, Clicks: {}, Scrolls: {}, MouseTravel: {}px, State: {}",
+        minute_label(log.timestamp),
+        crate::untrusted::scrub(&log.active_app_name),
+        crate::untrusted::scrub(&log.active_window_title),
+        log.keystroke_count,
+        log.mouse_click_count,
+        log.scroll_event_count,
+        log.mouse_movement_distance.round() as i64,
+        state
+    )
+}
+
 pub fn aggregate_slot(db: &Database, config: &crate::config::AgentConfig, slot_start: i64) {
     let logs = match db.get_minute_logs_for_slot(slot_start) {
         Ok(logs) => logs,
@@ -724,6 +753,11 @@ pub fn aggregate_slot(db: &Database, config: &crate::config::AgentConfig, slot_s
     let mut was_recently_active = false;
     let mut consecutive_silent_meeting = 0u32;
     let mut demoted_meeting_minutes = 0u32;
+    // The final per-minute verdicts (after the silent-meeting demotion), in log
+    // order. The auditor sees these on each activity line: the daemon's own rule
+    // engine already classified every minute, and making the model re-derive that
+    // from raw counts produced vaguer reasoning, not independent judgment.
+    let mut minute_states: Vec<&'static str> = Vec::with_capacity(logs.len());
     let evaluator = crate::evaluator::ActivityEvaluator::new();
 
     for log in &logs {
@@ -756,6 +790,15 @@ pub fn aggregate_slot(db: &Database, config: &crate::config::AgentConfig, slot_s
         } else {
             consecutive_silent_meeting = 0;
         }
+
+        minute_states.push(match classification {
+            crate::evaluator::ActivityClassification::Active => "Active",
+            crate::evaluator::ActivityClassification::PassiveReview => "PassiveReview",
+            crate::evaluator::ActivityClassification::Meeting => "Meeting",
+            crate::evaluator::ActivityClassification::Idle => "Idle",
+            crate::evaluator::ActivityClassification::Distracted => "Distracted",
+            crate::evaluator::ActivityClassification::Tampered => "Tampered",
+        });
 
         let is_active = classification == crate::evaluator::ActivityClassification::Active
             || classification == crate::evaluator::ActivityClassification::PassiveReview
@@ -858,17 +901,8 @@ pub fn aggregate_slot(db: &Database, config: &crate::config::AgentConfig, slot_s
             let provider_opt = crate::llm::get_llm_provider(config);
             if let Some(provider) = provider_opt {
                 let mut activity_lines = Vec::new();
-                for log in &logs {
-                    // App name and title are both written by whoever owns the
-                    // window, so both are scrubbed and both ride inside the fence
-                    // (#83). The counts are ours.
-                    activity_lines.push(format!(
-                        "App: '{}', Title: '{}', Keys: {}, Clicks: {}",
-                        crate::untrusted::scrub(&log.active_app_name),
-                        crate::untrusted::scrub(&log.active_window_title),
-                        log.keystroke_count,
-                        log.mouse_click_count
-                    ));
+                for (log, state) in logs.iter().zip(minute_states.iter()) {
+                    activity_lines.push(format_activity_line(log, state));
                 }
                 let mut activity_text = crate::untrusted::fence(&activity_lines.join("\n"));
 
@@ -1014,6 +1048,36 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// The auditor is only as concrete as its input (#111): every line must carry
+    /// the minute label, all three input counts, cursor travel, and the daemon's
+    /// own state verdict.
+    #[test]
+    fn activity_line_carries_time_counts_travel_and_state() {
+        let log = crate::db::MinuteLogData {
+            timestamp: 1_756_363_260,
+            keystroke_count: 94,
+            mouse_click_count: 3,
+            scroll_event_count: 12,
+            active_app_name: "Terminal".into(),
+            active_window_title: "ev-fleet-pilot — -zsh — 114×30".into(),
+            low_entropy: false,
+            mouse_movement_distance: 812.7,
+        };
+        let line = format_activity_line(&log, "Active");
+        assert!(
+            line.contains(
+                "] App: 'Terminal', Title: 'ev-fleet-pilot — -zsh — 114×30', Keys: 94, \
+                 Clicks: 3, Scrolls: 12, MouseTravel: 813px, State: Active"
+            ),
+            "unexpected line: {line}"
+        );
+        // The label is local wall-clock HH:MM — the times the reasoning will cite.
+        assert!(line.starts_with('['), "leads with the minute label: {line}");
+        let label = &line[1..line.find(']').unwrap()];
+        assert_eq!(label.len(), 5, "HH:MM label, got {label}");
+        assert_eq!(label.as_bytes()[2], b':');
+    }
 
     use std::sync::atomic::{AtomicUsize, Ordering};
     static DB_COUNTER: AtomicUsize = AtomicUsize::new(0);

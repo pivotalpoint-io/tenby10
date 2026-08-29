@@ -1545,7 +1545,7 @@ impl Database {
     pub fn get_minute_logs_for_slot(&self, slot_start: i64) -> Result<Vec<MinuteLogData>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT timestamp, keystroke_count, mouse_click_count, scroll_event_count, active_app_name, active_window_title, low_entropy 
+            "SELECT timestamp, keystroke_count, mouse_click_count, scroll_event_count, active_app_name, active_window_title, low_entropy, mouse_movement_distance 
              FROM minute_logs 
              WHERE timestamp >= ?1 AND timestamp < ?2
              ORDER BY timestamp ASC"
@@ -1560,6 +1560,7 @@ impl Database {
                 active_app_name: row.get(4)?,
                 active_window_title: row.get(5)?,
                 low_entropy: low_entropy_int != 0,
+                mouse_movement_distance: row.get(7)?,
             })
         })?;
 
@@ -1730,6 +1731,10 @@ pub struct MinuteLogData {
     pub active_app_name: String,
     pub active_window_title: String,
     pub low_entropy: bool,
+    /// Cursor travel this minute, in pixels. Already recorded per minute since v1;
+    /// surfaced here for the slot auditor, where travel with no clicks is the
+    /// difference between reading and absence.
+    pub mouse_movement_distance: f64,
 }
 
 /// A single 10-minute slot summary as shown in the activity dashboard.
