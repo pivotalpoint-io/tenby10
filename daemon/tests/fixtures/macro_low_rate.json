@@ -1,0 +1,17 @@
+{
+  "label": "macro",
+  "source": "synthetic",
+  "note": "~1 key/min macro; invisible in a per-minute window, visible over the rolling window",
+  "samples": {
+    "kind": "keyboard",
+    "intervals": [
+      60000,
+      60300,
+      59800,
+      60100,
+      59950,
+      60200,
+      60050
+    ]
+  }
+}

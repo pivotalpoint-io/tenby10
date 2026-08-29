@@ -6,6 +6,7 @@ pub mod debrief;
 pub mod entropy;
 pub mod env;
 pub mod evaluator;
+pub mod fixtures;
 pub mod llm;
 pub mod provenance;
 pub mod sync;

@@ -1,0 +1,20 @@
+{
+  "label": "macro",
+  "source": "synthetic",
+  "note": "~200ms with ~20ms jitter; stddev>10ms so the old absolute threshold missed it",
+  "samples": {
+    "kind": "keyboard",
+    "intervals": [
+      180,
+      220,
+      195,
+      210,
+      185,
+      215,
+      200,
+      225,
+      175,
+      205
+    ]
+  }
+}

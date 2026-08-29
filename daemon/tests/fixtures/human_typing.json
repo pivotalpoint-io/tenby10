@@ -1,0 +1,20 @@
+{
+  "label": "human",
+  "source": "synthetic",
+  "note": "varied human typing (CoV ~0.23)",
+  "samples": {
+    "kind": "keyboard",
+    "intervals": [
+      120,
+      150,
+      135,
+      200,
+      180,
+      145,
+      160,
+      220,
+      110,
+      130
+    ]
+  }
+}
