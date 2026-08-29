@@ -2,6 +2,7 @@ pub mod config;
 pub mod daemon;
 pub mod dashboard;
 pub mod db;
+pub mod debrief;
 pub mod entropy;
 pub mod env;
 pub mod evaluator;

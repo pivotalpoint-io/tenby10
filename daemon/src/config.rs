@@ -77,6 +77,32 @@ pub fn default_summary_prompt() -> String {
     )
 }
 
+/// Prompt for the private daily debrief (#113). Not a field of [`AgentConfig`] and
+/// not part of the signed config blob, on purpose: the debrief never affects a
+/// score and never leaves the machine, so there is no rubric to attest to — and
+/// keeping it out of the blob keeps "what the score was computed under" exactly
+/// as small as it was.
+pub fn debrief_prompt() -> String {
+    format!(
+        "You are writing a private end-of-day debrief that only the person who did the work will \
+        read. From the episode log below (one line per stretch of the day), write one paragraph of \
+        four to eight sentences describing the day in plain, neutral language. \
+        - Name the work: the projects, documents, or features the titles show, in your own words, \
+        and how the day was shaped — long focus stretches, fragmentation, interruptions, breaks. \
+        - Describe, never prescribe: no advice, no judgment, no praise or blame. Report what \
+        happened. \
+        - If episodes marked Distracted or Idle are present, account for that time matter-of-factly, \
+        and judge those episodes by their titles rather than their labels — if a 'Distracted' \
+        episode's titles look related to the work, say so. \
+        - If no Distracted or Idle episodes are present, do not speculate about gaps. \
+        - Cite times of day when they help (e.g. 'from 14:10'). Do not restate total hours — the \
+        numbers are shown separately. \
+        {} \
+        Output ONLY the paragraph, with no preamble.",
+        crate::untrusted::PROMPT_RULE
+    )
+}
+
 /// Every built-in auditor prompt this daemon ever shipped as the default, verbatim,
 /// oldest first — excluding the current one. Consumed only by `load_config`'s
 /// prompt-upgrade check (see the comment there). When `default_llm_prompt` changes,

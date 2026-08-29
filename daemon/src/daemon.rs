@@ -314,7 +314,10 @@ pub fn start_daemon_loop(db: Arc<Database>, state: Arc<TelemetryState>) {
     // never delays the first telemetry minute.
     {
         let db_clone = db.clone();
-        thread::spawn(move || generate_pending_summaries(&db_clone));
+        thread::spawn(move || {
+            generate_pending_summaries(&db_clone);
+            generate_pending_debriefs(&db_clone);
+        });
     }
 
     loop {
@@ -430,9 +433,11 @@ pub fn start_daemon_loop(db: Arc<Database>, state: Arc<TelemetryState>) {
         let db_clone = db.clone();
         thread::spawn(move || {
             aggregate_pending_slots(&db_clone);
-            // Off the same beat, and off the main thread: writing a note calls the
-            // user's own AI over the network, which must never stall telemetry.
+            // Off the same beat, and off the main thread: writing a note or a
+            // debrief calls the user's own AI over the network, which must never
+            // stall telemetry.
             generate_pending_summaries(&db_clone);
+            generate_pending_debriefs(&db_clone);
         });
 
         // Reset counts for the next minute segment
@@ -472,6 +477,171 @@ pub fn work_notes_enabled(
     has_provider: bool,
 ) -> bool {
     engine_mode == "llm" && !disable_work_summaries && has_provider
+}
+
+/// A day's debrief inputs, assembled and ready for the model (#113). Split from
+/// the network call so the assembly — episode building, the reconciliation
+/// switch, what does and does not reach the prompt — is testable without a
+/// provider.
+struct PreparedDebrief {
+    activity_text: String,
+    accounting: crate::debrief::DayAccounting,
+    reconciliation: bool,
+    episodes_json: String,
+}
+
+/// Classify each minute of a day with the same rules the slots were scored
+/// under, minus billing-only adjustments (the silent-meeting demotion bounds
+/// credit; it does not describe a day).
+fn classify_day_minutes(
+    logs: &[crate::db::MinuteLogData],
+    config: &crate::config::AgentConfig,
+) -> Vec<&'static str> {
+    let evaluator = crate::evaluator::ActivityEvaluator::new();
+    let mut was_recently_active = false;
+    logs.iter()
+        .map(|log| {
+            let ctx = crate::evaluator::StoredEvaluationContext {
+                keystroke_count: log.keystroke_count,
+                mouse_click_count: log.mouse_click_count,
+                scroll_event_count: log.scroll_event_count,
+                active_app: &log.active_app_name,
+                active_title: &log.active_window_title,
+                low_entropy: log.low_entropy,
+                was_recently_active,
+                distracting_apps: &config.distracting_apps,
+                productive_apps: &config.productive_apps,
+                meeting_apps: &config.meeting_apps,
+            };
+            let c = evaluator.evaluate_stored_minute(&ctx);
+            was_recently_active = c == crate::evaluator::ActivityClassification::Active;
+            state_name(c)
+        })
+        .collect()
+}
+
+/// Assemble one day's debrief inputs, or `None` when the day has nothing worth
+/// a paragraph. The reconciliation switch decides here — not in the renderer —
+/// whether Distracted/Idle episodes reach the model at all: on an ordinary day
+/// they are absent from the prompt, not merely hidden from the page.
+fn prepare_debrief_inputs(
+    db: &Database,
+    config: &crate::config::AgentConfig,
+    day_start: i64,
+    day_end: i64,
+) -> Option<PreparedDebrief> {
+    let categories = db.day_category_minutes(day_start, day_end).ok()?;
+    let accounting = crate::debrief::DayAccounting::from_category_minutes(&categories);
+    if accounting.presence < DEBRIEF_MIN_PRESENCE_MINUTES {
+        return None;
+    }
+    let logs = db.minute_logs_in_period(day_start, day_end).ok()?;
+    if logs.is_empty() {
+        return None;
+    }
+    let states = classify_day_minutes(&logs, config);
+    let episodes = crate::debrief::build_episodes(&logs, &states, &config.distracting_apps);
+    let reconciliation = crate::debrief::needs_reconciliation(&accounting);
+    let lines = crate::debrief::digest_lines(&episodes, reconciliation);
+    if lines.is_empty() {
+        return None;
+    }
+
+    // The episode lines are captured text and ride inside the fence; the
+    // accounting sentence after it is the daemon speaking, kept separable on
+    // purpose (#83).
+    let mut activity_text = crate::untrusted::fence(&lines.join("\n"));
+    activity_text.push_str(&format!(
+        "\n\nDAY ACCOUNTING (computed by the daemon): {}.",
+        crate::debrief::format_accounting_line(&accounting)
+    ));
+    if reconciliation {
+        activity_text.push_str(
+            " Credited time was well below time at the computer, so the log above includes \
+             the Distracted and Idle episodes; account for where that time went.",
+        );
+    } else {
+        activity_text.push_str(
+            " This was an ordinary day; off-work episodes are not included in the log above. \
+             Do not speculate about gaps.",
+        );
+    }
+
+    Some(PreparedDebrief {
+        activity_text,
+        accounting,
+        reconciliation,
+        episodes_json: serde_json::to_string(&episodes).unwrap_or_else(|_| "[]".into()),
+    })
+}
+
+/// Write the private daily debrief for any finished local day that lacks one
+/// (#113), and expire old unkept debriefs while at it.
+///
+/// Gated on the AI engine being on and a provider being reachable — the same
+/// conditions as slot scoring, and deliberately independent of
+/// `disable_work_summaries`: that switch governs the note that syncs, and a
+/// debrief never leaves the machine.
+pub fn generate_pending_debriefs(db: &Database) {
+    let mut config_path = crate::env::get_app_home();
+    config_path.push("config.json");
+    let config = crate::config::load_config(config_path).unwrap_or_default();
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+
+    // Retention is a property of the stored data, not of the AI being
+    // reachable, so it runs before any gate.
+    match db.prune_expired_debriefs(now, DEBRIEF_RETENTION_DAYS * 86_400) {
+        Ok(n) if n > 0 => println!("[Debrief] Expired {n} old debrief(s)."),
+        Ok(_) => {}
+        Err(err) => eprintln!("[Debrief] Could not expire old debriefs: {err:?}"),
+    }
+
+    if config.engine_mode != "llm" {
+        return;
+    }
+    let Some(provider) = crate::llm::get_llm_provider(&config) else {
+        return;
+    };
+
+    let pending = match db.days_needing_debrief(now, SUMMARY_LOOKBACK_DAYS) {
+        Ok(days) => days,
+        Err(err) => {
+            eprintln!("[Debrief] Could not list days needing a debrief: {err:?}");
+            return;
+        }
+    };
+
+    for (day_start, day_end) in pending {
+        let Some(prep) = prepare_debrief_inputs(db, &config, day_start, day_end) else {
+            continue;
+        };
+        println!("[Debrief] Writing the private debrief for the day starting {day_start}...");
+        let narrative =
+            match provider.write_debrief(&crate::config::debrief_prompt(), &prep.activity_text) {
+                Ok(text) => text,
+                Err(err) => {
+                    // Left unwritten: the next loop retries, same as a note.
+                    eprintln!("[Debrief] The AI could not write a debrief for {day_start}: {err}");
+                    continue;
+                }
+            };
+        let accounting_json = serde_json::to_string(&prep.accounting).unwrap_or_default();
+        if let Err(err) = db.insert_daily_debrief(
+            day_start,
+            day_end,
+            &narrative,
+            &accounting_json,
+            prep.reconciliation,
+            &prep.episodes_json,
+            now,
+        ) {
+            eprintln!("[Debrief] Could not store the debrief for {day_start}: {err:?}");
+        }
+    }
 }
 
 /// Say once per run — not once per 60-second loop — that an install which used to
@@ -695,6 +865,28 @@ fn meeting_creditable_ceiling(total_minutes: u32, demoted_meeting_minutes: u32) 
     ((creditable * 100) / 10).min(100)
 }
 
+/// Unkept debriefs expire after this many days (#113). A debrief is regenerable
+/// from the minute logs while they exist, so expiry deletes convenience, not
+/// evidence — and a candid document should not accumulate indefinitely by mere
+/// inertia.
+pub const DEBRIEF_RETENTION_DAYS: i64 = 30;
+
+/// A day with less presence than this has nothing worth a paragraph.
+const DEBRIEF_MIN_PRESENCE_MINUTES: u32 = 30;
+
+/// The display name of a minute's classification, shared by the slot auditor's
+/// activity lines and the debrief's episode builder.
+fn state_name(c: crate::evaluator::ActivityClassification) -> &'static str {
+    match c {
+        crate::evaluator::ActivityClassification::Active => "Active",
+        crate::evaluator::ActivityClassification::PassiveReview => "PassiveReview",
+        crate::evaluator::ActivityClassification::Meeting => "Meeting",
+        crate::evaluator::ActivityClassification::Idle => "Idle",
+        crate::evaluator::ActivityClassification::Distracted => "Distracted",
+        crate::evaluator::ActivityClassification::Tampered => "Tampered",
+    }
+}
+
 /// Local wall-clock label (HH:MM) for a minute timestamp. The auditor is asked to
 /// cite these in its reasoning, so they must match the clock the user (and anyone
 /// reading the dashboard beside them) actually saw — hence local time, not UTC.
@@ -791,14 +983,7 @@ pub fn aggregate_slot(db: &Database, config: &crate::config::AgentConfig, slot_s
             consecutive_silent_meeting = 0;
         }
 
-        minute_states.push(match classification {
-            crate::evaluator::ActivityClassification::Active => "Active",
-            crate::evaluator::ActivityClassification::PassiveReview => "PassiveReview",
-            crate::evaluator::ActivityClassification::Meeting => "Meeting",
-            crate::evaluator::ActivityClassification::Idle => "Idle",
-            crate::evaluator::ActivityClassification::Distracted => "Distracted",
-            crate::evaluator::ActivityClassification::Tampered => "Tampered",
-        });
+        minute_states.push(state_name(classification));
 
         let is_active = classification == crate::evaluator::ActivityClassification::Active
             || classification == crate::evaluator::ActivityClassification::PassiveReview
@@ -1048,6 +1233,94 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// The reconciliation switch decides what the model is ever shown (#113): an
+    /// ordinary day's prompt carries no Distracted episode and says so; a day
+    /// with a material gap carries them and asks for the accounting.
+    #[test]
+    fn debrief_inputs_withhold_offwork_on_quiet_days_and_include_it_on_gap_days() {
+        let db = Arc::new(create_test_db());
+        let mut config = AgentConfig::default();
+        config.distracting_apps = "youtube".to_string();
+        config.productive_apps = "vscode, cursor".to_string();
+
+        // Quiet day: four fully productive slots (40m, above the presence floor).
+        for slot_idx in 0..4i64 {
+            let slot = 600 + slot_idx * 600;
+            for i in 0..10 {
+                db.insert_minute_log(slot + i * 60, 80, 6, 0, 5.0, "Code", "billing.rs", false)
+                    .unwrap();
+            }
+            aggregate_slot(&db, &config, slot);
+        }
+        let (day_start, day_end) = crate::db::local_day_bounds(600);
+        let prep = prepare_debrief_inputs(&db, &config, day_start, day_end)
+            .expect("a 40-minute fully productive day clears the presence floor");
+        assert!(!prep.reconciliation);
+        assert!(
+            prep.activity_text.contains("ordinary day"),
+            "quiet days say so: {}",
+            prep.activity_text
+        );
+        assert!(
+            !prep.activity_text.contains("Distracted"),
+            "no off-work lines on a quiet day: {}",
+            prep.activity_text
+        );
+
+        // Gap day, fresh db: 1 productive slot, then 70 minutes of YouTube —
+        // 10 credited of 80 present, a 70-minute gap, comfortably past both
+        // reconciliation floors.
+        let db2 = Arc::new(create_test_db());
+        for i in 0..10 {
+            db2.insert_minute_log(600 + i * 60, 80, 6, 0, 5.0, "Code", "billing.rs", false)
+                .unwrap();
+        }
+        aggregate_slot(&db2, &config, 600);
+        for slot_idx in 0..7i64 {
+            let slot = 1200 + slot_idx * 600;
+            for i in 0..10 {
+                db2.insert_minute_log(
+                    slot + i * 60,
+                    0,
+                    2,
+                    5,
+                    3.0,
+                    "YouTube",
+                    "definitely leisure",
+                    false,
+                )
+                .unwrap();
+            }
+            aggregate_slot(&db2, &config, slot);
+        }
+        let prep2 = prepare_debrief_inputs(&db2, &config, day_start, day_end)
+            .expect("an 80-minute day clears the presence floor");
+        assert!(
+            prep2.reconciliation,
+            "10 credited of 80 present is a material gap"
+        );
+        assert!(
+            prep2.activity_text.contains("Distracted"),
+            "gap days include the off-work episodes: {}",
+            prep2.activity_text
+        );
+        assert!(
+            prep2
+                .activity_text
+                .contains("account for where that time went"),
+            "{}",
+            prep2.activity_text
+        );
+        let episodes: Vec<crate::debrief::Episode> =
+            serde_json::from_str(&prep2.episodes_json).unwrap();
+        assert!(
+            episodes
+                .iter()
+                .any(|e| e.matched_keyword.as_deref() == Some("youtube")),
+            "the matched keyword is stored for the UI's correction control"
+        );
+    }
 
     /// The auditor is only as concrete as its input (#111): every line must carry
     /// the minute label, all three input counts, cursor travel, and the daemon's

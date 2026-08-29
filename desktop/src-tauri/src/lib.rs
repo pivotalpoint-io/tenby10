@@ -488,6 +488,62 @@ async fn dashboard_work_notes(
         .map_err(|e| format!("Database error: {}", e))
 }
 
+/// The private daily debriefs covering `[from, to)` (#113). Local-only data:
+/// this command is the only reader, and nothing in the sync path can reach the
+/// table it comes from.
+#[tauri::command]
+async fn dashboard_debriefs(
+    db: tauri::State<'_, Arc<daemon::db::Database>>,
+    from: i64,
+    to: i64,
+) -> Result<Vec<daemon::db::DailyDebriefView>, String> {
+    let db_clone = db.inner().clone();
+    tokio::task::spawn_blocking(move || db_clone.get_daily_debriefs(from, to))
+        .await
+        .map_err(|e| format!("Task join error: {}", e))?
+        .map_err(|e| format!("Database error: {}", e))
+}
+
+/// Exempt one day's debrief from the retention sweep, or hand it back.
+#[tauri::command]
+async fn debrief_set_kept(
+    db: tauri::State<'_, Arc<daemon::db::Database>>,
+    day_start: i64,
+    kept: bool,
+) -> Result<(), String> {
+    let db_clone = db.inner().clone();
+    tokio::task::spawn_blocking(move || db_clone.set_debrief_kept(day_start, kept))
+        .await
+        .map_err(|e| format!("Task join error: {}", e))?
+        .map_err(|e| format!("Database error: {}", e))
+}
+
+/// Remove one keyword from `distracting_apps` — the debrief's "not a
+/// distraction" control. Affects how future minutes are classified; scored
+/// slots keep the verdicts they were signed under.
+#[tauri::command]
+async fn remove_distracting_keyword(keyword: String) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || {
+        let mut config_path = daemon::env::get_app_home();
+        config_path.push("config.json");
+        let mut config = daemon::config::load_config(config_path.clone())?;
+        let needle = keyword.trim().to_lowercase();
+        if needle.is_empty() {
+            return Err("no keyword given".to_string());
+        }
+        let kept: Vec<&str> = config
+            .distracting_apps
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty() && s.to_lowercase() != needle)
+            .collect();
+        config.distracting_apps = kept.join(", ");
+        daemon::config::save_config(config_path, &config)
+    })
+    .await
+    .map_err(|err| format!("keyword removal panicked: {err}"))?
+}
+
 /// Whether note generation is live right now: the user's own AI is configured and
 /// notes are not opted out. Drives the dashboard's empty state, so the invitation
 /// only appears to people who would actually gain something by acting on it.
@@ -867,6 +923,9 @@ pub fn run() {
             dashboard_pending_slots,
             dashboard_slot_details,
             dashboard_work_notes,
+            dashboard_debriefs,
+            debrief_set_kept,
+            remove_distracting_keyword,
             work_notes_enabled,
             export_dashboard_csv,
             get_agent_config,

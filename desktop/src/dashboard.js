@@ -41,6 +41,11 @@ function goHome() {
         // does, this can go and workNotesEnabled alone will be right again.
         let aiEngineOn = false;
 
+        // Private daily debriefs (#113), keyed by YYYY-MM-DD. Local-only data:
+        // absent is a normal state (AI off, day too small, or expired), and an
+        // absent debrief renders as nothing at all — never as a nag.
+        let debriefs = {};
+
         function dateKeyOf(unixSeconds) {
             const d = new Date(unixSeconds * 1000);
             const y = d.getFullYear();
@@ -65,6 +70,104 @@ function goHome() {
             } catch (err) {
                 console.error('Error fetching work notes', err);
             }
+        }
+
+        async function fetchDebriefs() {
+            try {
+                const rows = await invoke('dashboard_debriefs', { from: 0, to: 4102444800 });
+                debriefs = {};
+                (rows || []).forEach(d => {
+                    debriefs[dateKeyOf(d.day_start)] = d;
+                });
+            } catch (err) {
+                console.error('Error fetching debriefs', err);
+            }
+        }
+
+        function hhmm(unixSeconds) {
+            return new Date(unixSeconds * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
+        }
+
+        const DEBRIEF_STATE_LABELS = {
+            Active: 'Working',
+            PassiveReview: 'Reading',
+            Meeting: 'Meeting',
+            Idle: 'Idle',
+            Distracted: 'Distraction',
+            Tampered: 'Flagged',
+            Away: 'Away',
+        };
+
+        /// One row of the debrief's episode list. Titles render into a hidden
+        /// span so nothing sensitive is on screen until explicitly asked for —
+        /// including in reconciliation mode.
+        function renderEpisodeRow(ep) {
+            const label = DEBRIEF_STATE_LABELS[ep.state] || ep.state;
+            const stateClass = `debrief-state-${ep.state.toLowerCase()}`;
+            const span = `${hhmm(ep.start)}–${hhmm(ep.end)}`;
+            const what = ep.state === 'Away'
+                ? '<em>Away from the computer</em>'
+                : escapeHtml(ep.app || '(unknown app)');
+            const title = ep.state !== 'Away' && ep.title
+                ? `<span class="debrief-episode-title" style="display:none;">${escapeHtml(ep.title)}</span>`
+                : '';
+            let fix = '';
+            if (ep.state === 'Distracted' && ep.matched_keyword) {
+                fix = `<button type="button" class="debrief-fix-btn"
+                          data-remove-distraction="${escapeHtml(ep.matched_keyword)}">
+                          Not a distraction</button>`;
+            }
+            return `
+                <div class="debrief-episode-row">
+                    <span class="debrief-episode-span">${span}</span>
+                    <span class="debrief-episode-mins">${ep.minutes}m</span>
+                    <span class="debrief-episode-app">${what}${title}</span>
+                    <span class="debrief-state-chip ${stateClass}">${label}</span>
+                    ${fix}
+                </div>
+            `;
+        }
+
+        /// The private debrief card under the day's note (#113). Returns '' when
+        /// no debrief exists — quiet is a designed state here.
+        function renderDebrief(dateKey) {
+            const d = debriefs[dateKey];
+            if (!d) return '';
+            const recon = !!d.reconciliation;
+            const episodes = d.episodes || [];
+            const expanded = recon;
+            const explainer = recon
+                ? `<span class="work-note-meta">Shown in detail because credited time was well below time at the computer.</span>`
+                : '';
+            const keepLabel = d.kept
+                ? 'Kept · click to let it expire'
+                : 'Keep this day';
+            return `
+                <div class="debrief-card">
+                    <div class="debrief-head">
+                        <h4 class="work-note-label">Your day, privately</h4>
+                        <span class="debrief-badge">Stays on this device · ${d.kept ? 'kept' : 'expires after 30 days'}</span>
+                    </div>
+                    <p class="debrief-accounting">${escapeHtml(d.accounting_line)}</p>
+                    <p class="work-note-text">${escapeHtml(d.narrative)}</p>
+                    ${explainer}
+                    <div class="debrief-actions">
+                        <button type="button" class="debrief-action-btn" data-debrief-toggle="${d.day_start}">
+                            ${expanded ? '▾' : '▸'} Episodes (${episodes.length})
+                        </button>
+                        <button type="button" class="debrief-action-btn" data-debrief-keep="${d.day_start}" data-kept="${d.kept ? '1' : '0'}">
+                            ${keepLabel}
+                        </button>
+                    </div>
+                    <div class="debrief-episodes" id="debrief-episodes-${d.day_start}" style="display:${expanded ? 'block' : 'none'};">
+                        ${episodes.map(renderEpisodeRow).join('')}
+                        ${episodes.some(e => e.state !== 'Away' && e.title) ? `
+                        <button type="button" class="debrief-action-btn" data-debrief-titles="${d.day_start}">
+                            Show window titles
+                        </button>` : ''}
+                    </div>
+                </div>
+            `;
         }
 
         /// The note card shown above a day's timeline. Returns '' when there is
@@ -115,6 +218,7 @@ function goHome() {
                 const slots = await invoke('dashboard_slots');
                 const pendingSlots = await invoke('dashboard_pending_slots');
                 await fetchWorkNotes();
+                await fetchDebriefs();
 
                 globalSlots = slots || [];
 
@@ -734,6 +838,8 @@ function goHome() {
 
                 ${renderWorkNote(currentDateKey)}
 
+                ${renderDebrief(currentDateKey)}
+
                 <div style="margin-bottom: 2rem; background: rgba(0,0,0,0.15); border: 1px solid var(--border-card); border-radius: 12px; padding: 1.2rem;">
                     <h4 style="font-size: 0.8rem; text-transform: uppercase; color: var(--text-muted); letter-spacing: 0.8px; margin-bottom: 0.6rem;">24-Hour Focus Heatmap</h4>
                     <div class="heatmap-bar">
@@ -1138,6 +1244,63 @@ function goHome() {
         document.addEventListener('click', (event) => {
             const target = event.target;
             if (!(target instanceof Element)) return;
+
+            const debriefToggle = target.closest('[data-debrief-toggle]');
+            if (debriefToggle) {
+                const list = document.getElementById(`debrief-episodes-${debriefToggle.getAttribute('data-debrief-toggle')}`);
+                if (list) {
+                    const nowOpen = list.style.display === 'none';
+                    list.style.display = nowOpen ? 'block' : 'none';
+                    debriefToggle.textContent = `${nowOpen ? '▾' : '▸'} ${debriefToggle.textContent.slice(2)}`;
+                }
+                return;
+            }
+
+            const titlesBtn = target.closest('[data-debrief-titles]');
+            if (titlesBtn) {
+                const list = document.getElementById(`debrief-episodes-${titlesBtn.getAttribute('data-debrief-titles')}`);
+                if (list) {
+                    const hidden = list.querySelector('.debrief-episode-title')?.style.display === 'none';
+                    list.querySelectorAll('.debrief-episode-title').forEach(el => {
+                        el.style.display = hidden ? 'inline' : 'none';
+                    });
+                    titlesBtn.textContent = hidden ? 'Hide window titles' : 'Show window titles';
+                }
+                return;
+            }
+
+            const keepBtn = target.closest('[data-debrief-keep]');
+            if (keepBtn) {
+                const dayStart = Number(keepBtn.getAttribute('data-debrief-keep'));
+                const kept = keepBtn.getAttribute('data-kept') === '1';
+                invoke('debrief_set_kept', { dayStart, kept: !kept })
+                    .then(() => fetchDebriefs())
+                    .then(() => renderCurrentView())
+                    .catch(err => console.error('Could not update the debrief', err));
+                return;
+            }
+
+            // Two clicks on purpose: the first arms, the second removes. A rule
+            // change deserves a beat of confirmation, without a dialog.
+            const fixBtn = target.closest('[data-remove-distraction]');
+            if (fixBtn) {
+                const keyword = fixBtn.getAttribute('data-remove-distraction');
+                if (fixBtn.getAttribute('data-armed') !== '1') {
+                    fixBtn.setAttribute('data-armed', '1');
+                    fixBtn.textContent = `Remove '${keyword}' from distractions?`;
+                    return;
+                }
+                invoke('remove_distracting_keyword', { keyword })
+                    .then(() => {
+                        fixBtn.textContent = 'Removed · applies to future days';
+                        fixBtn.disabled = true;
+                    })
+                    .catch(err => {
+                        fixBtn.textContent = 'Could not remove — see Settings';
+                        console.error('Could not remove distraction keyword', err);
+                    });
+                return;
+            }
 
             const scroller = target.closest('[data-scroll-to]');
             if (scroller) {
