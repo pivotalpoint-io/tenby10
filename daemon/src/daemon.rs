@@ -385,7 +385,7 @@ pub fn start_daemon_loop(db: Arc<Database>, state: Arc<TelemetryState>) {
 
         let classification = evaluator.evaluate_minute(&ctx);
 
-        // Input provenance (#87): surface synthetic (software-injected) input.
+        // Input provenance: surface synthetic (software-injected) input.
         // Detection is observe-only unless enforcement is enabled; the rule only
         // fires when the minute had input but NONE of it was genuine hardware.
         let (synthetic_events, genuine_events) = crate::provenance::take_counts();
