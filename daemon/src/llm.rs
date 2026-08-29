@@ -93,6 +93,11 @@ pub trait LlmProvider {
     /// Write the daily work note (ADR 0019). Same provider and key as scoring, but the
     /// reply is prose rather than JSON, because this text is what a client reads.
     fn write_note(&self, system_prompt: &str, activity_text: &str) -> Result<String, String>;
+
+    /// Write the private daily debrief (#113): the same prose call as a note, but
+    /// contained by [`sanitize_debrief`] — a paragraph is the expected shape, so
+    /// the ceiling is [`MAX_DEBRIEF_CHARS`] rather than a note's two sentences.
+    fn write_debrief(&self, system_prompt: &str, activity_text: &str) -> Result<String, String>;
 }
 
 /// Guard rail on whatever the model returns. The note publishes without a review step,
@@ -106,6 +111,23 @@ pub trait LlmProvider {
 /// cannot see is whether the *words* came from a window title — that needs the day's
 /// titles, so it is checked in `daemon::generate_pending_summaries` before signing.
 pub fn sanitize_note(raw: &str) -> Result<String, String> {
+    sanitize_prose(raw, 600, "one or two sentences")
+}
+
+/// Ceiling on a debrief narrative, in characters. A paragraph of four to eight
+/// sentences fits comfortably; like the note's 600 this rejects a malfunction,
+/// not a style.
+pub const MAX_DEBRIEF_CHARS: usize = 2400;
+
+/// Guard rail for the debrief paragraph — [`sanitize_note`]'s rules at
+/// paragraph size. The debrief never publishes, but it is still model output
+/// rendered in the dashboard, so the same malfunctions are refused: emptiness,
+/// echoed fence markers, essays.
+pub fn sanitize_debrief(raw: &str) -> Result<String, String> {
+    sanitize_prose(raw, MAX_DEBRIEF_CHARS, "one paragraph")
+}
+
+fn sanitize_prose(raw: &str, max_chars: usize, expected: &str) -> Result<String, String> {
     // Flatten control characters and whitespace runs: the note is signed, stored, and
     // rendered next to an invoice, and a model that wrapped its sentence over three
     // lines has not written a different note.
@@ -123,10 +145,11 @@ pub fn sanitize_note(raw: &str) -> Result<String, String> {
     if crate::untrusted::contains_fence_marker(&text) {
         return Err("model echoed the untrusted-data markers back into the note".into());
     }
-    if text.chars().count() > 600 {
+    if text.chars().count() > max_chars {
         return Err(format!(
-            "model returned {} characters; expected one or two sentences",
-            text.chars().count()
+            "model returned {} characters; expected {}",
+            text.chars().count(),
+            expected
         ));
     }
     Ok(text)
@@ -227,6 +250,18 @@ impl LlmProvider for OpenAiProvider {
     }
 
     fn write_note(&self, system_prompt: &str, activity_text: &str) -> Result<String, String> {
+        sanitize_note(&self.prose_reply(system_prompt, activity_text)?)
+    }
+
+    fn write_debrief(&self, system_prompt: &str, activity_text: &str) -> Result<String, String> {
+        sanitize_debrief(&self.prose_reply(system_prompt, activity_text)?)
+    }
+}
+
+impl OpenAiProvider {
+    /// One prose completion, uncontained: every caller wraps this in the
+    /// sanitizer matching what it asked for.
+    fn prose_reply(&self, system_prompt: &str, activity_text: &str) -> Result<String, String> {
         let payload = serde_json::json!({
             "model": self.model,
             "messages": [
@@ -246,7 +281,7 @@ impl LlmProvider for OpenAiProvider {
         let json = res.json::<Value>().map_err(|e| e.to_string())?;
 
         match json["choices"][0]["message"]["content"].as_str() {
-            Some(content) => sanitize_note(content),
+            Some(content) => Ok(content.to_string()),
             None => Err("Failed to parse OpenAI note response".into()),
         }
     }
@@ -323,6 +358,18 @@ impl LlmProvider for AnthropicProvider {
     }
 
     fn write_note(&self, system_prompt: &str, activity_text: &str) -> Result<String, String> {
+        sanitize_note(&self.prose_reply(system_prompt, activity_text)?)
+    }
+
+    fn write_debrief(&self, system_prompt: &str, activity_text: &str) -> Result<String, String> {
+        sanitize_debrief(&self.prose_reply(system_prompt, activity_text)?)
+    }
+}
+
+impl AnthropicProvider {
+    /// One prose completion, uncontained: every caller wraps this in the
+    /// sanitizer matching what it asked for.
+    fn prose_reply(&self, system_prompt: &str, activity_text: &str) -> Result<String, String> {
         let payload = serde_json::json!({
             "model": self.model,
             "max_tokens": 4096,
@@ -355,7 +402,7 @@ impl LlmProvider for AnthropicProvider {
             .or_else(|| json["content"][0]["text"].as_str());
 
         match text {
-            Some(content) => sanitize_note(content),
+            Some(content) => Ok(content.to_string()),
             None => Err("Failed to parse Anthropic note response".into()),
         }
     }
@@ -416,6 +463,18 @@ impl LlmProvider for GeminiProvider {
     }
 
     fn write_note(&self, system_prompt: &str, activity_text: &str) -> Result<String, String> {
+        sanitize_note(&self.prose_reply(system_prompt, activity_text)?)
+    }
+
+    fn write_debrief(&self, system_prompt: &str, activity_text: &str) -> Result<String, String> {
+        sanitize_debrief(&self.prose_reply(system_prompt, activity_text)?)
+    }
+}
+
+impl GeminiProvider {
+    /// One prose completion, uncontained: every caller wraps this in the
+    /// sanitizer matching what it asked for.
+    fn prose_reply(&self, system_prompt: &str, activity_text: &str) -> Result<String, String> {
         let payload = serde_json::json!({
             "systemInstruction": { "parts": [{ "text": system_prompt }] },
             "contents": [{
@@ -439,7 +498,7 @@ impl LlmProvider for GeminiProvider {
         let json = res.json::<Value>().map_err(|e| e.to_string())?;
 
         match json["candidates"][0]["content"]["parts"][0]["text"].as_str() {
-            Some(content) => sanitize_note(content),
+            Some(content) => Ok(content.to_string()),
             None => Err("Failed to parse Gemini note response".into()),
         }
     }

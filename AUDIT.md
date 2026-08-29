@@ -40,7 +40,7 @@ auditable; the cloud portal is not part of this repository.
 | 2 | Only counts/metadata are stored per minute | ✅ Verified | [daemon.rs:414](daemon/src/daemon.rs#L414), [db.rs schema](daemon/src/db.rs) |
 | 3 | No screen capture exists at all | ✅ Verified | No capture code in the client (ADR 0018) — §3 has the grep and names the two lookalike symbols it deliberately excludes |
 | 4 | Raw keystrokes never leave the machine; **raw** window titles never reach tenby10 | ⚠️ Verified, but narrowed on 2026-08-14 | Still true of raw titles: no upload payload has a title field ([sync.rs:85](daemon/src/sync.rs#L85), [sync.rs:168](daemon/src/sync.rs#L168), [sync.rs:185](daemon/src/sync.rs#L185)). What changed: a title-*derived* sentence now does reach tenby10, in the daily work note (§2) — row 9 is what constrains it. Raw titles still go only to your own BYOK provider (row 5) |
-| 5 | Cloud sync (when enrolled) is count/category summaries + hashes + config + your daily work notes; your BYOK provider is the only other destination | ✅ Verified, scope corrected | Five endpoints, all inventoried in §2 — [sync.rs](daemon/src/sync.rs). BYOK calls live in [llm.rs](daemon/src/llm.rs), reached from slot scoring ([daemon.rs:794](daemon/src/daemon.rs#L794)) and from note writing ([daemon.rs:454](daemon/src/daemon.rs#L454)) |
+| 5 | Cloud sync (when enrolled) is count/category summaries + hashes + config + your daily work notes; your BYOK provider is the only other destination | ✅ Verified, scope corrected | Five endpoints, all inventoried in §2 — [sync.rs](daemon/src/sync.rs). BYOK calls live in [llm.rs](daemon/src/llm.rs), reached from slot scoring, note writing, and debrief writing (`generate_pending_debriefs`, [daemon.rs](daemon/src/daemon.rs)); the debrief's output stays local (§1a) |
 | 6 | No image is sent to your LLM provider, ever | ✅ Verified structurally | The provider trait takes text only ([llm.rs](daemon/src/llm.rs)); nothing in the client can produce an image to send |
 | 7 | Focus-scoring rules are deterministic and inspectable | ✅ Verified | [evaluator.rs](daemon/src/evaluator.rs), [entropy.rs](daemon/src/entropy.rs) |
 | 8 | Local logs are tamper-evident (full-payload hash chain) + self-signed when enrolled | ✅ Verified | [db.rs `insert_slot_summary`/`verify_ledger_integrity`](daemon/src/db.rs) — work notes have their own chain, same construction (§5) |
@@ -102,10 +102,17 @@ Written once per 60s at [daemon.rs:414-423](daemon/src/daemon.rs#L414):
 The one genuinely sensitive field is `active_window_title` (it can contain document names, email
 subjects, URLs). It is captured via [daemon.rs:197-215](daemon/src/daemon.rs#L197)
 (`active-win-pos-rs`) and stored **locally**. The title itself only leaves the machine if you connect
-your own AI, and then it goes to *your* provider — for slot scoring, and for writing the daily work
-note (§2). It is **never** a field in anything uploaded to tenby10. What tenby10 does receive is the
-work note: a sentence written *from* titles, which is a weaker boundary than "no title ever travels"
-and is stated as such in rows 4 and 9.
+your own AI, and then it goes to *your* provider — for slot scoring, for writing the daily work
+note, and for the private daily debrief (§2). It is **never** a field in anything uploaded to
+tenby10. What tenby10 does receive is the work note: a sentence written *from* titles, which is a
+weaker boundary than "no title ever travels" and is stated as such in rows 4 and 9.
+
+**§1a. The private daily debrief table.** `daily_debriefs` (#113) stores one local-only record per
+day: a narrative paragraph written by *your* AI, the day's category arithmetic, and the day's
+episode list (spans, apps, titles, states). It is worker-facing by construction: the table has no
+hash, no signature and no sync flag, nothing in [sync.rs](daemon/src/sync.rs) reads it, and the
+only reader is the dashboard. Rows expire after 30 days unless explicitly kept
+(`prune_expired_debriefs`, [db.rs](daemon/src/db.rs)).
 
 ---
 
@@ -182,11 +189,21 @@ Nothing leaves the machine until you **enroll** and sync. The complete list of o
      (`disable_work_summaries`, [daemon.rs:454-470](daemon/src/daemon.rs#L454)). Note this is **not**
      gated on `engine_mode`: connecting an AI is enough, by design (ADR 0019 — "setup once, then
      invisible"). Payload: the day's activity digest (`activity_digest`,
-     [db.rs:1308](daemon/src/db.rs#L1308)) — up to 60 `"12m — App: Window title"` lines, drawn only
-     from slots that cleared the focus bar and only from minutes with real input, so an unbilled
-     personal browse never reaches the model.
+     [db.rs](daemon/src/db.rs)) — up to 60 chronological runs of the form
+     `"09:10–09:52 (42m) — App: Window title"` (#113), drawn only from slots that cleared the
+     focus bar and only from minutes with real input, so an unbilled personal browse never
+     reaches the model.
+   - **Private daily debrief** (#113) — when the AI engine is on and a provider is configured
+     (`generate_pending_debriefs`, [daemon.rs](daemon/src/daemon.rs)). Payload: the day's episode
+     lines (span, app, **window title**, counts, state), *unfiltered by billability* — this feeds
+     a document that never leaves the machine (§1a). On an ordinary day the Distracted and Idle
+     episodes are withheld from the request entirely; they are included only when the day's
+     credited time falls well below presence (`debrief::needs_reconciliation`,
+     [debrief.rs](daemon/src/debrief.rs)), which is also the only case where titles from
+     distracting apps reach the provider. The output is stored locally, is never uploaded, and
+     expires after 30 days unless kept.
 
-   Text only in both cases; no image exists to send (§3).
+   Text only in all three cases; no image exists to send (§3).
 
 3. **Dashboard webfont — self-hosted.** The dashboard font is embedded as a `data:` URI
    ([dashboard.rs](daemon/src/dashboard.rs)); opening the local dashboard makes **no** third-party

@@ -504,6 +504,25 @@ impl Database {
             [],
         )?;
 
+        // Private daily debriefs (#113). Deliberately outside the ledger and the
+        // sync path by construction: no hash, no parent link, no signature, no
+        // synced flag, and nothing in `sync.rs` reads this table. A debrief is a
+        // mirror for the worker, not an attestation — it expires (see
+        // `prune_expired_debriefs`) unless the worker keeps it.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS daily_debriefs (
+                day_start INTEGER PRIMARY KEY,
+                day_end INTEGER NOT NULL,
+                narrative TEXT NOT NULL,
+                accounting TEXT NOT NULL,
+                reconciliation INTEGER NOT NULL,
+                episodes TEXT NOT NULL,
+                generated_at INTEGER NOT NULL,
+                kept INTEGER NOT NULL DEFAULT 0
+            )",
+            [],
+        )?;
+
         // Daily work summaries (ADR 0019), on their own hash chain. They are independent
         // of slot ordering — a summary attests "this text described this period, written
         // at this time" — so they link to each other rather than interleaving with slots.
@@ -1315,27 +1334,80 @@ impl Database {
     /// block in [`crate::untrusted::fence`] before it reaches a model: scrubbing is
     /// what makes the fence hold, it is not the fence.
     pub fn activity_digest(&self, from: i64, to: i64) -> Result<Vec<String>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT m.active_app_name, m.active_window_title, COUNT(*) AS minutes
-             FROM minute_logs m
-             JOIN slot_summaries s
-               ON s.slot_start = m.timestamp - (m.timestamp % 600)
-             WHERE m.timestamp >= ?1 AND m.timestamp < ?2
-               AND s.focus_score >= ?3
-               AND (m.keystroke_count > 0 OR m.mouse_click_count > 0 OR m.scroll_event_count > 0)
-             GROUP BY m.active_app_name, m.active_window_title
-             HAVING minutes >= 2
-             ORDER BY minutes DESC
-             LIMIT 60",
-        )?;
-        let rows = stmt.query_map(params![from, to, BILLABLE_FOCUS_THRESHOLD], |row| {
-            let app = crate::untrusted::scrub(&row.get::<_, String>(0)?);
-            let title = crate::untrusted::scrub(&row.get::<_, String>(1)?);
-            let minutes: i64 = row.get(2)?;
-            Ok(format!("{minutes}m — {app}: {title}"))
-        })?;
-        rows.collect()
+        // Chronological runs, not a ranked tally (#113): the model is asked to
+        // narrate the day, and a word cloud with the chronology deleted cannot
+        // be narrated. Same filters as before — billable slots, input minutes —
+        // only the shape of the digest changed.
+        let minutes: Vec<(i64, String, String)> = {
+            let conn = self.conn.lock().unwrap();
+            let mut stmt = conn.prepare(
+                "SELECT m.timestamp, m.active_app_name, m.active_window_title
+                 FROM minute_logs m
+                 JOIN slot_summaries s
+                   ON s.slot_start = m.timestamp - (m.timestamp % 600)
+                 WHERE m.timestamp >= ?1 AND m.timestamp < ?2
+                   AND s.focus_score >= ?3
+                   AND (m.keystroke_count > 0 OR m.mouse_click_count > 0 OR m.scroll_event_count > 0)
+                 ORDER BY m.timestamp ASC",
+            )?;
+            let rows = stmt.query_map(params![from, to, BILLABLE_FOCUS_THRESHOLD], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?;
+            rows.collect::<Result<Vec<_>>>()?
+        };
+
+        // Collapse consecutive minutes of the same app+title into one run. A
+        // single skipped minute does not break a run; a longer hole does.
+        struct Run {
+            start: i64,
+            end: i64,
+            minutes: i64,
+            app: String,
+            title: String,
+        }
+        let mut runs: Vec<Run> = Vec::new();
+        for (ts, app, title) in minutes {
+            match runs.last_mut() {
+                Some(run) if run.app == app && run.title == title && ts - run.end <= 120 => {
+                    run.end = ts + 60;
+                    run.minutes += 1;
+                }
+                _ => runs.push(Run {
+                    start: ts,
+                    end: ts + 60,
+                    minutes: 1,
+                    app,
+                    title,
+                }),
+            }
+        }
+        runs.retain(|r| r.minutes >= 2);
+
+        // The 60-line ceiling keeps the longest runs but renders them in day
+        // order, so the cap trims resolution rather than scrambling the story.
+        if runs.len() > 60 {
+            runs.sort_by_key(|r| std::cmp::Reverse(r.minutes));
+            runs.truncate(60);
+            runs.sort_by_key(|r| r.start);
+        }
+
+        Ok(runs
+            .iter()
+            .map(|r| {
+                format!(
+                    "{}–{} ({}m) — {}: {}",
+                    crate::debrief::hh_mm(r.start),
+                    crate::debrief::hh_mm(r.end),
+                    r.minutes,
+                    crate::untrusted::scrub(&r.app),
+                    crate::untrusted::scrub(&r.title),
+                )
+            })
+            .collect())
     }
 
     /// Every distinct window title recorded in `[from, to)`.
@@ -1414,6 +1486,185 @@ impl Database {
 
     /// Whether a period already has a summary, at any revision. The generator uses this
     /// to stay idempotent across restarts.
+    /// Whether a debrief already exists for the local day starting at `day_start`.
+    pub fn has_daily_debrief(&self, day_start: i64) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM daily_debriefs WHERE day_start = ?1",
+            params![day_start],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    /// Store a finished debrief. One per day; regenerating a day replaces it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_daily_debrief(
+        &self,
+        day_start: i64,
+        day_end: i64,
+        narrative: &str,
+        accounting_json: &str,
+        reconciliation: bool,
+        episodes_json: &str,
+        generated_at: i64,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO daily_debriefs
+             (day_start, day_end, narrative, accounting, reconciliation, episodes, generated_at, kept)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7,
+                     COALESCE((SELECT kept FROM daily_debriefs WHERE day_start = ?1), 0))",
+            params![
+                day_start,
+                day_end,
+                narrative,
+                accounting_json,
+                reconciliation as i32,
+                episodes_json,
+                generated_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Debriefs covering `[from, to)`, oldest first, for the dashboard day view.
+    pub fn get_daily_debriefs(&self, from: i64, to: i64) -> Result<Vec<DailyDebriefView>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT day_start, day_end, narrative, accounting, reconciliation, episodes,
+                    generated_at, kept
+             FROM daily_debriefs
+             WHERE day_start >= ?1 AND day_start < ?2
+             ORDER BY day_start ASC",
+        )?;
+        let rows = stmt.query_map(params![from, to], |row| {
+            let accounting_raw: String = row.get(3)?;
+            let episodes_raw: String = row.get(5)?;
+            let recon_int: i32 = row.get(4)?;
+            let kept_int: i32 = row.get(7)?;
+            let accounting: crate::debrief::DayAccounting =
+                serde_json::from_str(&accounting_raw).unwrap_or_default();
+            Ok(DailyDebriefView {
+                day_start: row.get(0)?,
+                day_end: row.get(1)?,
+                narrative: row.get(2)?,
+                accounting_line: crate::debrief::format_accounting_line(&accounting),
+                accounting,
+                reconciliation: recon_int != 0,
+                episodes: serde_json::from_str(&episodes_raw).unwrap_or_default(),
+                generated_at: row.get(6)?,
+                kept: kept_int != 0,
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// Mark a day's debrief as kept (exempt from expiry) or not.
+    pub fn set_debrief_kept(&self, day_start: i64, kept: bool) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE daily_debriefs SET kept = ?2 WHERE day_start = ?1",
+            params![day_start, kept as i32],
+        )?;
+        Ok(())
+    }
+
+    /// Delete unkept debriefs older than the retention window. A debrief is
+    /// regenerable from the minute logs while they exist, so expiry costs
+    /// nothing the worker cannot get back by asking.
+    pub fn prune_expired_debriefs(&self, now_ts: i64, retention_secs: i64) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "DELETE FROM daily_debriefs WHERE kept = 0 AND generated_at < ?1",
+            params![now_ts - retention_secs],
+        )?;
+        Ok(n)
+    }
+
+    /// Finished local days that have slot activity but no debrief yet — the
+    /// debrief twin of [`Self::days_needing_summary`], checked against its own
+    /// table so notes and debriefs generate independently.
+    pub fn days_needing_debrief(&self, now_ts: i64, lookback_days: i64) -> Result<Vec<(i64, i64)>> {
+        let earliest = now_ts - lookback_days * 86_400;
+        let slot_starts: Vec<i64> = {
+            let conn = self.conn.lock().unwrap();
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT slot_start FROM slot_summaries
+                 WHERE slot_start >= ?1 ORDER BY slot_start ASC",
+            )?;
+            let rows = stmt.query_map(params![earliest], |row| row.get(0))?;
+            rows.collect::<Result<Vec<i64>>>()?
+        };
+
+        let mut pending: Vec<(i64, i64)> = Vec::new();
+        for slot_start in slot_starts {
+            let (day_start, day_end) = local_day_bounds(slot_start);
+            if day_end > now_ts {
+                continue; // only whole, finished days
+            }
+            if pending.iter().any(|(s, _)| *s == day_start) {
+                continue;
+            }
+            if !self.has_daily_debrief(day_start)? {
+                pending.push((day_start, day_end));
+            }
+        }
+        Ok(pending)
+    }
+
+    /// The day's category minutes summed across its slots — the ledger's own
+    /// arithmetic, reused rather than re-derived, so the debrief's accounting
+    /// line always agrees with what the slots actually credited.
+    pub fn day_category_minutes(
+        &self,
+        from: i64,
+        to: i64,
+    ) -> Result<std::collections::HashMap<String, u32>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT app_categories FROM slot_summaries
+             WHERE slot_start >= ?1 AND slot_start < ?2",
+        )?;
+        let rows = stmt.query_map(params![from, to], |row| row.get::<_, String>(0))?;
+        let mut totals: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+        for raw in rows.flatten() {
+            if let Ok(map) = serde_json::from_str::<std::collections::HashMap<String, u32>>(&raw) {
+                for (k, v) in map {
+                    *totals.entry(k).or_insert(0) += v;
+                }
+            }
+        }
+        Ok(totals)
+    }
+
+    /// Every raw minute log in `[from, to)`, oldest first — the debrief's
+    /// unfiltered input. Unlike [`Self::activity_digest`] nothing is gated on
+    /// billability here: this feeds a document that never leaves the machine.
+    pub fn minute_logs_in_period(&self, from: i64, to: i64) -> Result<Vec<MinuteLogData>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT timestamp, keystroke_count, mouse_click_count, scroll_event_count, active_app_name, active_window_title, low_entropy, mouse_movement_distance 
+             FROM minute_logs 
+             WHERE timestamp >= ?1 AND timestamp < ?2
+             ORDER BY timestamp ASC",
+        )?;
+        let rows = stmt.query_map(params![from, to], |row| {
+            let low_entropy_int: i32 = row.get(6)?;
+            Ok(MinuteLogData {
+                timestamp: row.get(0)?,
+                keystroke_count: row.get(1)?,
+                mouse_click_count: row.get(2)?,
+                scroll_event_count: row.get(3)?,
+                active_app_name: row.get(4)?,
+                active_window_title: row.get(5)?,
+                low_entropy: low_entropy_int != 0,
+                mouse_movement_distance: row.get(7)?,
+            })
+        })?;
+        rows.collect()
+    }
+
     pub fn has_work_summary(&self, period_start: i64) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
@@ -1752,6 +2003,22 @@ pub struct SlotSummaryView {
     pub hash: String,
     pub parent_hash: String,
     pub llm_reasoning: Option<String>,
+}
+
+/// A stored daily debrief as the dashboard renders it (#113). Local-only by
+/// construction — see the table comment in `initialize`.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct DailyDebriefView {
+    pub day_start: i64,
+    pub day_end: i64,
+    pub narrative: String,
+    pub accounting: crate::debrief::DayAccounting,
+    /// Pre-formatted for display so the UI never re-derives the numbers.
+    pub accounting_line: String,
+    pub reconciliation: bool,
+    pub episodes: Vec<crate::debrief::Episode>,
+    pub generated_at: i64,
+    pub kept: bool,
 }
 
 /// A minute-by-minute activity row within a slot, with its classified `state`
@@ -3144,8 +3411,8 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855|CONFIGHASH|PARE
         );
         assert!(digest[0].contains("billing.rs"), "got {:?}", digest[0]);
         assert!(
-            digest[0].starts_with("4m"),
-            "minutes are grouped: {:?}",
+            digest[0].contains("(4m)"),
+            "consecutive minutes collapse into one run with its span: {:?}",
             digest[0]
         );
         assert!(
@@ -3209,6 +3476,69 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855|CONFIGHASH|PARE
         let stored = &db.get_minute_logs_for_slot(0).unwrap()[0].active_window_title;
         assert_eq!(stored.chars().count(), crate::untrusted::MAX_TITLE_CHARS);
         assert!(long_emoji_title.starts_with(stored));
+    }
+
+    /// Debriefs live outside the ledger by construction (#113): their table has
+    /// no signature or chain columns, expiry deletes unkept rows only, and one
+    /// day holds one debrief however often it regenerates.
+    #[test]
+    fn test_debrief_roundtrip_expiry_and_kept() {
+        let db = create_test_db();
+        let acc = serde_json::to_string(&crate::debrief::DayAccounting {
+            presence: 480,
+            credited: 180,
+            meeting: 0,
+            waste: 200,
+            idle: 100,
+            tampered: 0,
+        })
+        .unwrap();
+
+        db.insert_daily_debrief(0, 86_400, "First try.", &acc, true, "[]", 1_000)
+            .unwrap();
+        db.insert_daily_debrief(0, 86_400, "Second try.", &acc, true, "[]", 2_000)
+            .unwrap();
+        let views = db.get_daily_debriefs(0, 86_400).unwrap();
+        assert_eq!(views.len(), 1, "one debrief per day");
+        assert_eq!(views[0].narrative, "Second try.");
+        assert!(views[0].reconciliation);
+        assert_eq!(views[0].accounting.presence, 480);
+        assert!(views[0].accounting_line.contains("8h at the computer"));
+
+        // Unkept debriefs expire; kept ones survive the same sweep.
+        db.insert_daily_debrief(86_400, 172_800, "Old day.", &acc, false, "[]", 3_000)
+            .unwrap();
+        db.set_debrief_kept(0, true).unwrap();
+        let pruned = db
+            .prune_expired_debriefs(10_000 + 30 * 86_400, 30 * 86_400)
+            .unwrap();
+        assert_eq!(pruned, 1, "only the unkept one goes");
+        let left = db.get_daily_debriefs(0, 200_000).unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].day_start, 0, "the kept debrief survived");
+
+        // Re-generation must not clear the kept flag.
+        db.insert_daily_debrief(0, 86_400, "Third try.", &acc, true, "[]", 4_000)
+            .unwrap();
+        assert!(db.get_daily_debriefs(0, 86_400).unwrap()[0].kept);
+    }
+
+    /// `days_needing_debrief` mirrors the note's day discovery but consults its
+    /// own table, so notes and debriefs generate independently.
+    #[test]
+    fn test_days_needing_debrief_is_independent_of_notes() {
+        let db = create_test_db();
+        db.insert_slot_summary(600, 80, 8, 2, 100, 10, "{}", None, "", None)
+            .unwrap();
+        let (day_start, day_end) = local_day_bounds(600);
+        let now = day_end + 3_600;
+
+        let pending = db.days_needing_debrief(now, 7).unwrap();
+        assert_eq!(pending, vec![(day_start, day_end)]);
+
+        db.insert_daily_debrief(day_start, day_end, "Done.", "{}", false, "[]", now)
+            .unwrap();
+        assert!(db.days_needing_debrief(now, 7).unwrap().is_empty());
     }
 
     /// The note echo check gets the whole day, not the billable part the model saw:
