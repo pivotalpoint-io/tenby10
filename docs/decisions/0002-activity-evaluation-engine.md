@@ -2,7 +2,8 @@
 
 *Public edition of this record from the project's decision log: file references are
 repository-relative here, and issue numbers from the project's internal tracker are written out
-in prose. The decisions and their rationale are complete.*
+in prose. Decision records that are not part of this published set are named in prose rather than
+linked. The decisions and their rationale are complete.*
 
 ## Status
 Accepted
@@ -130,8 +131,8 @@ guarantee — matching the framing [AUDIT.md](../../AUDIT.md) already uses.
 
 Meeting detection matched a `meeting_apps` keyword as a loose **substring** of the app name *or* title,
 so "Meeting notes" hit `meet`, "myzoomrecording.mp4" hit `zoom`, and any window renamed to contain
-"zoom" read as a meeting. Every false meeting classification is surface the no-input cap above must
-absorb. Detection is now `is_meeting_context` in
+"zoom" read as a meeting. Every false meeting classification is surface area the no-input cap above
+must absorb. Detection is now `is_meeting_context` in
 [evaluator.rs](../../daemon/src/evaluator.rs):
 
 - **Native client** — loose substring match against the *application name* (OS-reported, hard to spoof)

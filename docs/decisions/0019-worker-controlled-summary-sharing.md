@@ -11,11 +11,11 @@ narrowed to verbatim reproduction and person names.
 ## Context
 
 Real verified links show numbers, categories, and rules. No narrative. (The `aiSummary` on the
-sample page is a demo fixture, marked demo-only in the cloud source.)
+sample page is a demo fixture.)
 
-Narrative is what convinces: hours are trusted when they map to something the reader remembers
-happening. The long-standing manual practice is a weekly written summary next to the invoice.
-Its two failure modes: people write bad notes, and they write them late.
+A number on its own is hard to check. A short note naming the work lets a reader match hours to
+something concrete. The long-standing manual practice is a weekly written summary next to the
+invoice. Its two failure modes: people write bad notes, and they write them late.
 
 Privacy contract at the time of this decision (the cloud privacy page and
 [AUDIT.md](../../AUDIT.md)): per-slot AI reasoning never leaves the machine; only its SHA-256

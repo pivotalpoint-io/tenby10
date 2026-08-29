@@ -16,8 +16,8 @@ pixels. tenby10 does not take pictures of screens. Not "off by default" — abse
 What the subsystem actually was at the time of this decision (≤ v0.2.x):
 
 - One screenshot per 10-minute slot, captured **deterministically at the slot boundary**
-  (`daemon.rs:322-354` of that tree) — the README of the time called it "random"; it was not.
-  Blurred with a 20px Gaussian in memory, raw buffer dropped before any write
+  (`daemon.rs:322-354` of that tree). Blurred with a 20px Gaussian in memory, raw buffer dropped
+  before any write
   (`screen.rs:43-70`), stored at native resolution under `~/.tenby10/screenshots/`, retained
   indefinitely (ADR 0004).
 - It went nowhere. The cloud payload carried only a `screenshot_count` integer (`sync.rs:100`);
@@ -61,9 +61,8 @@ escalate.
 ### 1. It was below the evidential noise floor
 One frame per 10 minutes cannot distinguish 10 minutes of work from 10 seconds of staged screen —
 and ours was *predictable*, taken at the boundary, so even that one frame was gameable on a
-schedule. Incumbent screenshot-based trackers take several random shots an hour **and show them
-to the paying client**. We took one predictable, blurred shot and showed it to nobody. It was
-the costume of screenshot-evidence with none of the evidence.
+schedule. One blurred frame per slot, stored locally and shown to nobody, was the costume of
+screenshot-evidence with none of the evidence.
 
 ### 2. It was squeezed dead between redundant and forbidden
 Everything a 20px-blurred frame could tell an auditor ("looks like an IDE"), the window title
@@ -85,7 +84,7 @@ contradiction waiting to be quoted, in a source-available repo whose claim is "n
   stated promise is that it takes no pictures of your screen — and it had already produced real
   field pain (dev/prod TCC identity collisions, silently faked captures).
 - An indefinite local screen archive is pure liability surface — a discovery/subpoena target,
-  and it was already exposed once by the debug HTTP server's static directory.
+  and every component that can read it is one more thing to keep bounded.
 - Employer-side gravity: capability that exists invites the demand to unlock it; capability
   that does not exist ends the conversation. This is the strongest possible foundation for the
   managed-configuration (MDM) work: **an employer profile cannot force what the binary cannot
@@ -107,8 +106,8 @@ trust mechanism; the permission pane is not the story.
   [ADR 0002](0002-activity-evaluation-engine.md)'s silent-meeting addendum is foreclosed — even
   a perceptual hash needs pixel access and keeps the permission. The liveness track continues
   via mic/camera/in-call signals instead.
-- **If it turns out that paying clients require seeing screens**, a blurred, local-only,
-  never-shown archive was never going to satisfy them. Nothing is hedged by keeping it.
+- **Even if screen images were later judged necessary**, a blurred, local-only, never-shown
+  archive was never going to serve that purpose. Nothing is hedged by keeping it.
 - **Anti-cheat ceiling: unchanged.** The adversary still owns the machine (ADR 0014);
   screenshots never raised that ceiling.
 
