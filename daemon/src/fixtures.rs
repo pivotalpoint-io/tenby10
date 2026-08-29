@@ -1,4 +1,4 @@
-//! Anti-cheat fixture corpus (issue #120).
+//! Anti-cheat fixture corpus (issue #119).
 //!
 //! The entropy heuristics are unit-tested with hand-authored samples — the
 //! detector and its test data written together, which proves the functions do

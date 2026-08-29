@@ -1,4 +1,4 @@
-//! Anti-cheat fixture corpus (issue #120).
+//! Anti-cheat fixture corpus (issue #119).
 //!
 //! Loads every trace in `tests/fixtures/`, runs the real entropy detector over
 //! it, and asserts the verdict matches the trace's known label. Drop a new
@@ -58,7 +58,7 @@ fn corpus_traces_classify_as_labelled() {
         eprintln!(
             "[corpus] WARNING: 0 captured traces — the detector is only checked against \
              hand-authored samples. Add real captures (daemon --capture-trace) to break the \
-             circularity (issue #120)."
+             circularity (issue #119)."
         );
     }
 

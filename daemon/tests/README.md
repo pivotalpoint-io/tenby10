@@ -1,4 +1,4 @@
-# Anti-cheat red-team & fixture corpus (issue #120)
+# Anti-cheat red-team & fixture corpus (issue #119)
 
 The entropy detectors ([`entropy.rs`](../src/entropy.rs)) are unit-tested with hand-authored
 samples — which proves they do what we *designed*, not that they catch what *real* cheat tools emit.

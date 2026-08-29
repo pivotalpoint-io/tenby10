@@ -19,7 +19,7 @@ async fn main() {
                 .expect("--reseal needs a unix timestamp argument")
         });
 
-    // Capture a labelled input trace for the anti-cheat corpus (#120), then exit.
+    // Capture a labelled input trace for the anti-cheat corpus (#119), then exit.
     if args.iter().any(|a| a == "--capture-trace") {
         run_capture_trace(&args);
     }
@@ -170,7 +170,7 @@ fn arg_value(args: &[String], name: &str) -> Option<String> {
         .and_then(|i| args.get(i + 1).cloned())
 }
 
-/// Record a labelled input trace and write it as a corpus fixture (#120), then
+/// Record a labelled input trace and write it as a corpus fixture (#119), then
 /// exit. Usage:
 ///   daemon --capture-trace <out.json> [--kind keyboard|mouse] \
 ///          [--label macro|jiggler|human] [--seconds N]
