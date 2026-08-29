@@ -56,7 +56,7 @@ the provider *you* configure — fully on-device with local Ollama.
 
 The gap previously logged here as **G1** (a `send_screenshots` toggle that never sent anything) is
 closed: rather than wire it up, the screenshot subsystem was removed outright
-([ADR 0018](../decisions/0018-remove-screenshot-subsystem.md)). The toggle is gone, and so is every
+([ADR 0018](docs/decisions/0018-remove-screenshot-subsystem.md)). The toggle is gone, and so is every
 line of capture code.
 
 ---
@@ -122,7 +122,7 @@ Nothing leaves the machine until you **enroll** and sync. The complete list of o
      keystroke/click **counts**, app-category **counts**, a SHA-256 **hash** of the LLM reasoning
      (not the text), the effective-config hash, and the hash-chain link + Ed25519 signature.
    - **Signed daily work notes** (`summary_payload`, [sync.rs:168](daemon/src/sync.rs#L168),
-     `POST /api/v1/summaries`, [ADR 0019](../decisions/0019-worker-controlled-summary-sharing.md),
+     `POST /api/v1/summaries`, [ADR 0019](docs/decisions/0019-worker-controlled-summary-sharing.md),
      shipped 2026-08-14): one or two sentences per finished local day, **as text**. This is the only
      upload that carries prose rather than counts and hashes.
      Fields: `agent_id`, `scheme_version`, `period_start`, `period_end`, `generated_at`,
@@ -217,7 +217,7 @@ ls ~/.tenby10/screenshots 2>/dev/null      # removed on upgrade; never recreated
 
 Earlier versions (≤ v0.2.x) captured one heavily-blurred JPEG per 10-minute slot and kept it locally,
 never uploading it. That subsystem was deleted rather than left switchable — see
-[ADR 0018](../decisions/0018-remove-screenshot-subsystem.md) — and the first run of a current build
+[ADR 0018](docs/decisions/0018-remove-screenshot-subsystem.md) — and the first run of a current build
 deletes the old `~/.tenby10/screenshots/` folder
 ([env.rs `purge_legacy_screenshots`](daemon/src/env.rs)).
 
@@ -231,7 +231,7 @@ held for text metadata, not pixels. The settings page reports whether titles are
 ## 4. Are the scoring rules fair?
 
 All classification is isolated in one pure module so it can be read and unit-tested without the
-capture loop ([decisions/0002](../decisions/0002-activity-evaluation-engine.md)). A minute is sorted
+capture loop ([ADR 0002](docs/decisions/0002-activity-evaluation-engine.md)). A minute is sorted
 into exactly one state by a fixed priority order in
 [evaluator.rs:114-167](daemon/src/evaluator.rs#L114):
 
@@ -273,9 +273,9 @@ and bias toward never flagging a real person:
 
 **Scoring is deterministic and forgiving of thinking time:**
 - Fixed 10-minute denominator so you can't game a 100% off one active minute
-  ([daemon.rs:785-786](daemon/src/daemon.rs#L785), [decisions/0006](../decisions/0006-focus-score-fixed-denominator.md)).
+  ([daemon.rs:785-786](daemon/src/daemon.rs#L785), [ADR 0006](docs/decisions/0006-focus-score-fixed-denominator.md)).
 - 5-minute delayed "idle forgiveness" for reading/thinking pauses at slot boundaries
-  ([daemon.rs:727-783](daemon/src/daemon.rs#L727), [decisions/0011](../decisions/0011-contextual-idle-forgiveness.md)).
+  ([daemon.rs:727-783](daemon/src/daemon.rs#L727), [ADR 0011](docs/decisions/0011-contextual-idle-forgiveness.md)).
 
 **The rules are locked by tests** — read these to see the intended behavior as executable spec:
 - [evaluator.rs:223-459](daemon/src/evaluator.rs#L223) — active / passive / idle / distraction / jiggler.
@@ -363,7 +363,7 @@ real mismatches to close:
 
 - **G1 — CLOSED (removed, not fixed).** A `send_screenshots` toggle used to imply a multimodal
   data flow that was never wired up. Instead of implementing it, the whole screenshot subsystem was
-  deleted ([ADR 0018](../decisions/0018-remove-screenshot-subsystem.md)): no toggle, no capture code,
+  deleted ([ADR 0018](docs/decisions/0018-remove-screenshot-subsystem.md)): no toggle, no capture code,
   no image path to any provider. See §3.
 
 - **G2 — CLOSED for the signing key; narrowed for the API key (#94).** `private_key` and

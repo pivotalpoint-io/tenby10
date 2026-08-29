@@ -12,10 +12,13 @@ screenshots/
 # OS metadata
 .DS_Store
 
-# Specs, Decisions, and Reviews (local only, do not commit)
-decisions/
+# Specs, Decisions, and Reviews (local only, do not commit).
+# Exception: docs/decisions/ holds the decision records AUDIT.md cites, published so its
+# references resolve for a reader of this repository.
+/decisions/
 specs/
-docs/
+docs/*
+!docs/decisions/
 ceo_assessment.json
 cpo_review.json
 investor_memo.json
