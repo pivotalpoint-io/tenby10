@@ -254,26 +254,45 @@ held for text metadata, not pixels. The settings page reports whether titles are
 
 All classification is isolated in one pure module so it can be read and unit-tested without the
 capture loop (ADR 0002). A minute is sorted into exactly one state by a fixed priority order in
-[evaluator.rs:114-167](daemon/src/evaluator.rs#L114):
+`evaluate_minute` / `evaluate_stored_minute` in [evaluator.rs](daemon/src/evaluator.rs):
 
 1. **Anti-cheat first** — mouse jiggler or keyboard macro → `Tampered`
-   ([evaluator.rs:115-121](daemon/src/evaluator.rs#L115)).
+   (`is_mouse_jiggler` / `is_keyboard_macro` in [evaluator.rs](daemon/src/evaluator.rs)).
 2. **Distraction** — active app/title matches your `distracting_apps` list → `Distracted`
-   ([evaluator.rs:123-137](daemon/src/evaluator.rs#L123)).
+   (the `distracting_apps` check in [evaluator.rs](daemon/src/evaluator.rs)).
 3. **Active** — any keystroke, click, or scroll → `Active`
-   ([evaluator.rs:139-144](daemon/src/evaluator.rs#L139)).
+   (the input check in [evaluator.rs](daemon/src/evaluator.rs)).
 4. **Meeting** — no input but the active window is a genuine meeting → `Meeting`
-   (`is_meeting_context` in [evaluator.rs](daemon/src/evaluator.rs)). Matching is hardened (#97): a
-   **native meeting app** by application name, a **whole-word** title keyword (so "Meeting notes" is
-   not a meeting), or a Google Meet **URL/code** in the title — not a loose substring. To stop a
-   spoofed/idle "meeting" window from billing a slot on zero interaction, only up to
-   `MEETING_NO_INPUT_STREAK_CAP` **consecutive**
-   no-input meeting minutes count as active — the streak resets on any real input, so an interactive
-   meeting is fully credited but a fully silent slot stays below the billable gate (see
-   `aggregate_slot` in [daemon.rs](daemon/src/daemon.rs)). The bound also holds in LLM mode: demoted
-   minutes are removed from the ceiling the LLM score may claim (`meeting_creditable_ceiling`).
+   (`meeting_context` in [evaluator.rs](daemon/src/evaluator.rs)). Matching is hardened (#97) and
+   carries a **confidence** (#126):
+   - **Strong** — a **native meeting app** by application name, a platform's own **title shell**
+     (`Meet - …`, `… | Microsoft Teams`, `… - Zoom`, Webex, Slack huddles), or a Google Meet
+     **URL/code** in the title. None of these follow from renaming a window.
+   - **Weak** — a **whole-word** title keyword and nothing else, so "Meeting notes" is not a meeting
+     and `myzoomrecording.mp4` is not a meeting, but a tab a user renames to `zoom` still matches at
+     this tier.
+
+   A browser-hosted call is also **carried across minutes** (`MinuteScanner`): Zoom's web client
+   titles its join page `Join from Zoom Workplace app - Zoom` and then retitles the tab to the
+   meeting topic alone, so after the first minute nothing in the window identifies a meeting. The
+   join page is what licenses the next title to be adopted; an unrelated window, an app switch, or a
+   gap in the record (locked or asleep) ends the session, and it is bounded at
+   `MEETING_SESSION_MAX_MINUTES`.
+
+   To stop a spoofed/idle "meeting" window from billing a slot on zero interaction, only a bounded
+   number of **consecutive** no-input meeting minutes count as active — `MEETING_NO_INPUT_STREAK_CAP`
+   on weak evidence, which keeps a fully silent weak-tier slot below the billable gate, and
+   `MEETING_NO_INPUT_STREAK_CAP_STRONG` on strong evidence, where the spoof the bound exists to stop
+   is not available. The streak resets on any real input (see `aggregate_slot` in
+   [daemon.rs](daemon/src/daemon.rs)). The bound also holds in LLM mode: demoted minutes are removed
+   from the ceiling the LLM score may claim (`meeting_creditable_ceiling`).
+
+   None of this proves a human was present in the call. It establishes that a meeting window was
+   frontmost, which is what the signals available without capturing audio or pixels can show.
 5. **Passive review** — no input but a `productive_apps` app *and* you were recently active →
-   `PassiveReview` ([evaluator.rs:151-163](daemon/src/evaluator.rs#L151)).
+   `PassiveReview` ([evaluator.rs](daemon/src/evaluator.rs)). "Recently" is
+   `RECENT_ACTIVITY_WINDOW_MINUTES`, deliberately short: crediting a longer pause is contextual idle
+   forgiveness (ADR 0011), which grants it only when work genuinely resumes.
 6. **Idle** otherwise.
 
 The lists (`distracting_apps`, `productive_apps`, `meeting_apps`) are **user-configurable** and live
@@ -299,9 +318,10 @@ and bias toward never flagging a real person:
   ([daemon.rs:727-783](daemon/src/daemon.rs#L727), ADR 0011).
 
 **The rules are locked by tests** — read these to see the intended behavior as executable spec:
-- [evaluator.rs:223-459](daemon/src/evaluator.rs#L223) — active / passive / idle / distraction / jiggler.
+- the `tests` module in [evaluator.rs](daemon/src/evaluator.rs) — active / passive / idle /
+  distraction / jiggler, meeting confidence tiers, and browser-hosted meeting continuity.
 - [entropy.rs:204-418](daemon/src/entropy.rs#L204) — human vs macro keyboard, human vs jiggler mouse.
-- [daemon.rs:946-1677](daemon/src/daemon.rs#L946) — full-slot aggregation, partial-slot ADR-0006,
+- the `tests` module in [daemon.rs](daemon/src/daemon.rs) — full-slot aggregation, partial-slot ADR-0006,
   idle-forgiveness approved/rejected, and the v2 config-hash binding.
 
 Run them with `cd daemon && cargo test`.
