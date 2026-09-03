@@ -1,4 +1,4 @@
-//! Input provenance — event-source discrimination (issues #87 macOS, #101 Windows).
+//! Input provenance — event-source discrimination (macOS tap, Windows hooks).
 //!
 //! On **macOS**, real hardware input reports `kCGEventSourceStateHIDSystemState`,
 //! while software-injected events (`CGEventPost` — jiggler apps, simple macros)
@@ -19,7 +19,8 @@
 //!   2. Legitimate tools (text expanders, password-manager auto-type) also post
 //!      synthetic events. The enforcement rule that avoids punishing them —
 //!      "the minute had input but *zero* genuine hardware events" — still needs
-//!      on-device red-team calibration (#96) before it is trusted.
+//!      on-device red-team calibration before it is trusted — the fixture
+//!      corpus and trace-capture tooling that gate needs are tracked in #119.
 //!
 //! **Honest limits.** A hardware HID emulator (Teensy/QMK) posts genuine HID
 //! events, and a sophisticated injector can spoof the source state — both evade.
@@ -131,7 +132,7 @@ pub fn start_provenance_monitor() {
     });
 }
 
-// --- Windows: low-level hooks read the explicit injected flag (#101) ---
+// --- Windows: low-level hooks read the explicit injected flag ---
 //
 // `WH_KEYBOARD_LL` / `WH_MOUSE_LL` deliver `KBDLLHOOKSTRUCT` / `MSLLHOOKSTRUCT`
 // whose `flags` carry `LLKHF_INJECTED` / `LLMHF_INJECTED` — a *direct* "this

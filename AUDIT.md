@@ -77,7 +77,7 @@ and record the *timing gap* between presses (for bot detection), never *what* wa
   (counts only).
 - [daemon.rs:263-276](daemon/src/daemon.rs#L263) — mouse *movement* stores `(x, y, timestamp)` for
   entropy analysis. This is cursor coordinates, not content.
-- A **second, listen-only** tap in [provenance.rs](daemon/src/provenance.rs) (issue #87) — on macOS a
+- A **second, listen-only** tap in [provenance.rs](daemon/src/provenance.rs) — on macOS a
   `CGEventTap` reading only `kCGEventSourceStateID`, on Windows low-level hooks reading only the
   injected-event flag — classifies each event as real-hardware vs. software-injected and counts them.
   It never reads the key value either, and passes every event through unchanged.

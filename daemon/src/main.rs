@@ -83,7 +83,7 @@ async fn main() {
     // Start the global event listener thread in the background
     start_input_listener(state.clone());
 
-    // Start the input-provenance monitor (#87): flags software-injected input.
+    // Start the input-provenance monitor: flags software-injected input.
     daemon::provenance::start_provenance_monitor();
 
     // Start the main loop (this blocks and runs indefinitely)

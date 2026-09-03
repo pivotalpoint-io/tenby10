@@ -25,10 +25,11 @@ base64 = "0.23.0"
 active-win-pos-rs = "0.11.0"
 keyring = { version = "3", features = ["apple-native", "windows-native"] }
 
-# Input-provenance (issue #87/#101). Platform-specific. core-graphics and
-# core-foundation are version-locked: the tap's run-loop source (a core-graphics
-# CFMachPort) and the CFRunLoop it is added to must share one core-foundation
-# version. core-graphics 0.25 depends on core-foundation 0.10, so both move together.
+# Input-provenance: the macOS event tap and the Windows low-level hooks.
+# Platform-specific. core-graphics and core-foundation are version-locked: the
+# tap's run-loop source (a core-graphics CFMachPort) and the CFRunLoop it is
+# added to must share one core-foundation version. core-graphics 0.25 depends on
+# core-foundation 0.10, so both move together.
 [target.'cfg(target_os = "macos")'.dependencies]
 core-graphics = "0.25"
 core-foundation = "0.10"

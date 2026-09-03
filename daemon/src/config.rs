@@ -207,10 +207,11 @@ pub struct AgentConfig {
     pub disable_work_summaries: bool,
     #[serde(default)]
     pub dashboard_port: Option<u16>,
-    /// Enforce synthetic-input detection (#87): mark a minute tampered when its
-    /// input was entirely software-injected. Default off — detection is observe-
-    /// only until on-device red-team calibration (#96), since a bad field read or
-    /// a legit auto-typer could otherwise flag a real user.
+    /// Enforce synthetic-input detection: mark a minute tampered when its input
+    /// was entirely software-injected. Default off — detection is observe-only
+    /// until on-device red-team calibration (the fixture corpus and trace-capture
+    /// tooling that gate needs are tracked in #119), since a bad field read or a
+    /// legit auto-typer could otherwise flag a real user.
     #[serde(default)]
     pub enforce_synthetic_detection: bool,
 }
