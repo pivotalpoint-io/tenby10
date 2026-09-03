@@ -12,6 +12,20 @@ Everything is stored locally under `~/.tenby10/`. If you enroll a device, what s
 
 ---
 
+## 📦 Install
+
+```bash
+brew install --cask pivotalpoint-io/tap/tenby10
+```
+
+Or take the `.dmg` straight from [the latest release](https://github.com/pivotalpoint-io/tenby10/releases/latest). Apple silicon, macOS Big Sur or later, signed and notarized.
+
+Windows installers ship with every release too, but they are **not code-signed yet**, so SmartScreen shows an unknown-publisher warning. That is it doing its job on an unsigned installer rather than a sign of anything wrong: verify the download through its [build provenance](#verifying-a-release-download) or build it yourself.
+
+Uninstalling with `brew uninstall --cask tenby10` leaves your ledger under `~/.tenby10` alone, because it is your record and not ours. `--zap` deletes it.
+
+---
+
 ## 🚀 Key Features
 
 *   ⏱️ **Passive, Zero-Friction Tracking**: The background daemon automatically logs active application and window states. Includes a convenient Pause/Resume toggle switch in the system tray and settings UI to control when tracking is active.
