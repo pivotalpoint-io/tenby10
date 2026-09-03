@@ -1,0 +1,20 @@
+{
+  "label": "human",
+  "source": "synthetic",
+  "note": "bursts separated by idle gaps",
+  "samples": {
+    "kind": "keyboard",
+    "intervals": [
+      110,
+      95,
+      130,
+      85000,
+      120,
+      100,
+      90,
+      62000,
+      115,
+      105
+    ]
+  }
+}

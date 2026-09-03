@@ -19,6 +19,11 @@ async fn main() {
                 .expect("--reseal needs a unix timestamp argument")
         });
 
+    // Capture a labelled input trace for the anti-cheat corpus (#119), then exit.
+    if args.iter().any(|a| a == "--capture-trace") {
+        run_capture_trace(&args);
+    }
+
     let app_home = daemon::env::get_app_home();
     let mut db_path = app_home.clone();
     db_path.push("tenby10.db");
@@ -154,6 +159,91 @@ fn reseal_and_sync(
         Err(err) => {
             eprintln!("ERROR: slot sync failed: {err}");
             1
+        }
+    }
+}
+
+/// Value following a `--flag` on the command line, if any.
+fn arg_value(args: &[String], name: &str) -> Option<String> {
+    args.iter()
+        .position(|a| a == name)
+        .and_then(|i| args.get(i + 1).cloned())
+}
+
+/// Record a labelled input trace and write it as a corpus fixture (#119), then
+/// exit. Usage:
+///   daemon --capture-trace <out.json> [--kind keyboard|mouse] \
+///          [--label macro|jiggler|human] [--seconds N]
+/// Run a real jiggler/macro (or act naturally) during the window. See
+/// daemon/tests/README.md.
+fn run_capture_trace(args: &[String]) -> ! {
+    use daemon::fixtures::{Label, Samples, Trace};
+    use std::time::Duration;
+
+    let out = arg_value(args, "--capture-trace").unwrap_or_else(|| "trace.json".to_string());
+    let kind = arg_value(args, "--kind").unwrap_or_else(|| "keyboard".to_string());
+    let seconds: u64 = arg_value(args, "--seconds")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(30);
+    let label = match arg_value(args, "--label").as_deref().unwrap_or("human") {
+        "macro" => Label::Macro,
+        "jiggler" => Label::Jiggler,
+        "human" => Label::Human,
+        other => {
+            eprintln!("Unknown --label '{}' (use macro|jiggler|human)", other);
+            std::process::exit(2);
+        }
+    };
+
+    let state = Arc::new(TelemetryState::new());
+    start_input_listener(state.clone());
+    println!(
+        "[capture] Recording {} input for {}s -> {}. Run the tool / act now...",
+        kind, seconds, out
+    );
+    std::thread::sleep(Duration::from_secs(seconds));
+
+    let samples = match kind.as_str() {
+        "mouse" => Samples::Mouse {
+            positions: state.mouse_positions.lock().unwrap().clone(),
+        },
+        "keyboard" => Samples::Keyboard {
+            intervals: state.keystroke_intervals.lock().unwrap().clone(),
+        },
+        other => {
+            eprintln!("Unknown --kind '{}' (use keyboard|mouse)", other);
+            std::process::exit(2);
+        }
+    };
+    let count = match &samples {
+        Samples::Keyboard { intervals } => intervals.len(),
+        Samples::Mouse { positions } => positions.len(),
+    };
+
+    let trace = Trace {
+        label,
+        source: "captured".to_string(),
+        note: format!("captured over {}s via --capture-trace", seconds),
+        samples,
+    };
+
+    match std::fs::write(&out, serde_json::to_string_pretty(&trace).unwrap()) {
+        Ok(()) => {
+            println!(
+                "[capture] Wrote {} samples to {} (label={:?}, source=captured).",
+                count, out, label
+            );
+            if count == 0 {
+                eprintln!(
+                    "[capture] WARNING: 0 samples recorded — was Input Monitoring granted, and did \
+                     input actually occur during the window?"
+                );
+            }
+            std::process::exit(0);
+        }
+        Err(err) => {
+            eprintln!("[capture] Failed to write {}: {}", out, err);
+            std::process::exit(1);
         }
     }
 }
