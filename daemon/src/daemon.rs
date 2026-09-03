@@ -301,7 +301,7 @@ pub fn start_daemon_loop(db: Arc<Database>, state: Arc<TelemetryState>) {
     println!("tenby10 Telemetry Daemon started.");
 
     let evaluator = crate::evaluator::ActivityEvaluator::new();
-    let mut was_recently_active = false;
+    let mut scanner = crate::evaluator::MinuteScanner::new();
 
     // One-time cleanup for machines upgrading from a build that still captured
     // screens (ADR 0018).
@@ -377,13 +377,20 @@ pub fn start_daemon_loop(db: Arc<Database>, state: Arc<TelemetryState>) {
             active_title: &active_title,
             mouse_positions: &mouse_pos,
             key_intervals: &key_intervals,
-            was_recently_active,
+            was_recently_active: scanner.was_recently_active(),
             distracting_apps: &config.distracting_apps,
             productive_apps: &config.productive_apps,
             meeting_apps: &config.meeting_apps,
         };
 
-        let classification = evaluator.evaluate_minute(&ctx);
+        // Advances the recent-input window and any in-progress meeting, so the
+        // console line matches what the aggregator will later score (#126).
+        let (classification, _) = scanner.observe(
+            &active_app,
+            &active_title,
+            &config.meeting_apps,
+            evaluator.evaluate_minute(&ctx),
+        );
 
         // Input provenance: surface synthetic (software-injected) input.
         // Detection is observe-only unless enforcement is enabled; the rule only
@@ -404,9 +411,6 @@ pub fn start_daemon_loop(db: Arc<Database>, state: Arc<TelemetryState>) {
         }
 
         // (Removed categorized_app call since it's unused in the live log loop)
-
-        // Update recently active flag for passive focus calculations
-        was_recently_active = classification == crate::evaluator::ActivityClassification::Active;
 
         println!(
             "[{}] App: '{}' | Keys: {} | Clicks: {} | State: {:?}",
@@ -498,7 +502,7 @@ fn classify_day_minutes(
     config: &crate::config::AgentConfig,
 ) -> Vec<&'static str> {
     let evaluator = crate::evaluator::ActivityEvaluator::new();
-    let mut was_recently_active = false;
+    let mut scanner = crate::evaluator::MinuteScanner::new();
     logs.iter()
         .map(|log| {
             let ctx = crate::evaluator::StoredEvaluationContext {
@@ -508,13 +512,17 @@ fn classify_day_minutes(
                 active_app: &log.active_app_name,
                 active_title: &log.active_window_title,
                 low_entropy: log.low_entropy,
-                was_recently_active,
+                was_recently_active: scanner.was_recently_active(),
                 distracting_apps: &config.distracting_apps,
                 productive_apps: &config.productive_apps,
                 meeting_apps: &config.meeting_apps,
             };
-            let c = evaluator.evaluate_stored_minute(&ctx);
-            was_recently_active = c == crate::evaluator::ActivityClassification::Active;
+            let (c, _) = scanner.observe(
+                &log.active_app_name,
+                &log.active_window_title,
+                &config.meeting_apps,
+                evaluator.evaluate_stored_minute(&ctx),
+            );
             state_name(c)
         })
         .collect()
@@ -852,7 +860,27 @@ pub fn aggregate_pending_slots(db: &Database) {
 /// minutes count as active; the streak resets on any real input, so a genuinely
 /// interactive meeting stays fully credited. Kept below the ADR-0012 billable
 /// gate (40% = 4 minutes) so a fully silent meeting slot cannot bill on its own.
+///
+/// This bound applies to `MeetingConfidence::Weak` evidence — a `meeting_apps`
+/// keyword in a window title, which any rename produces.
 const MEETING_NO_INPUT_STREAK_CAP: u32 = 3;
+
+/// The same bound for `MeetingConfidence::Strong` evidence (#126): a native
+/// meeting client frontmost, a platform's own title shell, or an observed join
+/// transition. None of those follow from renaming a window, so the spoof surface
+/// the weak cap exists to absorb is not present and a silent call may hold a full
+/// slot (ADR 0007). It is still a bound, not an exemption: a stale tab left on a
+/// finished call stops earning at the slot boundary rather than accumulating.
+const MEETING_NO_INPUT_STREAK_CAP_STRONG: u32 = 10;
+
+/// The no-input streak a `Meeting` minute is allowed, by how well the window
+/// identifies the meeting.
+pub fn meeting_streak_cap(confidence: Option<crate::evaluator::MeetingConfidence>) -> u32 {
+    match confidence {
+        Some(crate::evaluator::MeetingConfidence::Strong) => MEETING_NO_INPUT_STREAK_CAP_STRONG,
+        _ => MEETING_NO_INPUT_STREAK_CAP,
+    }
+}
 
 /// Upper bound (percent, fixed 10-minute denominator per ADR 0006) that the LLM
 /// score may claim once meeting-spoof inflation is removed: minutes demoted for
@@ -916,6 +944,74 @@ fn format_activity_line(log: &crate::db::MinuteLogData, state: &str) -> String {
     )
 }
 
+/// Longest spacing between consecutive minute logs still treated as continuous.
+/// Aggregation runs on a 60-second cycle and drifts by a second or two, so this
+/// is generous enough to never split an unbroken run and short enough that a
+/// lock, sleep or paused-tracking gap always breaks one.
+const MINUTE_CONTINUITY_TOLERANCE_SECS: i64 = 180;
+
+/// Minutes of history replayed before a slot is scored (#126). Bounded by
+/// `MEETING_SESSION_MAX_MINUTES`: no meeting session can still be held from
+/// further back, so nothing older can change a verdict in this slot.
+pub const SCANNER_WARMUP_MINUTES: i64 = 240;
+
+/// A [`crate::evaluator::MinuteScanner`] primed with the minutes immediately
+/// before `slot_start`, so a slot is scored from the state the classifier was
+/// actually in rather than from cold.
+///
+/// Slots are scored one at a time, and a meeting rarely starts on a slot
+/// boundary: without this, a call that began at 21:59 loses its session at 22:00
+/// and every ten minutes after that. Verdicts from the warm-up are discarded —
+/// only the carried state matters.
+pub fn warmed_scanner(
+    db: &Database,
+    config: &crate::config::AgentConfig,
+    slot_start: i64,
+    first_scored_minute: i64,
+) -> crate::evaluator::MinuteScanner {
+    let mut scanner = crate::evaluator::MinuteScanner::new();
+    let history = db
+        .get_minute_logs_between(slot_start - SCANNER_WARMUP_MINUTES * 60, slot_start)
+        .unwrap_or_default();
+    let evaluator = crate::evaluator::ActivityEvaluator::new();
+    let mut previous = None;
+    for log in &history {
+        // Telemetry stops while the machine is locked or asleep, so a gap in the
+        // record is a gap in what we know. Whatever was frontmost before it is
+        // not evidence about what is frontmost after, and in particular must not
+        // carry a meeting across it.
+        if previous.is_some_and(|prev| log.timestamp - prev > MINUTE_CONTINUITY_TOLERANCE_SECS) {
+            scanner = crate::evaluator::MinuteScanner::new();
+        }
+        previous = Some(log.timestamp);
+        let evaluated_history =
+            evaluator.evaluate_stored_minute(&crate::evaluator::StoredEvaluationContext {
+                keystroke_count: log.keystroke_count,
+                mouse_click_count: log.mouse_click_count,
+                scroll_event_count: log.scroll_event_count,
+                active_app: &log.active_app_name,
+                active_title: &log.active_window_title,
+                low_entropy: log.low_entropy,
+                was_recently_active: scanner.was_recently_active(),
+                distracting_apps: &config.distracting_apps,
+                productive_apps: &config.productive_apps,
+                meeting_apps: &config.meeting_apps,
+            });
+        scanner.observe(
+            &log.active_app_name,
+            &log.active_window_title,
+            &config.meeting_apps,
+            evaluated_history,
+        );
+    }
+    // The same rule across the join: history that stops well before the minute
+    // we are about to score tells us nothing about it.
+    if previous.is_some_and(|prev| first_scored_minute - prev > MINUTE_CONTINUITY_TOLERANCE_SECS) {
+        scanner = crate::evaluator::MinuteScanner::new();
+    }
+    scanner
+}
+
 pub fn aggregate_slot(db: &Database, config: &crate::config::AgentConfig, slot_start: i64) {
     let logs = match db.get_minute_logs_for_slot(slot_start) {
         Ok(logs) => logs,
@@ -942,7 +1038,7 @@ pub fn aggregate_slot(db: &Database, config: &crate::config::AgentConfig, slot_s
     let mut slot_clicks = 0;
     let mut slot_app_categories = HashMap::<String, u32>::new();
 
-    let mut was_recently_active = false;
+    let mut scanner = warmed_scanner(db, config, slot_start, logs[0].timestamp);
     let mut consecutive_silent_meeting = 0u32;
     let mut demoted_meeting_minutes = 0u32;
     // The final per-minute verdicts (after the silent-meeting demotion), in log
@@ -960,22 +1056,31 @@ pub fn aggregate_slot(db: &Database, config: &crate::config::AgentConfig, slot_s
             active_app: &log.active_app_name,
             active_title: &log.active_window_title,
             low_entropy: log.low_entropy,
-            was_recently_active,
+            was_recently_active: scanner.was_recently_active(),
             distracting_apps: &config.distracting_apps,
             productive_apps: &config.productive_apps,
             meeting_apps: &config.meeting_apps,
         };
 
-        let mut classification = evaluator.evaluate_stored_minute(&ctx);
+        // The scanner carries what a single minute cannot see: the recent-input
+        // window, and an in-progress meeting whose window stopped identifying
+        // itself (#126). It may upgrade `Idle` to `Meeting`.
+        let (mut classification, meeting_confidence) = scanner.observe(
+            &log.active_app_name,
+            &log.active_window_title,
+            &config.meeting_apps,
+            evaluator.evaluate_stored_minute(&ctx),
+        );
 
         // ADR 0002 addendum: bound consecutive no-input Meeting minutes. A
         // `Meeting` classification only occurs with no input (any input
         // classifies `Active` earlier), so this streak measures uninterrupted
-        // silence. Beyond the cap, demote to `Idle` so a spoofed, zero-input
-        // "meeting" cannot bill a slot; any real input resets the streak.
+        // silence. Beyond the cap for the evidence at hand, demote to `Idle` so a
+        // spoofed, zero-input "meeting" cannot bill a slot; any real input resets
+        // the streak.
         if classification == crate::evaluator::ActivityClassification::Meeting {
             consecutive_silent_meeting += 1;
-            if consecutive_silent_meeting > MEETING_NO_INPUT_STREAK_CAP {
+            if consecutive_silent_meeting > meeting_streak_cap(meeting_confidence) {
                 classification = crate::evaluator::ActivityClassification::Idle;
                 demoted_meeting_minutes += 1;
             }
@@ -994,8 +1099,6 @@ pub fn aggregate_slot(db: &Database, config: &crate::config::AgentConfig, slot_s
         } else {
             slot_idle_segments += 1;
         }
-
-        was_recently_active = classification == crate::evaluator::ActivityClassification::Active;
 
         slot_keystrokes += log.keystroke_count;
         slot_clicks += log.mouse_click_count;
@@ -1727,15 +1830,16 @@ mod tests {
 
     #[test]
     fn test_aggregate_silent_meeting_is_capped() {
-        // A window whose title/app matches a meeting keyword but receives zero
-        // input for the whole slot must not bill (ADR 0002 addendum). Only
+        // A browser tab whose title merely contains a meeting keyword — the
+        // weak tier, which any rename produces — must not bill a slot on zero
+        // input for the whole slot (ADR 0002 addendum). Only
         // MEETING_NO_INPUT_STREAK_CAP minutes count; the rest demote to Idle.
         let db = Arc::new(create_test_db());
         let mut config = AgentConfig::default();
         config.engine_mode = "static".to_string();
 
         for i in 0..10 {
-            db.insert_minute_log(600 + i * 60, 0, 0, 0, 0.0, "zoom", "Zoom Meeting", false)
+            db.insert_minute_log(600 + i * 60, 0, 0, 0, 0.0, "Google Chrome", "zoom", false)
                 .unwrap();
         }
 
@@ -1863,6 +1967,150 @@ mod tests {
         )
     }
 
+    #[test]
+    fn test_aggregate_silent_strong_meeting_holds_a_slot() {
+        // Strong evidence — the native client is frontmost — is not reachable by
+        // renaming a window, so the spoof surface the weak cap absorbs is absent
+        // and a silent call holds the slot (#126).
+        let db = Arc::new(create_test_db());
+        let mut config = AgentConfig::default();
+        config.engine_mode = "static".to_string();
+
+        for i in 0..10 {
+            db.insert_minute_log(600 + i * 60, 0, 0, 0, 0.0, "zoom.us", "Zoom Meeting", false)
+                .unwrap();
+        }
+
+        aggregate_slot(&db, &config, 600);
+        let (active, idle, focus) = read_slot(&db, 600);
+        assert_eq!(active, 10, "a silent call on strong evidence is credited");
+        assert_eq!(idle, 0);
+        assert_eq!(focus, 100);
+    }
+
+    #[test]
+    fn test_aggregate_zoom_web_client_call_is_credited() {
+        // End to end over the sequence this issue was filed from: the join page
+        // identifies Zoom, then the web client retitles the tab to the meeting
+        // topic and no minute of the call identifies a meeting again.
+        let db = Arc::new(create_test_db());
+        let mut config = AgentConfig::default();
+        config.engine_mode = "static".to_string();
+
+        db.insert_minute_log(
+            600,
+            30,
+            14,
+            0,
+            0.0,
+            "Google Chrome",
+            "Join from Zoom Workplace app - Zoom",
+            false,
+        )
+        .unwrap();
+        for i in 1..10 {
+            db.insert_minute_log(
+                600 + i * 60,
+                0,
+                0,
+                0,
+                0.0,
+                "Google Chrome",
+                "Joe Yetter <> Pablo Fernandez \u{1f50a}",
+                false,
+            )
+            .unwrap();
+        }
+
+        aggregate_slot(&db, &config, 600);
+        let (active, idle, focus) = read_slot(&db, 600);
+        assert_eq!(active, 10, "the call is credited for its duration");
+        assert_eq!(idle, 0);
+        assert_eq!(focus, 100);
+    }
+
+    #[test]
+    fn test_meeting_is_carried_across_a_slot_boundary() {
+        // Calls do not begin on slot boundaries. The join page lands in the
+        // previous slot, so scoring this one from cold would lose the session
+        // and the whole call would read as idle (#126).
+        let db = Arc::new(create_test_db());
+        let mut config = AgentConfig::default();
+        config.engine_mode = "static".to_string();
+
+        db.insert_minute_log(
+            1140, // last minute of the previous slot
+            30,
+            14,
+            0,
+            0.0,
+            "Google Chrome",
+            "Join from Zoom Workplace app - Zoom",
+            false,
+        )
+        .unwrap();
+        for i in 0..10 {
+            db.insert_minute_log(
+                1200 + i * 60,
+                0,
+                0,
+                0,
+                0.0,
+                "Google Chrome",
+                "Joe Yetter <> Pablo Fernandez",
+                false,
+            )
+            .unwrap();
+        }
+
+        aggregate_slot(&db, &config, 1200);
+        let (active, idle, focus) = read_slot(&db, 1200);
+        assert_eq!(active, 10, "the call continues into this slot");
+        assert_eq!(idle, 0);
+        assert_eq!(focus, 100);
+    }
+
+    #[test]
+    fn test_a_gap_in_the_record_does_not_carry_a_meeting() {
+        // Same shape, but the machine was locked or asleep between the join page
+        // and the window we are scoring. Nothing is known about that interval, so
+        // the session must not survive it.
+        let db = Arc::new(create_test_db());
+        let mut config = AgentConfig::default();
+        config.engine_mode = "static".to_string();
+
+        db.insert_minute_log(
+            600,
+            30,
+            14,
+            0,
+            0.0,
+            "Google Chrome",
+            "Join from Zoom Workplace app - Zoom",
+            false,
+        )
+        .unwrap();
+        // ...then nothing until the next slot: a gap well past the tolerance.
+        for i in 0..10 {
+            db.insert_minute_log(
+                1200 + i * 60,
+                0,
+                0,
+                0,
+                0.0,
+                "Google Chrome",
+                "Joe Yetter <> Pablo Fernandez",
+                false,
+            )
+            .unwrap();
+        }
+
+        aggregate_slot(&db, &config, 1200);
+        let (active, idle, _) = read_slot(&db, 1200);
+        assert_eq!(active, 0, "no credit is carried across the gap");
+        assert_eq!(idle, 10);
+    }
+
     fn insert_silent_meeting(db: &Database, slot_start: i64, minutes: i64) {
         for i in 0..minutes {
             db.insert_minute_log(
@@ -1871,8 +2119,8 @@ mod tests {
                 0,
                 0,
                 0.0,
+                "Google Chrome",
                 "zoom",
-                "Zoom Meeting",
                 false,
             )
             .unwrap();
@@ -1917,13 +2165,22 @@ mod tests {
         config.engine_mode = "static".to_string();
 
         for i in 0..5 {
-            db.insert_minute_log(600 + i * 60, 0, 0, 0, 0.0, "zoom", "Zoom Meeting", false)
+            db.insert_minute_log(600 + i * 60, 0, 0, 0, 0.0, "Google Chrome", "zoom", false)
                 .unwrap();
         }
-        db.insert_minute_log(600 + 5 * 60, 100, 10, 0, 0.0, "zoom", "Zoom Meeting", false)
-            .unwrap();
+        db.insert_minute_log(
+            600 + 5 * 60,
+            100,
+            10,
+            0,
+            0.0,
+            "Google Chrome",
+            "zoom",
+            false,
+        )
+        .unwrap();
         for i in 6..10 {
-            db.insert_minute_log(600 + i * 60, 0, 0, 0, 0.0, "zoom", "Zoom Meeting", false)
+            db.insert_minute_log(600 + i * 60, 0, 0, 0, 0.0, "Google Chrome", "zoom", false)
                 .unwrap();
         }
 
@@ -1944,10 +2201,10 @@ mod tests {
         let mut config = AgentConfig::default();
         config.engine_mode = "static".to_string();
 
-        db.insert_minute_log(600, 100, 10, 0, 0.0, "zoom", "Zoom Meeting", false)
+        db.insert_minute_log(600, 100, 10, 0, 0.0, "Google Chrome", "zoom", false)
             .unwrap();
         for i in 1..10 {
-            db.insert_minute_log(600 + i * 60, 0, 0, 0, 0.0, "zoom", "Zoom Meeting", false)
+            db.insert_minute_log(600 + i * 60, 0, 0, 0, 0.0, "Google Chrome", "zoom", false)
                 .unwrap();
         }
 

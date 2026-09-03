@@ -80,30 +80,134 @@ fn title_has_meeting_url(title: &str) -> bool {
         })
 }
 
-/// Whether the active window represents a genuine meeting (issue #97). Native
-/// meeting clients are matched by application name (hard to spoof); browser-hosted
-/// meetings are matched by a whole-word title keyword or a Meet URL/code, so a
-/// document merely titled "Meeting notes" or a window renamed to contain "zoom"
-/// is not mistaken for one. This hardens the spoof surface the ADR-0002 no-input
-/// cap must absorb; it does NOT prove a human is present in a live call (see #94).
-/// `app_lower` / `title_lower` are lowercase.
-fn is_meeting_context(app_lower: &str, title_lower: &str, meeting_apps: &str) -> bool {
-    for keyword in meeting_apps
-        .split(',')
-        .map(|s| s.trim().to_lowercase())
-        .filter(|s| !s.is_empty())
-    {
-        // Native client: the running application itself matches (trusted name).
-        if app_lower.contains(&keyword) {
-            return true;
-        }
-        // Browser tab / window title: whole-word keyword match.
-        if title_matches_keyword(title_lower, &keyword) {
-            return true;
-        }
+/// How strongly the active window identifies a live meeting. The distinction
+/// exists because the ADR-0002 no-input streak cap has to absorb every false
+/// meeting classification: evidence that survives a window rename earns a longer
+/// silent streak than evidence that does not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MeetingConfidence {
+    /// A native meeting client is frontmost, the title carries a platform's own
+    /// structural shell, or a join transition was observed. None of these come
+    /// from renaming a window.
+    Strong,
+    /// A `meeting_apps` keyword appears as a whole word in the title and nothing
+    /// else corroborates it. User-extensible, and spoofable by renaming.
+    Weak,
+}
+
+/// En/em dashes rewritten to ASCII so a platform's title shell matches whichever
+/// dash it ships (Google Meet uses both `Meet - x` and `Meet – x`).
+fn canonical_dashes(title: &str) -> String {
+    title.replace(['\u{2013}', '\u{2014}'], "-")
+}
+
+/// Platform-authored title shells: the wrapper a meeting product puts around the
+/// meeting's own name. Structural rather than keyword-based, so a document called
+/// "Meet Sol, the new model" is not a meeting while `Meet - Standup` is.
+/// `title_lower` is lowercase.
+fn title_has_meeting_shell(title_lower: &str) -> bool {
+    let t = canonical_dashes(title_lower);
+    let t = t.trim();
+    // Google Meet: "Meet - <topic>" / "Meet – <topic>".
+    if t.starts_with("meet - ") {
+        return true;
     }
-    // Browser-hosted meeting recognizable only by its URL/code.
-    title_has_meeting_url(title_lower)
+    // Microsoft Teams, native and web: "<topic> | Microsoft Teams".
+    if t.ends_with("| microsoft teams") || t.contains("| microsoft teams |") {
+        return true;
+    }
+    // Zoom, including the launcher page and the native window.
+    if t.ends_with("- zoom") || t.contains("zoom workplace") || t.contains("zoom meeting") {
+        return true;
+    }
+    // Webex.
+    if t.starts_with("webex |") || t.contains("cisco webex") || t.contains("webex meetings") {
+        return true;
+    }
+    // Slack huddles.
+    if t.contains("| huddle") || t.contains("huddle |") {
+        return true;
+    }
+    false
+}
+
+/// A page that launches or joins a call, as opposed to the call itself. Seeing
+/// one is what licenses [`MeetingSession`] to adopt the next title in the same
+/// application: Zoom's web client titles its join page `Join from Zoom Workplace
+/// app - Zoom` and then retitles the tab to the meeting topic alone, which
+/// carries no platform marker of its own. `title_lower` is lowercase.
+fn is_meeting_launcher(title_lower: &str) -> bool {
+    const LAUNCHERS: [&str; 6] = [
+        "join from zoom",
+        "zoom workplace app",
+        "meeting join",
+        "join meeting",
+        "launching meeting",
+        "start your meeting",
+    ];
+    LAUNCHERS.iter().any(|p| title_lower.contains(p))
+}
+
+/// Compare titles across minutes without tripping over decoration the browser
+/// adds and removes on its own: Chrome appends a speaker glyph while a tab plays
+/// audio and prefixes an unread count. Lowercased, stripped of a leading `(n) `,
+/// non-ASCII removed and whitespace collapsed — applied to both sides, so it only
+/// has to be consistent, not pretty.
+fn normalize_title(title_lower: &str) -> String {
+    let mut t = title_lower.trim();
+    if let Some(rest) = t.strip_prefix('(')
+        && let Some((count, after)) = rest.split_once(')')
+        && !count.is_empty()
+        && count.chars().all(|c| c.is_ascii_digit())
+    {
+        t = after.trim_start();
+    }
+    t.chars()
+        .filter(|c| c.is_ascii())
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Whether the active window represents a genuine meeting, and how strongly
+/// (issue #126, narrowing the #97 hardening). Native meeting clients are matched
+/// by application name and platform title shells by structure, so a document
+/// merely titled "Meeting notes" or a window renamed to contain "zoom" is not
+/// mistaken for one. A bare title keyword still matches, at `Weak`. None of this
+/// proves a human is present in a live call. `app_lower` / `title_lower` are
+/// lowercase.
+fn meeting_context(
+    app_lower: &str,
+    title_lower: &str,
+    meeting_apps: &str,
+) -> Option<MeetingConfidence> {
+    let keywords = || {
+        meeting_apps
+            .split(',')
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| !s.is_empty())
+    };
+
+    // Native client: the running application itself matches (trusted name).
+    if keywords().any(|k| app_lower.contains(&k)) {
+        return Some(MeetingConfidence::Strong);
+    }
+    // Browser-hosted meeting identified by the platform's own title shell, or by
+    // a Meet URL/code.
+    if title_has_meeting_shell(title_lower) || title_has_meeting_url(title_lower) {
+        return Some(MeetingConfidence::Strong);
+    }
+    // Browser tab / window title: whole-word keyword match, spoofable by rename.
+    if keywords().any(|k| title_matches_keyword(title_lower, &k)) {
+        return Some(MeetingConfidence::Weak);
+    }
+    None
+}
+
+/// Whether the active window represents a genuine meeting at all.
+fn is_meeting_context(app_lower: &str, title_lower: &str, meeting_apps: &str) -> bool {
+    meeting_context(app_lower, title_lower, meeting_apps).is_some()
 }
 
 impl ActivityEvaluator {
@@ -216,6 +320,154 @@ impl ActivityEvaluator {
         }
 
         ActivityClassification::Idle
+    }
+}
+
+/// How long a minute keeps granting passive-review credit after the last minute
+/// of real input.
+///
+/// Deliberately 1. Crediting a thinking pause is contextual idle forgiveness
+/// (ADR 0011), which grants it only when the pause is short *and* work genuinely
+/// resumes afterwards. Widening this window would hand out the same credit with
+/// neither condition attached, so a whitelisted app left open would earn for as
+/// long as the window ran — a strictly weaker rule reached by a second route.
+/// The constant exists so the horizon is stated once and every call site derives
+/// it identically, which is what [`MinuteScanner`] is for.
+pub const RECENT_ACTIVITY_WINDOW_MINUTES: u32 = 1;
+
+/// A meeting session is dropped after this long without any corroboration, so a
+/// tab left open on a finished call cannot keep earning indefinitely.
+const MEETING_SESSION_MAX_MINUTES: u32 = 240;
+
+/// A meeting being tracked across minutes.
+struct MeetingSession {
+    /// Lowercased application the meeting lives in.
+    app: String,
+    /// Normalized title being held (see [`normalize_title`]).
+    title: String,
+    confidence: MeetingConfidence,
+    /// Whether a title change should be read as the call starting rather than as
+    /// the meeting ending. Set only while the window is a launcher page, and the
+    /// launcher re-anchors the session every minute it stays frontmost, so the
+    /// change has to follow it immediately.
+    adopt_next_title: bool,
+    /// Minutes this session has been held without fresh direct evidence.
+    held: u32,
+}
+
+/// Per-minute classifier state shared by every call site that scores minutes.
+///
+/// It carries the two things a single minute cannot know on its own: how
+/// recently the user last supplied input, and whether an ongoing meeting explains
+/// a window that no longer looks like one. Sharing one implementation is what
+/// keeps a slot's total and its per-minute drill-down from disagreeing about the
+/// same minute.
+///
+/// Callers read [`Self::was_recently_active`] before classifying a minute, then
+/// hand the verdict back to [`Self::observe`], which may upgrade it and advances
+/// the rolling state.
+#[derive(Default)]
+pub struct MinuteScanner {
+    recent_active: u32,
+    session: Option<MeetingSession>,
+}
+
+impl MinuteScanner {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Whether input landed inside the recent-activity window. Feed this into
+    /// [`LiveEvaluationContext::was_recently_active`] or its stored counterpart.
+    pub fn was_recently_active(&self) -> bool {
+        self.recent_active > 0
+    }
+
+    /// Advance the rolling state with this minute's window and verdict, and
+    /// return the verdict the caller should record.
+    ///
+    /// A minute already credited is never downgraded here: only `Idle` is
+    /// upgraded, and only when a meeting session covers it. The returned
+    /// confidence is `Some` exactly when the verdict is `Meeting`, and selects
+    /// which no-input streak cap applies to it.
+    pub fn observe(
+        &mut self,
+        active_app: &str,
+        active_title: &str,
+        meeting_apps: &str,
+        classification: ActivityClassification,
+    ) -> (ActivityClassification, Option<MeetingConfidence>) {
+        let app_lower = active_app.to_lowercase();
+        let title_lower = active_title.to_lowercase();
+        let direct = meeting_context(&app_lower, &title_lower, meeting_apps);
+        let covering = self.advance_session(&app_lower, &title_lower, direct);
+
+        let mut verdict = classification;
+        if verdict == ActivityClassification::Idle && covering.is_some() {
+            verdict = ActivityClassification::Meeting;
+        }
+
+        if verdict == ActivityClassification::Active {
+            self.recent_active = RECENT_ACTIVITY_WINDOW_MINUTES;
+        } else {
+            self.recent_active = self.recent_active.saturating_sub(1);
+        }
+
+        let confidence = if verdict == ActivityClassification::Meeting {
+            // A directly matched meeting reports its own strength even when no
+            // session is being carried (the first minute of one).
+            covering.or(direct)
+        } else {
+            None
+        };
+        (verdict, confidence)
+    }
+
+    /// Open, continue, adopt or drop the tracked meeting for this minute, and
+    /// return the confidence covering it.
+    fn advance_session(
+        &mut self,
+        app_lower: &str,
+        title_lower: &str,
+        direct: Option<MeetingConfidence>,
+    ) -> Option<MeetingConfidence> {
+        let title_norm = normalize_title(title_lower);
+
+        if let Some(confidence) = direct {
+            // Anchor on what we can see now. Only a launcher page licenses a
+            // later title change to be read as the call starting.
+            self.session = Some(MeetingSession {
+                app: app_lower.to_string(),
+                title: title_norm,
+                confidence,
+                adopt_next_title: is_meeting_launcher(title_lower),
+                held: 0,
+            });
+            return Some(confidence);
+        }
+
+        if let Some(session) = self.session.as_mut()
+            && session.app == app_lower
+        {
+            if session.title == title_norm {
+                session.held += 1;
+                if session.held <= MEETING_SESSION_MAX_MINUTES {
+                    return Some(session.confidence);
+                }
+            } else if session.adopt_next_title {
+                // The join page became the call. The meeting's own title carries
+                // no platform marker, so this is the only point at which it can
+                // be learned.
+                session.title = title_norm;
+                session.confidence = MeetingConfidence::Strong;
+                session.adopt_next_title = false;
+                session.held = 0;
+                return Some(MeetingConfidence::Strong);
+            }
+        }
+
+        self.session = None;
+        None
     }
 }
 
@@ -454,6 +706,227 @@ mod tests {
         assert_eq!(
             e.evaluate_minute(&no_input_ctx("Finder", "myzoomrecording.mp4", "zoom, meet")),
             ActivityClassification::Idle
+        );
+    }
+
+    // --- browser-hosted meeting continuity (#126) ---
+    //
+    // The titles below are real ones observed on a developer machine, including
+    // the Zoom web-client sequence that motivated this issue.
+
+    const MEETINGS: &str = "zoom, meet, teams, webex, slack | huddle";
+
+    /// Drive the scanner over consecutive minutes of `(app, title, keystrokes)`.
+    /// `productive_apps` deliberately excludes browsers so passive-review credit
+    /// cannot mask what the meeting logic is doing.
+    fn drive(
+        minutes: &[(&str, &str, u32)],
+    ) -> Vec<(ActivityClassification, Option<MeetingConfidence>)> {
+        let evaluator = ActivityEvaluator::new();
+        let mut scanner = MinuteScanner::new();
+        minutes
+            .iter()
+            .map(|(app, title, keys)| {
+                let ctx = StoredEvaluationContext {
+                    keystroke_count: *keys,
+                    mouse_click_count: 0,
+                    scroll_event_count: 0,
+                    active_app: app,
+                    active_title: title,
+                    low_entropy: false,
+                    was_recently_active: scanner.was_recently_active(),
+                    distracting_apps: "youtube, netflix",
+                    productive_apps: "vscode, cursor",
+                    meeting_apps: MEETINGS,
+                };
+                let evaluated = evaluator.evaluate_stored_minute(&ctx);
+                scanner.observe(app, title, MEETINGS, evaluated)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_platform_title_shells_are_strong() {
+        for title in [
+            "meet - david/pablo sync",
+            "meet \u{2013} pablo / jorge",
+            "meet \u{2013} pablo / jorge - fen\u{ea}tre de la pr\u{e9}sentation",
+            "call re. vp eng role: pablo & paul | microsoft teams",
+            "meeting join | microsoft teams meeting | microsoft teams",
+            "join from zoom workplace app - zoom",
+            "cisco webex meetings",
+            "acme \u{2014} slack | huddle",
+        ] {
+            assert!(
+                title_has_meeting_shell(title),
+                "shell should match: {title}"
+            );
+            assert_eq!(
+                meeting_context("google chrome", title, MEETINGS),
+                Some(MeetingConfidence::Strong),
+                "should be strong: {title}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_native_client_is_strong_and_bare_keyword_is_weak() {
+        assert_eq!(
+            meeting_context("zoom.us", "zoom", MEETINGS),
+            Some(MeetingConfidence::Strong)
+        );
+        // A whole-word keyword and nothing else: any rename produces this, so it
+        // keeps the lower tier and the tighter streak cap.
+        assert_eq!(
+            meeting_context(
+                "google chrome",
+                "gpt-5.6: meet sol, terra and luna",
+                MEETINGS
+            ),
+            Some(MeetingConfidence::Weak)
+        );
+    }
+
+    #[test]
+    fn test_non_meeting_pages_still_match_nothing() {
+        for title in [
+            "recall.ai: the universal api for meeting bots | product hunt",
+            "meeting notes - q3",
+            "myzoomrecording.mp4",
+            "meeting with michael - gmail",
+        ] {
+            assert_eq!(
+                meeting_context("google chrome", title, MEETINGS),
+                None,
+                "should not match: {title}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_normalize_title_ignores_browser_decoration() {
+        // Chrome appends a speaker glyph while a tab plays audio and prefixes an
+        // unread count; neither means the meeting ended.
+        assert_eq!(
+            normalize_title("joe yetter <> pablo fernandez \u{1f50a}"),
+            normalize_title("joe yetter <> pablo fernandez")
+        );
+        assert_eq!(
+            normalize_title("(3) joe yetter <> pablo fernandez"),
+            normalize_title("joe yetter <> pablo fernandez")
+        );
+    }
+
+    #[test]
+    fn test_zoom_web_client_call_stays_a_meeting() {
+        // The observed sequence: the join page carries a Zoom marker, then the
+        // web client retitles the tab to the meeting topic alone and nothing in
+        // the window identifies a meeting again until the call ends.
+        let out = drive(&[
+            ("Google Chrome", "Join from Zoom Workplace app - Zoom", 30),
+            ("Google Chrome", "Joe Yetter <> Pablo Fernandez", 4),
+            ("Google Chrome", "Joe Yetter <> Pablo Fernandez", 0),
+            (
+                "Google Chrome",
+                "Joe Yetter <> Pablo Fernandez \u{1f50a}",
+                0,
+            ),
+            (
+                "Google Chrome",
+                "Joe Yetter <> Pablo Fernandez \u{1f50a}",
+                0,
+            ),
+            ("Google Chrome", "Carol: Day grid reservation", 11),
+            ("Google Chrome", "Carol: Day grid reservation", 0),
+        ]);
+
+        assert_eq!(out[0].0, ActivityClassification::Active);
+        assert_eq!(out[1].0, ActivityClassification::Active);
+        for i in 2..=4 {
+            assert_eq!(
+                out[i],
+                (
+                    ActivityClassification::Meeting,
+                    Some(MeetingConfidence::Strong)
+                ),
+                "minute {i} of the call"
+            );
+        }
+        // The call ends when the window becomes unrelated content.
+        assert_eq!(out[5].0, ActivityClassification::Active);
+        assert_eq!(out[6].0, ActivityClassification::Idle);
+    }
+
+    #[test]
+    fn test_only_a_launcher_licenses_adopting_a_new_title() {
+        // "Meet - Standup" identifies itself for the whole call, so it never
+        // needs adoption — and must not hand its credit to the next tab.
+        let out = drive(&[
+            ("Google Chrome", "Meet - Standup", 0),
+            ("Google Chrome", "reddit: the front page", 0),
+        ]);
+        assert_eq!(
+            out[0],
+            (
+                ActivityClassification::Meeting,
+                Some(MeetingConfidence::Strong)
+            )
+        );
+        assert_eq!(out[1].0, ActivityClassification::Idle);
+    }
+
+    #[test]
+    fn test_meeting_session_does_not_follow_an_app_switch() {
+        let out = drive(&[
+            ("Google Chrome", "Join from Zoom Workplace app - Zoom", 5),
+            ("Google Chrome", "Joe <> Pablo", 0),
+            ("Finder", "Joe <> Pablo", 0),
+        ]);
+        assert_eq!(out[1].0, ActivityClassification::Meeting);
+        assert_eq!(out[2].0, ActivityClassification::Idle);
+    }
+
+    #[test]
+    fn test_recent_activity_window_covers_a_reading_pause() {
+        // One minute of input, then silence in a whitelisted app. Credit lasts
+        // the rolling window rather than a single minute.
+        let mut minutes = vec![("VSCode", "main.rs", 40u32)];
+        minutes.extend(std::iter::repeat(("VSCode", "main.rs", 0u32)).take(12));
+        let out = drive(&minutes);
+
+        assert_eq!(out[0].0, ActivityClassification::Active);
+        for i in 1..=RECENT_ACTIVITY_WINDOW_MINUTES as usize {
+            assert_eq!(
+                out[i].0,
+                ActivityClassification::PassiveReview,
+                "minute {i} should still be within the window"
+            );
+        }
+        assert_eq!(
+            out[RECENT_ACTIVITY_WINDOW_MINUTES as usize + 1].0,
+            ActivityClassification::Idle,
+            "credit ends once the window closes"
+        );
+    }
+
+    #[test]
+    fn test_input_during_a_call_reopens_the_window() {
+        // A call the user types in stays Active, and the meeting session survives
+        // the interruption because the window never changed.
+        let out = drive(&[
+            ("Google Chrome", "Join from Zoom Workplace app - Zoom", 5),
+            ("Google Chrome", "Joe <> Pablo", 0),
+            ("Google Chrome", "Joe <> Pablo", 22),
+            ("Google Chrome", "Joe <> Pablo", 0),
+        ]);
+        assert_eq!(out[1].0, ActivityClassification::Meeting);
+        assert_eq!(out[2].0, ActivityClassification::Active);
+        assert_eq!(
+            out[3],
+            (
+                ActivityClassification::Meeting,
+                Some(MeetingConfidence::Strong)
+            )
         );
     }
 }

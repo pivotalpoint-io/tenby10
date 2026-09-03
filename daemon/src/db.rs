@@ -1794,6 +1794,11 @@ impl Database {
 
     /// Retrieve all raw minute logs within the specified slot window [slot_start, slot_start + 600).
     pub fn get_minute_logs_for_slot(&self, slot_start: i64) -> Result<Vec<MinuteLogData>> {
+        self.get_minute_logs_between(slot_start, slot_start + 600)
+    }
+
+    /// Retrieve all raw minute logs in `[from, to)`, oldest first.
+    pub fn get_minute_logs_between(&self, from: i64, to: i64) -> Result<Vec<MinuteLogData>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT timestamp, keystroke_count, mouse_click_count, scroll_event_count, active_app_name, active_window_title, low_entropy, mouse_movement_distance 
@@ -1801,7 +1806,7 @@ impl Database {
              WHERE timestamp >= ?1 AND timestamp < ?2
              ORDER BY timestamp ASC"
         )?;
-        let rows = stmt.query_map(params![slot_start, slot_start + 600], |row| {
+        let rows = stmt.query_map(params![from, to], |row| {
             let low_entropy_int: i32 = row.get(6)?;
             Ok(MinuteLogData {
                 timestamp: row.get(0)?,
@@ -1866,9 +1871,21 @@ impl Database {
         let config = crate::config::load_config(config_path).unwrap_or_default();
         let evaluator = crate::evaluator::ActivityEvaluator::new();
 
+        // The drill-down explains a slot's score, so it has to be scored the way
+        // the slot was (#126): same rolling scanner, same silent-meeting
+        // demotion. Deriving either differently is what let this view call a
+        // minute `Inactive` that the slot total had counted `Productive`.
+        let mut scanner = crate::daemon::warmed_scanner(
+            self,
+            &config,
+            slot_start,
+            raw.first().map(|r| r.timestamp).unwrap_or(slot_start),
+        );
+        let mut consecutive_silent_meeting = 0u32;
+
         let mut list = Vec::new();
         for item in raw {
-            let classification =
+            let evaluated =
                 evaluator.evaluate_stored_minute(&crate::evaluator::StoredEvaluationContext {
                     keystroke_count: item.keystroke_count,
                     mouse_click_count: item.mouse_click_count,
@@ -1876,11 +1893,27 @@ impl Database {
                     active_app: &item.active_app_name,
                     active_title: &item.active_window_title,
                     low_entropy: item.low_entropy,
-                    was_recently_active: false,
+                    was_recently_active: scanner.was_recently_active(),
                     distracting_apps: &config.distracting_apps,
                     productive_apps: &config.productive_apps,
                     meeting_apps: &config.meeting_apps,
                 });
+            let (mut classification, meeting_confidence) = scanner.observe(
+                &item.active_app_name,
+                &item.active_window_title,
+                &config.meeting_apps,
+                evaluated,
+            );
+            if classification == crate::evaluator::ActivityClassification::Meeting {
+                consecutive_silent_meeting += 1;
+                if consecutive_silent_meeting
+                    > crate::daemon::meeting_streak_cap(meeting_confidence)
+                {
+                    classification = crate::evaluator::ActivityClassification::Idle;
+                }
+            } else {
+                consecutive_silent_meeting = 0;
+            }
             let state = match classification {
                 crate::evaluator::ActivityClassification::Active
                 | crate::evaluator::ActivityClassification::PassiveReview => "Productive",
