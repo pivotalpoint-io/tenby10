@@ -45,6 +45,7 @@ auditable; the cloud portal is not part of this repository.
 | 7 | Focus-scoring rules are deterministic and inspectable | ✅ Verified | [evaluator.rs](daemon/src/evaluator.rs), [entropy.rs](daemon/src/entropy.rs) |
 | 8 | Local logs are tamper-evident (full-payload hash chain) + self-signed when enrolled | ✅ Verified | [db.rs `insert_slot_summary`/`verify_ledger_integrity`](daemon/src/db.rs) — work notes have their own chain, same construction (§5) |
 | 9 | Your daily work note names the work in its own words — never a verbatim window title, never a person | ⚠️ Mechanism-enforced for verbatim titles; prompt-steered for the rest | The default prompt ([config.rs:60](daemon/src/config.rs#L60)) instructs the model to name the project, document, or feature in its own words, and to reproduce no window title, file path, or URL verbatim and no person's name (ADR 0019 §4). The verbatim rule does not rest on the model: before a note is signed, `note_quotes_a_title` ([untrusted.rs](daemon/src/untrusted.rs), called from [daemon.rs:594](daemon/src/daemon.rs#L594)) refuses a note that echoes a ≥32-normalized-character run of any title captured that day, and `sanitize_note` ([llm.rs:108](daemon/src/llm.rs#L108)) rejects empty or essay-length replies. Short names (a repo, a product) pass the echo check by design. The person-name rule and the naming instruction remain prompt-steered; the prompt's SHA-256 is bound into the signed record so a reader can check which rules applied |
+| 10 | Anyone you share a link with, a client or a manager, sees only what you uploaded: never your screen, window titles, URLs or what you typed | ✅ Bounded by §2; the page itself is rendered by the cloud | §7 lists what the page shows and when new hours appear; commands 3 to 5 in How to verify prove the bound |
 | — | Secrets stored in OS keychain, and the signing key never reaches the app window | ✅ Verified | [config.rs `save_config`/`load_config`](daemon/src/config.rs) — `private_key` & `llm_api_key` kept in the OS keychain via the `keyring` crate. Since #94 the settings UI is sent a redacted config with no `private_key` and no API key value ([lib.rs](desktop/src-tauri/src/lib.rs)); the API key is write-only and the app runs under a `default-src 'self'` CSP — see G2 |
 | — | Local dashboard makes no third-party calls | ✅ Verified | [dashboard.rs](daemon/src/dashboard.rs) — Outfit font embedded as a data URI; no CDN `<link>` |
 | — | The installed app opens **no listening port** | ✅ Verified | The dashboard renders in-app over Tauri IPC. The loopback HTTP server is a debug-only escape hatch for the standalone `daemon` binary, off unless `TENBY10_DEBUG_HTTP` is set — [env.rs `debug_http_enabled`](daemon/src/env.rs) |
@@ -460,6 +461,60 @@ real mismatches to close:
 
 ---
 
+## 7. What someone you share a link with sees
+
+A verified link is the only way anyone else sees your record, whether you send it to a client or to
+a manager. There is one kind of link, so a manager sees exactly what a client would. The page is
+rendered by the tenby10 cloud, which is not part of this repository, so this section describes that
+page as of 2026-09-15. What bounds it is §2: a link can only show what your machine uploaded, and
+commands 3 to 5 in [How to verify](#how-to-verify) prove what that is.
+
+**What the page shows**, for the period set when the link was created:
+
+- the name on the link (the one typed when it was created, or your account name), the label for the
+  person it was made for, and the period
+- your active time, the days you worked, and how many ten-minute intervals counted out of those
+  logged
+- an average focus figure for the period, for each day and for each hour, unless the link was created
+  with averages hidden
+- every logged ten-minute interval, with fully idle ones left out: its start time, its focus score
+  (how much of the ten minutes was active work), whether it counted, and its minutes by category:
+  productive, meetings, reading, distracting, idle, flagged or other
+- your daily work notes, if you turned them on and haven't withdrawn them, marked when one was
+  written more than two days late or corrected
+- the rules that scored the intervals, the most recent ones if they changed during the period: your
+  app lists, whether fake-activity detection was on, and the AI prompt in your scoring
+  configuration, if it has one
+- the fingerprints behind it: each interval's ledger hash, the head of the chain, the rules and
+  prompt fingerprints, and the result of checking the signatures
+
+**What it never shows, because it is never uploaded (§2):** your screen, window titles, URLs, what
+you typed, mouse movement, your AI's reasoning text (only its hash travels), and your private daily
+debrief (§1a).
+
+**Uploaded, but not shown:** keystroke and click counts, and active and idle segment counts. They
+are in every signed slot so the record can be checked, and the page does not display them.
+
+**When new hours appear.** Each ten-minute interval is uploaded as soon as it closes:
+`aggregate_slot` ([daemon.rs:1015](daemon/src/daemon.rs#L1015)) saves the slot, then calls
+`sync_signed_slots` ([daemon.rs:1311](daemon/src/daemon.rs#L1311)). So a link whose period includes
+today shows today's intervals shortly after they end. Nothing on the page says whether you are at
+your machine right now, and nobody is alerted when you start, stop or go idle. Work notes are the
+exception: each waits 12 hours on your machine before it uploads (§2).
+
+**What else can reach them.**
+
+- **A weekly summary email**, if you switch one on for a link: the address you choose gets that
+  week's hours and notes by email, and can unsubscribe with one click.
+- **A weekly report of a team's hours**, if tenby10 prepares one from your link: it uses what the
+  link shows, plus when each interval reached tenby10, and everyone on the team gets the same report.
+
+**What you keep.** You can revoke a link at any time, and it then shows only that it was withdrawn.
+You can withdraw any work note, and it disappears from every link. Someone viewing a link can narrow
+it to a shorter period, but never widen it.
+
+---
+
 ## How to verify
 
 Run these from the `client/` directory. Each is designed to *fail loudly* if a claim is false.
@@ -543,4 +598,4 @@ as the source you can read above. It is a supply-chain control, not a behavioura
 scoring rule, update the relevant row here in the same PR. Adding an endpoint without touching §2 is
 how this guide last went stale (#84) — command 3 in "How to verify" now catches that.*
 
-*Last checked line-by-line against the code on 2026-08-19.*
+*Last checked line-by-line against the code on 2026-08-19; §7 added and checked on 2026-09-15.*
