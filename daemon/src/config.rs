@@ -316,7 +316,7 @@ impl AgentConfig {
     ///
     /// Errors are written for the user; the Settings save path surfaces them as-is.
     pub fn validate(&self) -> Result<(), String> {
-        validate_prompt("System Auditor Prompt", &self.llm_prompt)?;
+        validate_prompt("Scoring Prompt", &self.llm_prompt)?;
         validate_prompt("Work Note Prompt", &self.summary_prompt)?;
 
         // The prompt ceiling leaves room for the app lists, but nothing bounds those on
@@ -1107,13 +1107,13 @@ mod tests {
     #[test]
     fn test_prompt_at_the_limit_is_accepted() {
         let at_limit = "x".repeat(MAX_PROMPT_BYTES);
-        assert!(validate_prompt("System Auditor Prompt", &at_limit).is_ok());
+        assert!(validate_prompt("Scoring Prompt", &at_limit).is_ok());
 
         let over = "x".repeat(MAX_PROMPT_BYTES + 1);
-        let err = validate_prompt("System Auditor Prompt", &over)
+        let err = validate_prompt("Scoring Prompt", &over)
             .expect_err("a prompt over the limit must be refused");
         // The message is shown to the user, so it must name the field and the ceiling.
-        assert!(err.contains("System Auditor Prompt"), "message was: {err}");
+        assert!(err.contains("Scoring Prompt"), "message was: {err}");
         assert!(err.contains("32 KB"), "message was: {err}");
     }
 
@@ -1144,7 +1144,7 @@ mod tests {
 
         for (field, mutate) in [
             (
-                "System Auditor Prompt",
+                "Scoring Prompt",
                 (|c: &mut AgentConfig| c.llm_prompt = "x".repeat(MAX_PROMPT_BYTES + 1))
                     as fn(&mut AgentConfig),
             ),

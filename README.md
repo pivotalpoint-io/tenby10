@@ -139,9 +139,9 @@ identity**, so dev and prod must be distinct apps or they clobber each other's g
   grant that survives rebuilds. The dev app self-isolates to `~/.tenby10_dev` / port 5006.
 - `scripts/prod.sh` — prod config locally (identity `io.pivotalpoint.tenby10`).
 
-> Input capture (keys/clicks/scroll) requires **Input Monitoring**, *not* Accessibility —
-> the settings page reports both, plus a live capture-health readout that reflects whether
-> telemetry is actually being captured.
+> Counting keys, clicks and scrolls requires **Input Monitoring**, *not* Accessibility. The
+> Permissions tab reports both, plus a live "Is it working?" check that shows whether activity is
+> actually being counted.
 
 ---
 

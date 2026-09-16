@@ -64,9 +64,9 @@ fn perform_toggle_tracking(app: &tauri::AppHandle) -> Result<bool, String> {
         .store(new_state, Ordering::Relaxed);
 
     let new_text = if new_state {
-        "Pause Tracking"
+        "Pause tenby10"
     } else {
-        "Resume Tracking"
+        "Resume tenby10"
     };
 
     let tray_state = app.state::<TrayState>();
@@ -111,7 +111,7 @@ async fn enroll_agent(token: String) -> Result<String, String> {
         .map_err(|err| format!("Failed to save local configuration: {}", err))?;
 
     Ok(format!(
-        "Enrolled Successfully!\n\nAgent ID: {}\nPublic Key: {}",
+        "Device linked.\n\nDevice ID: {}\nPublic key: {}",
         config.agent_id, config.public_key
     ))
 }
@@ -979,7 +979,7 @@ pub fn run() {
             let toggle_item = tauri::menu::MenuItem::with_id(
                 app,
                 "toggle_tracking",
-                "Pause Tracking",
+                "Pause tenby10",
                 true,
                 None::<&str>,
             )?;

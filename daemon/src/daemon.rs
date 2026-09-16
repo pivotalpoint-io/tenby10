@@ -664,7 +664,7 @@ fn warn_work_notes_gated_by_engine(engine_mode: &str) {
         println!(
             "[Summary] An AI is configured and daily work notes are switched on, but the AI \
              engine is set to \"{engine_mode}\" — so no note will be written, and no window \
-             title is sent to your provider. Turn the AI Auditor on in Settings to resume \
+             title is sent to your provider. Turn AI scoring on in Settings to resume \
              notes. Hours, categories and rules are unaffected."
         );
     });

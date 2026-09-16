@@ -150,7 +150,7 @@ Nothing leaves the machine until you **enroll** and sync. The complete list of o
    - **Blobs a record names** (`upload_config`, [sync.rs:57](daemon/src/sync.rs#L57),
      `POST /api/v1/config`): `agent_id`, `config_hash`, `config_blob`. Two kinds of blob share this
      endpoint, which is a plain SHA-256-keyed store: the effective config a slot was scored under
-     (your app lists, engine mode, synthetic-detection flag and the AI auditor prompt, #62/#80), and
+     (your app lists, engine mode, synthetic-detection flag and the AI scoring prompt, #62/#80), and
      the prompt a work note was written with (#147). A blob is sent **only after** the cloud rejects
      the record that names it with HTTP 428 ([sync.rs:49](daemon/src/sync.rs#L49)) — no speculative
      pre-upload — so a relying party can always resolve the rules behind a score or a sentence.
@@ -338,7 +338,7 @@ Run them with `cd daemon && cargo test`.
   hash**, parent link) — `canonical_slot_payload` in [db.rs](daemon/src/db.rs). Hand-editing *any* field
   of the SQLite file breaks the chain; `verify_ledger_integrity` re-derives and compares it.
 - **The scoring rubric is bound in (v2, #62).** The payload includes a SHA-256 of the effective config
-  (your auditing rules + AI auditor prompt), so a score can't be silently divorced from the rules that
+  (your app lists and rules, plus the AI scoring prompt), so a score can't be silently divorced from the rules that
   produced it. The exact config blob is uploaded on demand — the cloud refuses a slot naming a config
   it does not hold, and sync backfills it then (§2) — so a relying party can always inspect it. Locked by
   `test_v2_payload_binds_config_hash` and the cross-language vector `test_v2_canonical_vector_matches_cloud`.
@@ -508,6 +508,9 @@ exception: each waits 12 hours on your machine before it uploads (§2).
   week's hours and notes by email, and can unsubscribe with one click.
 - **A weekly report of a team's hours**, if tenby10 prepares one from your link: it uses what the
   link shows, plus when each interval reached tenby10, and everyone on the team gets the same report.
+- **A weekly email to a team's client**, if tenby10 prepares one from that report: your active time
+  and days worked that week, your link, and a line if any of those hours failed the signature check.
+  The report's questions are not in it.
 
 **What you keep.** You can revoke a link at any time, and it then shows only that it was withdrawn.
 You can withdraw any work note, and it disappears from every link. Someone viewing a link can narrow
@@ -598,4 +601,4 @@ as the source you can read above. It is a supply-chain control, not a behavioura
 scoring rule, update the relevant row here in the same PR. Adding an endpoint without touching §2 is
 how this guide last went stale (#84) — command 3 in "How to verify" now catches that.*
 
-*Last checked line-by-line against the code on 2026-08-19; §7 added and checked on 2026-09-15.*
+*Last checked line-by-line against the code on 2026-08-19; §7 added and checked on 2026-09-15, and updated on 2026-09-16.*
