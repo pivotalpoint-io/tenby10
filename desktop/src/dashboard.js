@@ -204,8 +204,8 @@ function goHome() {
             if (!aiEngineOn) {
                 return `
                     <div class="work-note-card work-note-empty">
-                        <p class="work-note-text">Your AI is connected, but the AI Auditor is switched off, so no note is written for this day.</p>
-                        <span class="work-note-meta">Turn the AI Auditor on in Settings to start notes again. Your hours and categories are unaffected.</span>
+                        <p class="work-note-text">Your AI is connected, but AI scoring is switched off, so no note is written for this day.</p>
+                        <span class="work-note-meta">Turn AI scoring on in Settings to start notes again. Your hours and categories are unaffected.</span>
                     </div>
                 `;
             }
@@ -458,7 +458,7 @@ function goHome() {
             if (slot && slot.llm_reasoning) {
                 document.getElementById('dialog-llm-reasoning').innerHTML = `
                     <div style="margin-bottom: 0.5rem; padding: 1rem; background: rgba(16, 185, 129, 0.1); border: 1px solid rgba(16, 185, 129, 0.2); border-radius: 8px;">
-                        <h4 style="font-size: 0.7rem; text-transform: uppercase; color: var(--accent-green); margin-bottom: 0.5rem;">AI Auditor Reasoning</h4>
+                        <h4 style="font-size: 0.7rem; text-transform: uppercase; color: var(--accent-green); margin-bottom: 0.5rem;">Your AI's reasoning</h4>
                         <p style="font-size: 0.85rem; line-height: 1.4; color: #fff;">${escapeHtml(slot.llm_reasoning)}</p>
                     </div>
                 `;
@@ -617,7 +617,7 @@ function goHome() {
             document.getElementById('label-days-tracked').innerText = labelDays;
 
             // Make the slot basis explicit. The billable hero's sub-line reports the
-            // logged-slot count (matching the fat client's "N slots logged today");
+            // logged-slot count (matching the fat client's "N ten-minute records today");
             // focus averages over those same logged slots.
             const slotWord = countSlots === 1 ? 'slot' : 'slots';
             document.getElementById('hint-billable').innerHTML =

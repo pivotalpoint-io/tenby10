@@ -7,8 +7,8 @@
          Without NSInputMonitoringUsageDescription the app cannot prompt for Input
          Monitoring, which is the permission that gates keyboard/click/scroll capture. -->
     <key>NSInputMonitoringUsageDescription</key>
-    <string>tenby10 captures keyboard, click and scroll activity to measure focused work time.</string>
+    <string>tenby10 counts key presses, clicks and scrolls to measure your active work time. It never records which key you pressed.</string>
     <key>NSAppleEventsUsageDescription</key>
-    <string>tenby10 asks System Events for the active application and window title to attribute activity.</string>
+    <string>tenby10 asks System Events which app and window are in front, to sort your activity into categories.</string>
 </dict>
 </plist>

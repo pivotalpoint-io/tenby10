@@ -52,13 +52,13 @@ function updateTrackingUI(isActive) {
     badge.className = "status-badge active";
     statusText.innerText = "Active";
     toggleIcon.innerText = "⏸";
-    toggleText.innerText = "Pause Tracking";
+    toggleText.innerText = "Pause";
     toggleBtn.className = "btn btn-primary";
   } else {
     badge.className = "status-badge paused";
     statusText.innerText = "Paused";
     toggleIcon.innerText = "▶";
-    toggleText.innerText = "Resume Tracking";
+    toggleText.innerText = "Resume";
     toggleBtn.className = "btn btn-primary paused-state";
   }
 }
@@ -85,8 +85,8 @@ async function refreshMetrics() {
         billableEl.innerText = `${billableMins}m`;
       }
       
-      const slotText = metrics.total_slots === 1 ? "Slot" : "Slots";
-      subSlotsEl.innerText = `${metrics.total_slots} ${slotText} Logged Today`;
+      const recordText = metrics.total_slots === 1 ? "ten-minute record" : "ten-minute records";
+      subSlotsEl.innerText = `${metrics.total_slots} ${recordText} today`;
     }
 
     // 2. Slot Timeline
@@ -550,11 +550,11 @@ if (saveSettingsBtn) {
         }
         // A local endpoint needs no key (Ollama ignores it); every remote one does.
         if (!willHaveApiKey && !isLoopbackUrl(baseUrl)) {
-          rejectSave("⚠️ API Key is required when AI Auditor is enabled.");
+          rejectSave("⚠️ An API key is needed while AI scoring is on.");
           return;
         }
         if (!prompt) {
-          rejectSave("⚠️ System Auditor Prompt is required when AI Auditor is enabled.");
+          rejectSave("⚠️ The Scoring Prompt is needed while AI scoring is on.");
           return;
         }
       }
@@ -575,7 +575,7 @@ if (saveSettingsBtn) {
       // form they typed it in, next to the field at fault.
       const summaryPromptText = summaryPromptEl ? summaryPromptEl.value.trim() : "";
       const tooLong = [
-        ["System Auditor Prompt", prompt],
+        ["Scoring Prompt", prompt],
         ["Work Note Prompt", summaryPromptText],
       ].find(([, text]) => promptByteLength(text) > maxPromptBytes);
       if (tooLong) {
@@ -774,19 +774,19 @@ async function checkCaptureHealth() {
     const inputDetail = document.getElementById("health-input-detail");
     if (inputStatus && inputDetail) {
       if (!health.input_listener_alive) {
-        inputStatus.innerText = "Not capturing";
+        inputStatus.innerText = "Not counting";
         inputStatus.className = "status-indicator denied";
-        inputDetail.innerText = "The input listener failed to start — grant Input Monitoring and restart tenby10.";
+        inputDetail.innerText = "Counting didn't start. Turn on Input Monitoring, then restart tenby10.";
       } else if (health.input_recently_seen) {
-        inputStatus.innerText = "Capturing";
+        inputStatus.innerText = "Counting";
         inputStatus.className = "status-indicator granted";
         inputDetail.innerText = "Keyboard/mouse events are being received.";
       } else {
         inputStatus.innerText = "Idle";
         inputStatus.className = "status-indicator unknown";
         inputDetail.innerText = health.input_idle_ms < 0
-          ? "Listener is alive but no events seen yet — move the mouse or type to confirm."
-          : `Listener alive; no input for ${Math.round(health.input_idle_ms / 1000)}s.`;
+          ? "Ready, but no activity seen yet. Move the mouse or type to check."
+          : `Ready, with no activity for ${Math.round(health.input_idle_ms / 1000)}s.`;
       }
     }
 
@@ -796,7 +796,7 @@ async function checkCaptureHealth() {
       if (health.window_titles_ok) {
         titlesStatus.innerText = "Readable";
         titlesStatus.className = "status-indicator granted";
-        titlesDetail.innerText = "Window titles are coming back with real values — checked live.";
+        titlesDetail.innerText = "Window titles are coming back with real values, checked live.";
       } else {
         titlesStatus.innerText = "Blank";
         titlesStatus.className = "status-indicator denied";
@@ -814,9 +814,9 @@ function updatePermissionStatusUI(elementId, isGranted) {
   const el = document.getElementById(elementId);
   if (!el) return;
   if (isGranted === "stale") {
-    el.innerText = "Not capturing";
+    el.innerText = "Not working";
     el.className = "status-indicator denied";
-    el.title = "macOS reports this permission as granted, but capture is failing right now. Re-grant Screen Recording, then fully quit and relaunch tenby10.";
+    el.title = "macOS shows this permission as granted, but window titles are coming back blank. Turn Screen Recording off and on again, then fully quit and relaunch tenby10.";
   } else if (isGranted) {
     el.innerText = "Granted";
     el.className = "status-indicator granted";
