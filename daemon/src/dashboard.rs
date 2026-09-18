@@ -1206,6 +1206,9 @@ async fn serve_dashboard_html() -> impl IntoResponse {
     <script>
         let globalSlots = [];
         let daysMap = {};
+        // A logged slot counts as active time once its focus clears this gate
+        // (ADR 0012). Mirrors BILLABLE_FOCUS_THRESHOLD in daemon/src/db.rs.
+        const BILLABLE_FOCUS_THRESHOLD = 40;
         let availableDates = [];
         let currentDateKey = null;
         let currentViewMode = 'daily';
@@ -1305,9 +1308,11 @@ async fn serve_dashboard_html() -> impl IntoResponse {
                         slots: [],
                         totalActiveSegments: 0,
                         // A slot is "logged" iff it holds >=1 productive minute (focus_score > 0).
-                        // Active time = totalLoggedSlots * 10, so it reconstructs by counting
-                        // 10-minute slots and matches the fat client's get_today_metrics exactly.
                         totalLoggedSlots: 0,
+                        // Logged slots that cleared the focus gate. Active time =
+                        // totalBillableSlots * 10, the aggregation v1 rule (ADR 0017) that
+                        // aggregate_v1 and the fat client's get_today_metrics use.
+                        totalBillableSlots: 0,
                         sumFocusScore: 0,
                     };
                 }
@@ -1315,6 +1320,7 @@ async fn serve_dashboard_html() -> impl IntoResponse {
                 entry.slots.push(slot);
                 entry.totalActiveSegments += slot.active_segments;
                 if (slot.focus_score > 0) entry.totalLoggedSlots += 1;
+                if (slot.focus_score >= BILLABLE_FOCUS_THRESHOLD) entry.totalBillableSlots += 1;
                 entry.sumFocusScore += slot.focus_score;
             });
 
@@ -1627,11 +1633,9 @@ async fn serve_dashboard_html() -> impl IntoResponse {
                         sumFocus += slot.focus_score;
                         countSlots += 1;
                         dayHasSlots = true;
-                        // Billable slot: cleared the focus gate (>= 40, ADR 0012).
-                        // Same rule as the fat client's billable hero.
-                        if (slot.focus_score >= 40) billableSlots += 1;
                     }
                 });
+                billableSlots += day.totalBillableSlots;
                 if (dayHasSlots) daysRun += 1;
             });
 
@@ -1650,18 +1654,20 @@ async fn serve_dashboard_html() -> impl IntoResponse {
             document.getElementById('label-avg-focus').innerText = labelFocus;
             document.getElementById('label-days-tracked').innerText = labelDays;
 
-            // Make the slot basis explicit. The billable hero's sub-line reports the
-            // logged-slot count (matching the fat client's "N slots logged today");
-            // focus averages over those same logged slots.
+            // Make the slot basis explicit. The active-time sub-line reports counted
+            // slots out of logged slots, so the time reconstructs by counting;
+            // focus averages over the logged slots.
             const slotWord = countSlots === 1 ? 'slot' : 'slots';
             document.getElementById('hint-billable').innerHTML =
-                countSlots > 0 ? `${countSlots} ${slotWord} logged` : '&nbsp;';
+                countSlots > 0 ? `${billableSlots} of ${countSlots} ${slotWord} counted` : '&nbsp;';
             document.getElementById('hint-avg-focus').innerHTML =
                 countSlots > 0 ? `over ${countSlots} logged ${slotWord}` : '&nbsp;';
-            // Daily: the value already IS the slot count, so clarify each is 10 min.
+            // Daily: the value is the logged-slot count, so say how many of those fell
+            // below the focus gate and were not counted.
             // Weekly/monthly: the value is days, so annotate the total logged slots.
+            const notCounted = countSlots - billableSlots;
             document.getElementById('hint-days-tracked').innerHTML = currentViewMode === 'daily'
-                ? (countSlots > 0 ? '10 min each' : '&nbsp;')
+                ? (countSlots > 0 ? (notCounted > 0 ? `${notCounted} below ${BILLABLE_FOCUS_THRESHOLD}% focus` : 'all counted') : '&nbsp;')
                 : (countSlots > 0 ? `${countSlots} logged ${slotWord}` : '&nbsp;');
         }
 
@@ -1704,7 +1710,7 @@ async fn serve_dashboard_html() -> impl IntoResponse {
             });
 
             const avgFocus = dayCountSlots > 0 ? Math.round(daySumFocus / dayCountSlots) : 0;
-            const activeMins = day.totalLoggedSlots * 10;
+            const activeMins = day.totalBillableSlots * 10;
             const hours = Math.floor(activeMins / 60);
             const mins = activeMins % 60;
             const activeTimeStr = hours > 0 ? `${hours}h ${mins}m` : `${mins}m`;
@@ -1866,7 +1872,7 @@ async fn serve_dashboard_html() -> impl IntoResponse {
                     </div>
                     <div class="day-view-badges">
                         <span class="badge badge-focus ${focusColorClass}" style="font-size:0.85rem; padding: 0.35rem 0.75rem;">${avgFocus}% Focus</span>
-                        <span class="badge badge-time" style="font-size:0.85rem; padding: 0.35rem 0.75rem;">${activeTimeStr} Active (${day.totalLoggedSlots} ${day.totalLoggedSlots === 1 ? 'slot' : 'slots'})</span>
+                        <span class="badge badge-time" style="font-size:0.85rem; padding: 0.35rem 0.75rem;">${activeTimeStr} Active (${day.totalBillableSlots} of ${day.totalLoggedSlots} ${day.totalLoggedSlots === 1 ? 'slot' : 'slots'} counted)</span>
                     </div>
                 </div>
 
@@ -2048,7 +2054,7 @@ async fn serve_dashboard_html() -> impl IntoResponse {
                 });
 
                 avgFocus = dayCountSlots > 0 ? Math.round(daySumFocus / dayCountSlots) : 0;
-                const activeMins = dayData.totalLoggedSlots * 10;
+                const activeMins = dayData.totalBillableSlots * 10;
                 const hours = Math.floor(activeMins / 60);
                 const mins = activeMins % 60;
                 activeTimeStr = hours > 0 ? `${hours}h ${mins}m` : `${mins}m`;
