@@ -628,10 +628,12 @@ function goHome() {
                 countSlots > 0 ? `${billableSlots} of ${countSlots} ${slotWord} counted` : '&nbsp;';
             document.getElementById('hint-avg-focus').innerHTML =
                 countSlots > 0 ? `over ${countSlots} logged ${slotWord}` : '&nbsp;';
-            // Daily: the value already IS the slot count, so clarify each is 10 min.
+            // Daily: the value is the logged-slot count, so say how many of those fell
+            // below the focus gate and were not counted.
             // Weekly/monthly: the value is days, so annotate the total logged slots.
+            const notCounted = countSlots - billableSlots;
             document.getElementById('hint-days-tracked').innerHTML = currentViewMode === 'daily'
-                ? (countSlots > 0 ? '10 min each' : '&nbsp;')
+                ? (countSlots > 0 ? (notCounted > 0 ? `${notCounted} below ${BILLABLE_FOCUS_THRESHOLD}% focus` : 'all counted') : '&nbsp;')
                 : (countSlots > 0 ? `${countSlots} logged ${slotWord}` : '&nbsp;');
         }
 

@@ -73,9 +73,9 @@ async function refreshMetrics() {
     const subSlotsEl = document.getElementById("metric-total-slots-sub");
     
     if (billableEl && subSlotsEl) {
-      // Only slots that cleared the focus gate bill 10 min each (ADR 0012);
-      // "slots logged" below counts every slot with at least one productive minute,
-      // so billable_slots is always a subset you can count on the timeline.
+      // Only slots that cleared the focus gate count, 10 min each (ADR 0012).
+      // total_slots counts every slot with at least one productive minute, so
+      // billable_slots is always a subset you can count on the timeline.
       const billableMins = metrics.billable_slots * 10;
       if (billableMins >= 60) {
         const hrs = Math.floor(billableMins / 60);
@@ -85,8 +85,10 @@ async function refreshMetrics() {
         billableEl.innerText = `${billableMins}m`;
       }
       
-      const recordText = metrics.total_slots === 1 ? "ten-minute record" : "ten-minute records";
-      subSlotsEl.innerText = `${metrics.total_slots} ${recordText} today`;
+      const slotWord = metrics.total_slots === 1 ? "slot" : "slots";
+      subSlotsEl.innerText = metrics.total_slots > 0
+        ? `${metrics.billable_slots} of ${metrics.total_slots} ${slotWord} counted today`
+        : "No slots logged yet today";
     }
 
     // 2. Slot Timeline
@@ -113,16 +115,10 @@ async function refreshMetrics() {
       focusEl.innerText = `${metrics.average_focus}%`;
     }
 
-    const activeTimeEl = document.getElementById("metric-active-time");
-    if (activeTimeEl) {
-      const mins = metrics.active_minutes;
-      if (mins >= 60) {
-        const hrs = Math.floor(mins / 60);
-        const remMins = mins % 60;
-        activeTimeEl.innerText = `${hrs}h ${remMins}m`;
-      } else {
-        activeTimeEl.innerText = `${mins}m`;
-      }
+    // A count, not a duration: only counted slots (the headline) become time.
+    const loggedSlotsEl = document.getElementById("metric-logged-slots");
+    if (loggedSlotsEl) {
+      loggedSlotsEl.innerText = metrics.total_slots.toLocaleString();
     }
 
     const inputsEl = document.getElementById("metric-total-inputs");
