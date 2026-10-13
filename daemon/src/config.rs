@@ -60,12 +60,14 @@ pub fn default_llm_prompt() -> String {
 pub fn default_summary_prompt() -> String {
     format!(
         "You are writing a short work note that a client will read next to an invoice. \
-        From the activity log below (apps and window titles), write one or two sentences \
+        From the activity log below (apps and window titles), write three or four sentences \
         describing what was worked on, in plain professional language. \
         - Be specific: name the project, repository, document, or feature the titles show, and \
         what was done to it — \"fixed the sync retries in the fleet-pilot repo and reviewed the \
         billing pull request\", not \"worked on development tasks\". Name the work, not the tools \
         it was done in. \
+        - Cover each main piece of work in the day, roughly in the order it happened, not only \
+        the largest one. \
         - Use your own words. Never reproduce a whole window title, file path, or URL verbatim: \
         a note that does is discarded unread and the day is left without a note. \
         - Never name a person. Projects, products, and companies are fine; people are not. \
@@ -136,7 +138,7 @@ fn retired_llm_prompts() -> [String; 2] {
 }
 
 /// The retired work-note prompts, mirror of [`retired_llm_prompts`].
-fn retired_summary_prompts() -> [String; 2] {
+fn retired_summary_prompts() -> [String; 3] {
     [
         // v1, ADR 0019 initial — before the untrusted-data rule (#83).
         "You are writing a short work note that a client will read next to an invoice. \
@@ -159,6 +161,24 @@ fn retired_summary_prompts() -> [String; 2] {
             - Never quote a window title, file path, or URL. A note that reproduces one is \
             discarded unread and the day is left without a note. \
             - Never name a person, company, or any third party. \
+            - Do not mention hours, focus scores, or productivity. \
+            - If the activity is too unclear to describe honestly, say that plainly instead of guessing. \
+            {} \
+            Output ONLY the sentences, with no preamble.",
+            crate::untrusted::PROMPT_RULE
+        ),
+        // v3, ADR 0019 §4 revision..#155 — names the work, in one or two sentences.
+        format!(
+            "You are writing a short work note that a client will read next to an invoice. \
+            From the activity log below (apps and window titles), write one or two sentences \
+            describing what was worked on, in plain professional language. \
+            - Be specific: name the project, repository, document, or feature the titles show, and \
+            what was done to it — \"fixed the sync retries in the fleet-pilot repo and reviewed the \
+            billing pull request\", not \"worked on development tasks\". Name the work, not the tools \
+            it was done in. \
+            - Use your own words. Never reproduce a whole window title, file path, or URL verbatim: \
+            a note that does is discarded unread and the day is left without a note. \
+            - Never name a person. Projects, products, and companies are fine; people are not. \
             - Do not mention hours, focus scores, or productivity. \
             - If the activity is too unclear to describe honestly, say that plainly instead of guessing. \
             {} \
@@ -789,10 +809,11 @@ mod tests {
         assert!(!retired_llm_prompts().contains(&default_llm_prompt()));
         assert!(!retired_summary_prompts().contains(&default_summary_prompt()));
 
-        for (retired_llm, retired_sum) in retired_llm_prompts()
-            .into_iter()
-            .zip(retired_summary_prompts())
-        {
+        // The two prompts retire independently, so the lists differ in length; every
+        // retired note prompt is paired with some retired auditor prompt.
+        let retired_llms = retired_llm_prompts();
+        for (i, retired_sum) in retired_summary_prompts().into_iter().enumerate() {
+            let retired_llm = &retired_llms[i.min(retired_llms.len() - 1)];
             let path = temp_config_path();
             let json = serde_json::json!({
                 "agent_id": "a", "enrollment_token": "", "public_key": "", "private_key": "",
