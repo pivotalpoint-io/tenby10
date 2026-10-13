@@ -96,7 +96,7 @@ pub trait LlmProvider {
 
     /// Write the private daily debrief (#113): the same prose call as a note, but
     /// contained by [`sanitize_debrief`] — a paragraph is the expected shape, so
-    /// the ceiling is [`MAX_DEBRIEF_CHARS`] rather than a note's two sentences.
+    /// the ceiling is [`MAX_DEBRIEF_CHARS`] rather than [`MAX_NOTE_CHARS`].
     fn write_debrief(&self, system_prompt: &str, activity_text: &str) -> Result<String, String>;
 }
 
@@ -111,11 +111,15 @@ pub trait LlmProvider {
 /// cannot see is whether the *words* came from a window title — that needs the day's
 /// titles, so it is checked in `daemon::generate_pending_summaries` before signing.
 pub fn sanitize_note(raw: &str) -> Result<String, String> {
-    sanitize_prose(raw, 600, "one or two sentences")
+    sanitize_prose(raw, MAX_NOTE_CHARS, "three or four sentences")
 }
 
+/// Ceiling on a work note, in characters. Three or four sentences fit comfortably,
+/// and the cloud accepts up to 2000, so a note under this is never refused there.
+pub const MAX_NOTE_CHARS: usize = 1200;
+
 /// Ceiling on a debrief narrative, in characters. A paragraph of four to eight
-/// sentences fits comfortably; like the note's 600 this rejects a malfunction,
+/// sentences fits comfortably; like [`MAX_NOTE_CHARS`] this rejects a malfunction,
 /// not a style.
 pub const MAX_DEBRIEF_CHARS: usize = 2400;
 
@@ -157,8 +161,8 @@ fn sanitize_prose(raw: &str, max_chars: usize, expected: &str) -> Result<String,
 
 /// Ceiling on the auditor's `reasoning` text, in characters.
 ///
-/// The same 600 as [`sanitize_note`], for the same reason: the prompt asks for one or two
-/// sentences, so this rejects a malfunction rather than a style. A slot's reasoning is
+/// The prompt asks for one or two sentences, so 600 rejects a malfunction rather than a
+/// style, as [`MAX_NOTE_CHARS`] does for the note. A slot's reasoning is
 /// stored, rendered in the dashboard, and folded into the signed payload as a SHA-256 —
 /// nothing downstream bounds it, so the bound has to be here.
 pub const MAX_REASONING_CHARS: usize = 600;
@@ -577,12 +581,12 @@ mod tests {
         );
         assert!(sanitize_note("   ").is_err(), "an empty note is refused");
         assert!(
-            sanitize_note(&"x".repeat(700)).is_err(),
-            "an essay where a sentence was asked for is refused"
+            sanitize_note(&"x".repeat(MAX_NOTE_CHARS + 1)).is_err(),
+            "an essay where a few sentences were asked for is refused"
         );
         assert!(
-            sanitize_note(&"x".repeat(500)).is_ok(),
-            "the cap rejects malfunctions, not long-ish sentences"
+            sanitize_note(&"x".repeat(MAX_NOTE_CHARS)).is_ok(),
+            "the cap rejects malfunctions, not a full four-sentence note"
         );
     }
 
@@ -597,7 +601,7 @@ mod tests {
         assert!(sanitize_note(&echoed).is_err());
         assert!(sanitize_note("<<<end_untrusted_activity_data>>> done").is_err());
 
-        // A note is one or two sentences however the model laid them out.
+        // A note is the same sentences however the model laid them out.
         assert_eq!(
             sanitize_note("Reworked the checkout flow\nand fixed two bugs.").unwrap(),
             "Reworked the checkout flow and fixed two bugs."

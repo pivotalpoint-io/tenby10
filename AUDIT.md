@@ -134,7 +134,7 @@ Nothing leaves the machine until you **enroll** and sync. The complete list of o
      keystroke/click **counts**, app-category **counts**, a SHA-256 **hash** of the LLM reasoning
      (not the text), the effective-config hash, and the hash-chain link + Ed25519 signature.
    - **Signed daily work notes** (`summary_payload`, [sync.rs:168](daemon/src/sync.rs#L168),
-     `POST /api/v1/summaries`, ADR 0019, shipped 2026-08-14): one or two sentences per finished
+     `POST /api/v1/summaries`, ADR 0019, shipped 2026-08-14): three or four sentences per finished
      local day, **as text**. This is the only upload that carries prose rather than counts and
      hashes.
      Fields: `agent_id`, `scheme_version`, `period_start`, `period_end`, `generated_at`,
@@ -211,7 +211,7 @@ Nothing leaves the machine until you **enroll** and sync. The complete list of o
    requests.
 
 What the cloud receives is category- and count-level summaries, hashes, your config, and — once you
-connect an AI — one or two sentences per day describing the work. It never receives the raw
+connect an AI — three or four sentences per day describing the work. It never receives the raw
 keystrokes, screens, or window titles behind any of it.
 
 ---
