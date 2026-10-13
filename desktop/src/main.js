@@ -63,6 +63,102 @@ function updateTrackingUI(isActive) {
   }
 }
 
+// A slot counts as active time once its focus clears this gate (ADR 0012).
+// Mirrors BILLABLE_FOCUS_THRESHOLD in daemon/src/db.rs.
+const COUNTED_FOCUS_THRESHOLD = 40;
+let renderedTimelineKey = null;
+
+function slotTimeRange(start) {
+  const fmt = (secs) =>
+    new Date(secs * 1000).toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit" });
+  return `${fmt(start)} – ${fmt(start + 600)}`;
+}
+
+// One dot per logged slot today. Each is a button: hover or focus says what the
+// slot was, a click opens it in the dashboard (#157).
+function renderSlotTimeline(container, starts, scores) {
+  // The poll runs every 15 seconds. Rebuilding identical dots would pull a hover
+  // label out from under the pointer, so only rebuild when a slot changed.
+  const key = scores.map((score, i) => `${starts[i]}:${score}`).join(",");
+  if (key === renderedTimelineKey) return;
+  renderedTimelineKey = key;
+  hideSlotTooltip();
+
+  container.innerHTML = "";
+  scores.forEach((score, i) => {
+    const block = document.createElement("button");
+    block.type = "button";
+    block.className = "slot-block";
+    if (score >= 80) {
+      block.classList.add("focus-high");
+    } else if (score >= COUNTED_FOCUS_THRESHOLD) {
+      block.classList.add("focus-medium");
+    } else {
+      block.classList.add("focus-low");
+    }
+    const counted = score >= COUNTED_FOCUS_THRESHOLD;
+    block.dataset.slotStart = String(starts[i]);
+    block.dataset.time = slotTimeRange(starts[i]);
+    block.dataset.detail = `Focus ${score}% · ${counted ? "Counted" : "Not counted"}`;
+    block.setAttribute("aria-label", `${block.dataset.time}, ${block.dataset.detail}. Open details`);
+    container.appendChild(block);
+  });
+}
+
+const slotTooltip = document.getElementById("slot-tooltip");
+
+function showSlotTooltip(block) {
+  if (!slotTooltip) return;
+  slotTooltip.replaceChildren();
+  const time = document.createElement("strong");
+  time.textContent = block.dataset.time;
+  const detail = document.createElement("span");
+  detail.textContent = block.dataset.detail;
+  const hint = document.createElement("span");
+  hint.className = "slot-tooltip-hint";
+  hint.textContent = "Click for details";
+  slotTooltip.append(time, detail, hint);
+  slotTooltip.hidden = false;
+
+  // Above the dot, kept inside the window so dots at the edges stay readable.
+  const margin = 8;
+  const dot = block.getBoundingClientRect();
+  const tip = slotTooltip.getBoundingClientRect();
+  const left = Math.max(
+    margin,
+    Math.min(dot.left + dot.width / 2 - tip.width / 2, window.innerWidth - tip.width - margin)
+  );
+  let top = dot.top - tip.height - margin;
+  if (top < margin) top = dot.bottom + margin;
+  slotTooltip.style.left = `${left}px`;
+  slotTooltip.style.top = `${top}px`;
+}
+
+function hideSlotTooltip() {
+  if (slotTooltip) slotTooltip.hidden = true;
+}
+
+const slotTimeline = document.getElementById("slot-timeline-container");
+if (slotTimeline) {
+  slotTimeline.addEventListener("mouseover", (event) => {
+    const block = event.target.closest(".slot-block");
+    if (block) showSlotTooltip(block);
+    else hideSlotTooltip();
+  });
+  slotTimeline.addEventListener("mouseleave", hideSlotTooltip);
+  slotTimeline.addEventListener("focusin", (event) => {
+    const block = event.target.closest(".slot-block");
+    if (block) showSlotTooltip(block);
+  });
+  slotTimeline.addEventListener("focusout", hideSlotTooltip);
+  slotTimeline.addEventListener("click", (event) => {
+    const block = event.target.closest(".slot-block");
+    if (!block) return;
+    hideSlotTooltip();
+    enterDashboard(Number(block.dataset.slotStart));
+  });
+}
+
 // Fetch Today's Metrics
 async function refreshMetrics() {
   try {
@@ -94,19 +190,7 @@ async function refreshMetrics() {
     // 2. Slot Timeline
     const timelineContainer = document.getElementById("slot-timeline-container");
     if (timelineContainer && metrics.slot_scores) {
-      timelineContainer.innerHTML = ""; // Clear existing
-      metrics.slot_scores.forEach(score => {
-        const block = document.createElement("div");
-        block.className = "slot-block";
-        if (score >= 80) {
-          block.classList.add("focus-high");
-        } else if (score >= 40) {
-          block.classList.add("focus-medium");
-        } else {
-          block.classList.add("focus-low");
-        }
-        timelineContainer.appendChild(block);
-      });
+      renderSlotTimeline(timelineContainer, metrics.slot_starts || [], metrics.slot_scores);
     }
 
     // 3. Secondary Metrics
@@ -636,11 +720,32 @@ if (toggleTrackingBtn) {
 const activityView = document.getElementById("activity-view");
 const activityFrame = document.getElementById("activity-frame");
 
-async function enterDashboard() {
+// A slot the dashboard should open once its document has loaded (#157).
+let pendingSlotStart = null;
+let activityFrameLoaded = false;
+
+function sendPendingSlot() {
+  if (pendingSlotStart === null || !activityFrameLoaded) return;
+  activityFrame.contentWindow.postMessage({ type: "tenby10-open-slot", start: pendingSlotStart }, "*");
+  pendingSlotStart = null;
+}
+
+if (activityFrame) {
+  activityFrame.addEventListener("load", () => {
+    activityFrameLoaded = true;
+    sendPendingSlot();
+  });
+}
+
+// `slotStart` (unix seconds) opens the dashboard on that slot's details; without
+// it the dashboard opens where it was left.
+async function enterDashboard(slotStart) {
+  if (Number.isFinite(slotStart)) pendingSlotStart = slotStart;
   // Lazy-load the dashboard document on first open.
   if (activityFrame && !activityFrame.getAttribute("src")) {
     activityFrame.setAttribute("src", "dashboard.html");
   }
+  sendPendingSlot();
   dashboardView.style.display = "none";
   if (settingsView) settingsView.style.display = "none";
   if (activityView) activityView.style.display = "block";
@@ -679,7 +784,7 @@ window.addEventListener("keydown", (event) => {
 });
 
 if (openDashboardBtn) {
-  openDashboardBtn.addEventListener("click", enterDashboard);
+  openDashboardBtn.addEventListener("click", () => enterDashboard());
 }
 
 // Enrollment Form Submit
