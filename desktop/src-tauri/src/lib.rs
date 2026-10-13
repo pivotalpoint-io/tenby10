@@ -55,6 +55,16 @@ struct TodayMetrics {
     billable_slots: u32,
 }
 
+/// Brings the main window back from hidden or minimized and gives it focus. Shared by
+/// the tray's "Show Dashboard" item and the macOS Dock icon.
+fn show_main_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+}
+
 fn perform_toggle_tracking(app: &tauri::AppHandle) -> Result<bool, String> {
     let telemetry_state = app.state::<Arc<daemon::daemon::TelemetryState>>();
     let currently_enabled = telemetry_state.tracking_enabled.load(Ordering::Relaxed);
@@ -1020,12 +1030,7 @@ pub fn run() {
                     "toggle_tracking" => {
                         let _ = perform_toggle_tracking(app);
                     }
-                    "show_window" => {
-                        if let Some(window) = app.get_webview_window("main") {
-                            let _ = window.show();
-                            let _ = window.set_focus();
-                        }
-                    }
+                    "show_window" => show_main_window(app),
                     "exit" => {
                         app.exit(0);
                     }
@@ -1035,8 +1040,18 @@ pub fn run() {
 
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            // Closing the window only hides it, so a click on the Dock icon arrives as
+            // a reopen request with nothing visible. Show the window, as the tray does.
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Reopen { .. } = event {
+                show_main_window(app);
+            }
+            #[cfg(not(target_os = "macos"))]
+            let _ = (app, event);
+        });
 }
 
 /// The settings form no longer sees the signing key, so nothing on the round trip
