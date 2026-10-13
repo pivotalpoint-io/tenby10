@@ -50,6 +50,8 @@ struct TodayMetrics {
     total_keystrokes: u32,
     total_clicks: u32,
     slot_scores: Vec<u32>,
+    /// Start of each slot in `slot_scores`, unix seconds, same order (#157).
+    slot_starts: Vec<i64>,
     total_slots: u32,
     /// Slots that cleared the focus gate and bill 10 minutes each (ADR 0012).
     billable_slots: u32,
@@ -168,12 +170,14 @@ async fn get_today_metrics(
         .map_err(|e| format!("Task join error: {}", e))?
         .map_err(|e| format!("Database error: {}", e))?;
 
+    let (slot_starts, slot_scores) = metrics.4.into_iter().unzip();
     Ok(TodayMetrics {
         average_focus: metrics.0,
         active_minutes: metrics.1,
         total_keystrokes: metrics.2,
         total_clicks: metrics.3,
-        slot_scores: metrics.4,
+        slot_scores,
+        slot_starts,
         total_slots: metrics.5,
         billable_slots: metrics.6,
     })

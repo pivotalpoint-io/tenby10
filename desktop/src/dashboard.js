@@ -18,6 +18,15 @@ function goHome() {
     }
 }
 
+// Esc leaves the dashboard, as it does from the host window. Key presses land here
+// once this frame has focus (opening a slot from the home screen gives it focus), so
+// the host never sees them. An open dialog takes the first Esc for itself.
+window.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && !document.querySelector("dialog[open]")) {
+        goHome();
+    }
+});
+
 
         let globalSlots = [];
         let daysMap = {};
@@ -281,6 +290,7 @@ function goHome() {
                 }
 
                 renderCurrentView();
+                openPendingSlot();
             } catch (err) {
                 console.error("Error fetching dashboard data", err);
                 document.getElementById('day-view-container').innerHTML = 
@@ -523,6 +533,32 @@ function goHome() {
             
             const dialog = document.getElementById('slot-dialog');
             dialog.showModal();
+        }
+
+        // The home screen's slot dots open a slot here (#157). The request can
+        // arrive before the first data load, so it waits for that.
+        let pendingOpenSlot = null;
+
+        window.addEventListener('message', (event) => {
+            if (event.source !== window.parent) return;
+            if (!event.data || event.data.type !== 'tenby10-open-slot') return;
+            pendingOpenSlot = Number(event.data.start);
+            openPendingSlot();
+        });
+
+        function openPendingSlot() {
+            if (pendingOpenSlot === null || !positionInitialized) return;
+            const start = pendingOpenSlot;
+            pendingOpenSlot = null;
+
+            const dialog = document.getElementById('slot-dialog');
+            if (dialog.open) dialog.close();
+            if (currentViewMode !== 'daily') switchView('daily');
+            navigateToDate(dateKeyOf(start));
+
+            const row = document.getElementById(`hour-row-${dateKeyOf(start)}-${new Date(start * 1000).getHours()}`);
+            if (row) row.scrollIntoView({ block: 'center' });
+            showSlotDetails(start);
         }
 
         function closeSlotDialog() {

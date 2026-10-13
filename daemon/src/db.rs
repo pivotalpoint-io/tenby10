@@ -369,14 +369,15 @@ fn verify_slot_signature(
 
 /// Aggregated "today" metrics returned by [`Database::get_today_metrics`]:
 /// `(avg_focus, active_minutes, total_keystrokes, total_clicks,
-/// per_slot_focus_scores, logged_slot_count, billable_slot_count)`.
+/// logged_slots, logged_slot_count, billable_slot_count)`, where `logged_slots` is
+/// each logged slot's `(slot_start, focus_score)` in time order.
 ///
 /// Every time value is slot-granular so it reconstructs by counting 10-minute
-/// slots: `active_minutes / 10 == logged_slot_count == per_slot_focus_scores.len()`,
+/// slots: `active_minutes / 10 == logged_slot_count == logged_slots.len()`,
 /// and `billable_slot_count * 10` is the billable minutes. A slot is "logged" only
 /// if it holds at least one productive minute (`focus_score > 0`); fully-idle slots
 /// are excluded from every aggregate. `avg_focus` averages over logged slots only.
-pub type TodayMetrics = (u32, u32, u32, u32, Vec<u32>, u32, u32);
+pub type TodayMetrics = (u32, u32, u32, u32, Vec<(i64, u32)>, u32, u32);
 
 pub struct Database {
     pub conn: Mutex<Connection>,
@@ -882,7 +883,7 @@ impl Database {
 
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT focus_score, total_keystrokes, total_clicks
+            "SELECT slot_start, focus_score, total_keystrokes, total_clicks
              FROM slot_summaries
              WHERE slot_start >= ?1
              ORDER BY slot_start ASC",
@@ -896,19 +897,27 @@ impl Database {
         let mut keystrokes = 0;
         let mut clicks = 0;
         let mut all_focus = Vec::new();
+        let mut starts = Vec::new();
 
         while let Some(row) = rows.next()? {
-            let focus_score: u32 = row.get(0)?;
-            let k: u32 = row.get(1)?;
-            let c: u32 = row.get(2)?;
+            let slot_start: i64 = row.get(0)?;
+            let focus_score: u32 = row.get(1)?;
+            let k: u32 = row.get(2)?;
+            let c: u32 = row.get(3)?;
             keystrokes += k;
             clicks += c;
+            starts.push(slot_start);
             all_focus.push(focus_score);
         }
 
         let agg = aggregate_v1(&all_focus);
-        // Per-slot focus values for logged (focus > 0) slots — the timeline/histogram input.
-        let logged_scores: Vec<u32> = all_focus.into_iter().filter(|&f| f > 0).collect();
+        // Logged (focus > 0) slots with their start times — the timeline input. The start
+        // lets the home screen label a slot and open it in the dashboard (#157).
+        let logged_slots: Vec<(i64, u32)> = starts
+            .into_iter()
+            .zip(all_focus)
+            .filter(|&(_, f)| f > 0)
+            .collect();
         // Slot-granular active time (ADR 0013): one logged 10-minute slot contributes 10 minutes,
         // so `active_minutes / 10 == logged_count`.
         let active_mins = agg.logged * 10;
@@ -918,7 +927,7 @@ impl Database {
             active_mins,
             keystrokes,
             clicks,
-            logged_scores,
+            logged_slots,
             agg.logged,
             agg.billable,
         ))
@@ -2626,7 +2635,7 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855|CONFIGHASH|PARE
         db.insert_slot_summary(today_midnight + 1800, 0, 0, 10, 0, 0, "{}", None, "", None)
             .unwrap();
 
-        let (avg, active, _k, _c, scores, logged_slots, billable_slots) =
+        let (avg, active, _k, _c, slots, logged_slots, billable_slots) =
             db.get_today_metrics().unwrap();
 
         assert_eq!(logged_slots, 3, "only slots with focus > 0 are logged");
@@ -2634,7 +2643,15 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855|CONFIGHASH|PARE
             billable_slots, 2,
             "only slots at/above the gate are billable"
         );
-        assert_eq!(scores.len(), 3, "timeline shows exactly the logged slots");
+        assert_eq!(
+            slots,
+            vec![
+                (today_midnight, BILLABLE_FOCUS_THRESHOLD - 10),
+                (today_midnight + 600, BILLABLE_FOCUS_THRESHOLD),
+                (today_midnight + 1200, 90),
+            ],
+            "timeline shows exactly the logged slots, in order, with their start times"
+        );
         // Countability contract: active minutes reconstruct from the slot count.
         assert_eq!(
             active,
