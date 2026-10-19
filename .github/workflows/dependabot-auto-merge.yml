@@ -5,8 +5,13 @@ name: Dependabot auto-merge
 # Dependabot opens its pull requests; this workflow asks GitHub to merge each
 # one once every required check on `main` is green. It merges nothing itself
 # and runs no build: `gh pr merge --auto` only sets the pull request's
-# auto-merge flag. The merge then goes through the `main` ruleset (required
-# checks, merge queue) exactly as a merge by hand does.
+# auto-merge flag. GitHub then performs the merge when the `main` ruleset's
+# required status checks pass, the same gate a merge by hand goes through.
+#
+# No merge queue, on purpose (issue #174): a queue never admits a pull request
+# whose auto-merge flag the Actions token set, and a queue entry attributed to
+# github-actions gets no merge_group workflow run. Plain auto-merge on
+# required checks is the path GitHub documents for Dependabot.
 #
 # Scope: patch and minor version updates only. A major update gets no flag and
 # waits for a person to review it.
