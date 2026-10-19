@@ -27,6 +27,8 @@ on:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
+  # The main ruleset runs these checks again inside the merge queue.
+  merge_group:
   # Advisories arrive by calendar, not by commit. Catch them against main.
   schedule:
     - cron: "27 6 * * *"
