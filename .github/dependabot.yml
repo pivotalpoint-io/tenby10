@@ -1,16 +1,33 @@
 version: 2
+
+# Patch and minor updates arrive as one grouped pull request per workspace, so
+# a week of bumps is one review (or one auto-merge, see
+# workflows/dependabot-auto-merge.yml) instead of one per crate. Major updates
+# stay as separate pull requests, outside the groups.
 updates:
   - package-ecosystem: "npm"
     directory: "/desktop"
     schedule:
       interval: "weekly"
+    groups:
+      desktop-npm:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
 
   - package-ecosystem: "cargo"
     directory: "/daemon"
     schedule:
       interval: "weekly"
+    groups:
+      daemon-cargo:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
 
   - package-ecosystem: "cargo"
     directory: "/desktop/src-tauri"
     schedule:
       interval: "weekly"
+    groups:
+      desktop-cargo:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]

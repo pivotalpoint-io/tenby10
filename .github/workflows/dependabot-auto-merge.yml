@@ -1,0 +1,50 @@
+name: Dependabot auto-merge
+
+# Companion to dependabot.yml, for issue #170.
+#
+# Dependabot opens its pull requests; this workflow asks GitHub to merge each
+# one once every required check on `main` is green. It merges nothing itself
+# and runs no build: `gh pr merge --auto` only sets the pull request's
+# auto-merge flag. The merge then goes through the `main` ruleset (required
+# checks, merge queue) exactly as a merge by hand does.
+#
+# Scope: patch and minor version updates only. A major update gets no flag and
+# waits for a person to review it.
+#
+# Token: this is the one workflow in the repository with a write grant.
+# `contents: write` is what GitHub requires to set auto-merge, and
+# `pull-requests: write` lets the step read and flag the pull request. The job
+# runs only on events dependabot[bot] triggers and uses no secret beyond
+# GITHUB_TOKEN.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  auto-merge:
+    name: Enable auto-merge
+    runs-on: ubuntu-latest
+    if: github.actor == 'dependabot[bot]'
+    steps:
+      - name: Read update metadata
+        id: metadata
+        uses: dependabot/fetch-metadata@v2
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Enable auto-merge for patch and minor updates
+        if: >-
+          steps.metadata.outputs.update-type == 'version-update:semver-patch' ||
+          steps.metadata.outputs.update-type == 'version-update:semver-minor'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: gh pr merge --auto --merge "$PR_URL"

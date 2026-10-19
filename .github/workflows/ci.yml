@@ -5,6 +5,8 @@ on:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
+  # The main ruleset runs these checks again inside the merge queue.
+  merge_group:
 
 # This workflow only reads the tree: fmt, clippy and tests. It writes nothing
 # back to the repo, so it does not need the repo's default token grant.
