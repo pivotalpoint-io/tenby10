@@ -278,6 +278,18 @@ pub fn sync_work_summaries(
     if agent_id.is_empty() {
         return Ok(0);
     }
+    // A chain held up by notes from before pairing heals before anything is offered
+    // (#179). Cheap when the chain is whole: one read of the links, nothing written.
+    if let Some(signer) = signer {
+        match db.relink_summary_chain(signer) {
+            Ok(0) => {}
+            Ok(n) => println!(
+                "[Sync] Re-linked {n} unsent work note record(s) behind notes kept on this \
+                 machine. They upload as their correction window ends."
+            ),
+            Err(e) => return Err(format!("could not re-link the work note chain: {e}")),
+        }
+    }
     let notes = db
         .get_unsynced_summaries(now_ts, SUMMARY_CORRECTION_WINDOW_SECS, 50)
         .map_err(|e| format!("could not read unsynced work notes: {e}"))?;
@@ -521,6 +533,40 @@ mod tests {
             head_in_cloud,
             Some(kept_hash),
             "the next upload links to the cloud's head"
+        );
+        assert!(db.verify_summary_chain(&keys.public_key).unwrap().is_ok());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_sync_relinks_a_chain_held_up_by_a_note_from_before_pairing() {
+        // #179: before the first upload, a chain whose first signed note links to a note
+        // from before pairing is re-linked, so the cloud is offered a chain from its start.
+        let path =
+            std::env::temp_dir().join(format!("tenby10_sync_paired_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::new(path.clone()).unwrap();
+        let keys = crate::config::generate_enrollment_keys("tok");
+        let signer = crate::db::SlotSigner {
+            public_key: &keys.public_key,
+            private_key: &keys.private_key,
+        };
+
+        db.insert_work_summary(86_400, 172_800, "Day one.", 200_000, "ph", None)
+            .unwrap();
+        let unsigned_hash = db.get_work_summaries(0, 400_000).unwrap()[0].hash.clone();
+        db.append_note_linked_to(172_800, "Day two.", 300_000, &signer, &unsigned_hash);
+
+        // The reply does not matter here: what is checked is what the sync offered.
+        let base = one_shot_server("409 Conflict", r#"{"error":"chain_broken"}"#);
+        let now = 1_000_000;
+        assert!(sync_work_summaries(&db, "agent", &base, now, Some(&signer)).is_err());
+
+        let queue = db.get_unsynced_summaries(now, 0, 50).unwrap();
+        assert_eq!(queue.len(), 1);
+        assert_eq!(
+            queue[0].parent_hash, "",
+            "the first signed note starts the chain"
         );
         assert!(db.verify_summary_chain(&keys.public_key).unwrap().is_ok());
         let _ = std::fs::remove_file(&path);

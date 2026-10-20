@@ -415,11 +415,18 @@ fn rechain_summaries(
     Ok(rows.len())
 }
 
-/// The `work_summaries` rows that form the chain: every row except a note withdrawn
-/// before it uploaded (#178). That note never travels, so nothing the cloud holds can
-/// link to it. It stays on disk with its own hash and signature, outside the chain.
-/// A withdrawn note never uploads afterwards, so a row cannot move back in.
-const ON_CHAIN: &str = "NOT (kind = 'note' AND withdrawn = 1 AND synced = 0)";
+/// The `work_summaries` rows that form the chain: every signed row except a note
+/// withdrawn before it uploaded. Neither of the others ever travels, so nothing the
+/// cloud holds can link to them. They stay on disk with their own hash (and signature,
+/// if any), outside the chain.
+///
+/// - **Unsigned rows** (#179) were written before the device was paired, or with a key
+///   that could not sign. Pairing starts the shared record: they stay on this machine.
+///   A row is never signed after it is written, so it cannot move in.
+/// - **A note withdrawn before it uploaded** (#178). A withdrawn note never uploads
+///   afterwards, so it cannot move back in.
+const ON_CHAIN: &str =
+    "signature IS NOT NULL AND NOT (kind = 'note' AND withdrawn = 1 AND synced = 0)";
 
 /// Head of the work-summary chain as seen by `conn`, or `""` before the first record.
 /// Takes a connection so writers can read it inside their own transaction.
@@ -1388,8 +1395,9 @@ impl Database {
     /// for the same day is a different text claiming the same place in the record, which
     /// the cloud refuses, and the notes chained behind it could never upload.
     ///
-    /// Like slot insertion, a malformed key leaves the row unsigned (still chained) rather
-    /// than failing the write: losing the summary is worse than losing its signature.
+    /// Like slot insertion, a malformed key leaves the row unsigned rather than failing
+    /// the write: losing the summary is worse than losing its signature. An unsigned row
+    /// stays on this machine, outside the chain (#179).
     pub fn insert_work_summary(
         &self,
         period_start: i64,
@@ -1541,11 +1549,16 @@ impl Database {
             rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
 
         // The first revision this withdrawal takes out of the chain, and the link it had.
+        // Only a revision in the chain leaves it. One written before pairing was never
+        // in it (#179), so nothing behind it needs re-linking.
         let leaving: Option<(i64, String)> = tx
             .query_row(
-                "SELECT id, parent_hash FROM work_summaries
-                 WHERE period_start = ?1 AND kind = 'note' AND synced = 0 AND withdrawn = 0
-                 ORDER BY id ASC LIMIT 1",
+                &format!(
+                    "SELECT id, parent_hash FROM work_summaries
+                     WHERE period_start = ?1 AND kind = 'note' AND synced = 0 AND withdrawn = 0
+                       AND {ON_CHAIN}
+                     ORDER BY id ASC LIMIT 1"
+                ),
                 params![period_start],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
@@ -1692,6 +1705,65 @@ impl Database {
         Ok(Some(rechained))
     }
 
+    /// Re-link a note chain that a record outside it still holds up (#179). Returns how
+    /// many records were re-linked: 0 when the chain is whole, or when it cannot be
+    /// repaired without touching something that left this machine.
+    ///
+    /// Before #179, notes written before pairing were unsigned but still in the chain,
+    /// so the first signed note after pairing linked to a note the cloud never receives.
+    /// The cloud refused it, and every note behind it waited. Those rows now sit outside
+    /// the chain ([`ON_CHAIN`]), which leaves a gap where they were.
+    ///
+    /// The chain is walked from its start. At the first record whose link does not match
+    /// the record before it in the chain, that record and every one after it are
+    /// re-linked, re-hashed and re-signed with `signer`. Each keeps its own text, period
+    /// and `generated_at`, so the correction window is unchanged. Nothing is rewritten
+    /// unless none of those records has uploaded and every one was signed with
+    /// `signer`'s key.
+    pub fn relink_summary_chain(&self, signer: &SlotSigner) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let tx =
+            rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
+
+        // (id, hash, parent_hash, synced, signing_pubkey) for each record in the chain.
+        type Link = (i64, String, String, bool, Option<String>);
+        let chain: Vec<Link> = {
+            let mut stmt = tx.prepare(&format!(
+                "SELECT id, hash, parent_hash, synced, signing_pubkey FROM work_summaries
+                 WHERE {ON_CHAIN} ORDER BY id ASC"
+            ))?;
+            let rows = stmt.query_map([], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })?;
+            rows.collect::<Result<_>>()?
+        };
+
+        let mut after_id = 0;
+        let mut parent = String::new();
+        let Some(gap) = chain.iter().position(|(id, hash, parent_hash, _, _)| {
+            if *parent_hash != parent {
+                return true;
+            }
+            after_id = *id;
+            parent = hash.clone();
+            false
+        }) else {
+            return Ok(0);
+        };
+
+        let rest = &chain[gap..];
+        let safe = rest.iter().all(|(_, _, _, synced, pubkey)| {
+            !*synced && pubkey.as_deref() == Some(signer.public_key)
+        });
+        if !safe {
+            return Ok(0);
+        }
+
+        let relinked = rechain_summaries(&tx, after_id, parent, Some(signer))?;
+        tx.commit()?;
+        Ok(relinked)
+    }
+
     /// Append a note the way inserts worked before #176: no check for an existing note,
     /// so a test can build the duplicate an overlapping pass used to leave behind.
     #[cfg(test)]
@@ -1714,6 +1786,51 @@ impl Database {
             text,
             "ph",
             &parent,
+        );
+        conn.execute(
+            "INSERT INTO work_summaries (
+                period_start, period_end, summary_text, generated_at, revision,
+                hash, parent_hash, signature, signing_pubkey, scheme_version, prompt_hash
+            ) VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, ?7, ?8, ?9, 'ph')",
+            params![
+                period_start,
+                period_start + 86_400,
+                text,
+                generated_at,
+                sha256_hex(&payload),
+                parent,
+                sign_hex(signer.private_key, &payload).unwrap(),
+                signer.public_key,
+                SUMMARY_SCHEME_VERSION,
+            ],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    /// Append a signed note linked to `parent`, whatever the chain head is, so a test can
+    /// build the chain notes from before pairing used to leave behind (#179): a signed
+    /// note linked to an unsigned one.
+    #[cfg(test)]
+    pub(crate) fn append_note_linked_to(
+        &self,
+        period_start: i64,
+        text: &str,
+        generated_at: i64,
+        signer: &SlotSigner,
+        parent: &str,
+    ) -> i64 {
+        let conn = self.conn.lock().unwrap();
+        let payload = canonical_summary_payload(
+            SUMMARY_SCHEME_VERSION,
+            signer.public_key,
+            period_start,
+            period_start + 86_400,
+            generated_at,
+            0,
+            text,
+            "ph",
+            parent,
         );
         conn.execute(
             "INSERT INTO work_summaries (
@@ -3991,6 +4108,211 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855|CONFIGHASH|PARE
             head = record.hash.clone();
         }
         (head, 0)
+    }
+
+    #[test]
+    fn test_notes_written_before_pairing_stay_local_and_later_notes_upload() {
+        // #179: notes written before the device is paired are unsigned. They used to sit
+        // in the chain, so the first signed note linked to a note the cloud never gets,
+        // was refused, and no note uploaded again.
+        let db = create_test_db();
+        let keys = crate::config::generate_enrollment_keys("tok");
+        let signer = SlotSigner {
+            public_key: &keys.public_key,
+            private_key: &keys.private_key,
+        };
+        let day = 86_400;
+        let window = 12 * 3600;
+        let t0 = 1_786_800_000;
+
+        // Two days written before pairing.
+        let before = [
+            db.insert_work_summary(day, 2 * day, "Day one.", t0, "ph", None)
+                .unwrap()
+                .unwrap(),
+            db.insert_work_summary(2 * day, 3 * day, "Day two.", t0 + day, "ph", None)
+                .unwrap()
+                .unwrap(),
+        ];
+        let before_rows: Vec<_> = before.iter().map(|&id| note_row(&db, id)).collect();
+
+        // Paired. The next two days are signed.
+        let t1 = t0 + 2 * day;
+        db.insert_work_summary(3 * day, 4 * day, "Day three.", t1, "ph", Some(&signer))
+            .unwrap();
+        db.insert_work_summary(4 * day, 5 * day, "Day four.", t1 + day, "ph", Some(&signer))
+            .unwrap();
+
+        let now = t1 + day + window;
+        let offered = db.get_unsynced_summaries(now, window, 50).unwrap();
+        assert_eq!(
+            offered.iter().map(|r| r.period_start).collect::<Vec<_>>(),
+            vec![3 * day, 4 * day],
+            "only notes from after pairing are offered"
+        );
+        assert_eq!(
+            offered[0].parent_hash, "",
+            "the first signed note starts the chain"
+        );
+        let (_, refused) = upload_like_the_cloud(&db, String::new(), now);
+        assert_eq!(refused, 0, "every note from after pairing uploads");
+
+        for (id, row) in before.iter().zip(before_rows) {
+            assert_eq!(
+                note_row(&db, *id),
+                row,
+                "a note from before pairing is untouched"
+            );
+        }
+        assert!(
+            db.has_work_summary(day).unwrap(),
+            "the day keeps its local note, so the generator does not write it again"
+        );
+        assert!(
+            db.get_unsynced_summaries(now + 10 * day, window, 50)
+                .unwrap()
+                .is_empty(),
+            "and it is never offered later"
+        );
+        assert!(db.verify_summary_chain(&keys.public_key).unwrap().is_ok());
+    }
+
+    #[test]
+    fn test_a_chain_held_up_by_a_note_from_before_pairing_recovers() {
+        // A database written before #179: the first signed note links to an unsigned
+        // one. Relinking puts it at the start of the chain; nothing else changes.
+        let db = create_test_db();
+        let keys = crate::config::generate_enrollment_keys("tok");
+        let signer = SlotSigner {
+            public_key: &keys.public_key,
+            private_key: &keys.private_key,
+        };
+        let day = 86_400;
+        let window = 12 * 3600;
+        let t0 = 1_786_800_000;
+
+        let unsigned = db
+            .insert_work_summary(day, 2 * day, "Day one.", t0, "ph", None)
+            .unwrap()
+            .unwrap();
+        let unsigned_row = note_row(&db, unsigned).unwrap();
+        let first =
+            db.append_note_linked_to(2 * day, "Day two.", t0 + day, &signer, &unsigned_row.0);
+        let second = db
+            .insert_work_summary(
+                3 * day,
+                4 * day,
+                "Day three.",
+                t0 + 2 * day,
+                "ph",
+                Some(&signer),
+            )
+            .unwrap()
+            .unwrap();
+        let first_before = note_row(&db, first).unwrap();
+
+        let now = t0 + 2 * day + window;
+        let (_, refused) = upload_like_the_cloud(&db, String::new(), now);
+        assert_eq!(refused, 2, "held up: the cloud refuses the first and stops");
+
+        assert_eq!(db.relink_summary_chain(&signer).unwrap(), 2);
+        let first_after = note_row(&db, first).unwrap();
+        assert_eq!(first_after.1, "", "the first signed note starts the chain");
+        assert!(first_after.2.is_some(), "and is re-signed");
+        assert_eq!(
+            (first_after.3, first_after.4),
+            (first_before.3, first_before.4),
+            "its text and moment are unchanged, so its correction window is too"
+        );
+        assert_eq!(note_row(&db, second).unwrap().1, first_after.0);
+        assert_eq!(
+            note_row(&db, unsigned).unwrap(),
+            unsigned_row,
+            "the note from before pairing is untouched"
+        );
+        assert!(db.verify_summary_chain(&keys.public_key).unwrap().is_ok());
+
+        let (_, refused) = upload_like_the_cloud(&db, String::new(), now);
+        assert_eq!(refused, 0, "every note from after pairing now uploads");
+        assert_eq!(
+            db.relink_summary_chain(&signer).unwrap(),
+            0,
+            "a whole chain is left alone"
+        );
+    }
+
+    #[test]
+    fn test_relinking_never_touches_what_has_uploaded() {
+        let db = create_test_db();
+        let keys = crate::config::generate_enrollment_keys("tok");
+        let signer = SlotSigner {
+            public_key: &keys.public_key,
+            private_key: &keys.private_key,
+        };
+        let other = crate::config::generate_enrollment_keys("other");
+        let other_signer = SlotSigner {
+            public_key: &other.public_key,
+            private_key: &other.private_key,
+        };
+        let day = 86_400;
+        let t0 = 1_786_800_000;
+
+        // A gap followed by a record that has uploaded: rewriting it would change
+        // something the cloud holds, so nothing changes.
+        let unsigned = db
+            .insert_work_summary(day, 2 * day, "Day one.", t0, "ph", None)
+            .unwrap()
+            .unwrap();
+        let link = note_row(&db, unsigned).unwrap().0;
+        let uploaded = db.append_note_linked_to(2 * day, "Day two.", t0 + day, &signer, &link);
+        db.mark_summary_synced(uploaded).unwrap();
+        let before = note_row(&db, uploaded);
+        assert_eq!(db.relink_summary_chain(&signer).unwrap(), 0);
+        assert_eq!(note_row(&db, uploaded), before);
+
+        // A gap followed by a record signed with another key: not ours to re-sign.
+        let db = create_test_db();
+        let unsigned = db
+            .insert_work_summary(day, 2 * day, "Day one.", t0, "ph", None)
+            .unwrap()
+            .unwrap();
+        let link = note_row(&db, unsigned).unwrap().0;
+        let foreign = db.append_note_linked_to(2 * day, "Day two.", t0 + day, &other_signer, &link);
+        let before = note_row(&db, foreign);
+        assert_eq!(db.relink_summary_chain(&signer).unwrap(), 0);
+        assert_eq!(note_row(&db, foreign), before);
+    }
+
+    #[test]
+    fn test_withdrawing_a_day_from_before_pairing_leaves_the_chain_alone() {
+        // The note was never in the chain, so withdrawing it re-links nothing. The
+        // withdrawal itself is signed and links to the head like any record.
+        let db = create_test_db();
+        let keys = crate::config::generate_enrollment_keys("tok");
+        let signer = SlotSigner {
+            public_key: &keys.public_key,
+            private_key: &keys.private_key,
+        };
+        let day = 86_400;
+        let window = 12 * 3600;
+        let t0 = 1_786_800_000;
+
+        db.insert_work_summary(day, 2 * day, "Day one.", t0, "ph", None)
+            .unwrap();
+        let signed = db
+            .insert_work_summary(2 * day, 3 * day, "Day two.", t0 + day, "ph", Some(&signer))
+            .unwrap()
+            .unwrap();
+        let (head, _) = upload_like_the_cloud(&db, String::new(), t0 + day + window);
+        let signed_row = note_row(&db, signed);
+
+        db.withdraw_work_summary(day, t0 + day + window + 60, Some(&signer))
+            .unwrap()
+            .unwrap();
+        assert_eq!(note_row(&db, signed), signed_row, "nothing is re-linked");
+        let (_, refused) = upload_like_the_cloud(&db, head, t0 + day + window + 120);
+        assert_eq!(refused, 0);
+        assert!(db.verify_summary_chain(&keys.public_key).unwrap().is_ok());
     }
 
     #[test]
