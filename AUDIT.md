@@ -43,7 +43,7 @@ auditable; the cloud portal is not part of this repository.
 | 5 | Cloud sync (when enrolled) is count/category summaries + hashes + config + your daily work notes; your BYOK provider is the only other destination | ✅ Verified, scope corrected | Five endpoints, all inventoried in §2 — [sync.rs](daemon/src/sync.rs). BYOK calls live in [llm.rs](daemon/src/llm.rs), reached from slot scoring, note writing, and debrief writing (`generate_pending_debriefs`, [daemon.rs](daemon/src/daemon.rs)); the debrief's output stays local (§1a) |
 | 6 | No image is sent to your LLM provider, ever | ✅ Verified structurally | The provider trait takes text only ([llm.rs](daemon/src/llm.rs)); nothing in the client can produce an image to send |
 | 7 | Focus-scoring rules are deterministic and inspectable | ✅ Verified | [evaluator.rs](daemon/src/evaluator.rs), [entropy.rs](daemon/src/entropy.rs) |
-| 8 | Local logs are tamper-evident (full-payload hash chain) + self-signed when enrolled | ✅ Verified | [db.rs `insert_slot_summary`/`verify_ledger_integrity`](daemon/src/db.rs) — work notes have their own chain, same construction (§5) |
+| 8 | Local logs are tamper-evident (full-payload hash chain) + self-signed when enrolled | ✅ Verified | [db.rs `insert_slot_summary`/`verify_ledger_integrity`](daemon/src/db.rs) — work notes have their own chain, same construction (§5). Slots recorded before pairing keep a local chain of their own; the shared chain starts at the first signed slot (#180) |
 | 9 | Your daily work note names the work in its own words — never a verbatim window title, never a person | ⚠️ Mechanism-enforced for verbatim titles; prompt-steered for the rest | The default prompt ([config.rs:60](daemon/src/config.rs#L60)) instructs the model to name the project, document, or feature in its own words, and to reproduce no window title, file path, or URL verbatim and no person's name (ADR 0019 §4). The verbatim rule does not rest on the model: before a note is signed, `note_quotes_a_title` ([untrusted.rs](daemon/src/untrusted.rs), called from [daemon.rs:594](daemon/src/daemon.rs#L594)) refuses a note that echoes a ≥32-normalized-character run of any title captured that day, and `sanitize_note` ([llm.rs:108](daemon/src/llm.rs#L108)) rejects empty or essay-length replies. Short names (a repo, a product) pass the echo check by design. The person-name rule and the naming instruction remain prompt-steered; the prompt's SHA-256 is bound into the signed record so a reader can check which rules applied |
 | 10 | Anyone you share a link with, a client or a manager, sees only what you uploaded: never your screen, window titles, URLs or what you typed | ✅ Bounded by §2; the page itself is rendered by the cloud | §7 lists what the page shows and when new hours appear; commands 3 to 5 in How to verify prove the bound |
 | — | Secrets stored in OS keychain, and the signing key never reaches the app window | ✅ Verified | [config.rs `save_config`/`load_config`](daemon/src/config.rs) — `private_key` & `llm_api_key` kept in the OS keychain via the `keyring` crate. Since #94 the settings UI is sent a redacted config with no `private_key` and no API key value ([lib.rs](desktop/src-tauri/src/lib.rs)); the API key is write-only and the app runs under a `default-src 'self'` CSP — see G2 |
@@ -162,7 +162,9 @@ Nothing leaves the machine until you **enroll** and sync. The complete list of o
    `generated_at` is older than that. **Withdraw it before the window closes and it never travels at
    all** — the same query drops withdrawn notes. Withdrawal *records* are exempt from the wait and
    upload immediately, because taking something back is useless if it queues. Unsigned rows are never
-   uploaded either, so nothing syncs before you enroll.
+   uploaded either, so nothing syncs before you enroll. Slots recorded before you pair stay on this
+   machine for good: pairing starts the shared record, and the first slot signed after it links to
+   genesis (#180, §5).
 
    **Never sent:** raw keystrokes, and raw window titles — no payload above has a title field. The
    one thing that can carry information *derived* from a title is the work note's `summary_text`, and
@@ -346,6 +348,20 @@ Run them with `cd daemon && cargo test`.
   keychain). This closes the obvious hole in a bare hash chain: an attacker who edits a row and then
   re-computes its hash to hide the edit still cannot produce a valid signature without your key, so
   verification fails. Slots written before enrollment are unsigned (hash-chain tamper-evidence only).
+- **Pairing starts the shared record (#180).** Each slot links to the previous slot on its own chain:
+  signed slots to the previous slot signed by the same key, starting at genesis, which is where the
+  cloud's record for that key starts; unsigned slots to the previous unsigned slot. Slots recorded
+  before pairing therefore stay on this machine on a local chain and are never uploaded, and
+  `verify_ledger_integrity` checks each chain on its own. Slots signed by earlier builds linked to the
+  previous slot of any kind, so the first one after pairing could link to an unsigned slot. Before
+  each upload, `relink_unsent_slots` re-links, re-hashes and re-signs signed slots from the first
+  wrong link on, with the same key. It changes no hour, score, timestamp or config hash, and it acts
+  only when every slot it would touch has never been uploaded and still matches its stored hash and
+  signature, so nothing the cloud holds changes and a slot edited on disk is never re-signed. Locked by
+  `test_hours_tracked_before_pairing_do_not_hold_up_hours_after_pairing` (in [db.rs](daemon/src/db.rs)
+  and, against a stand-in for the cloud's chain check, in [sync.rs](daemon/src/sync.rs)),
+  `test_unsent_slots_signed_behind_pre_pairing_slots_are_relinked`,
+  `test_relink_leaves_uploaded_slots_alone` and `test_relink_never_re_signs_a_slot_edited_on_disk`.
 - **Honest scope.** This is *tamper-evidence and self-asserted authorship on a machine you control*,
   not encryption and not third-party proof: you hold the signing key, so anyone with your key (i.e.
   you) can still fabricate a self-consistent, self-signed ledger. Verifying a report *to a

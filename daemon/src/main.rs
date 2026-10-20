@@ -148,7 +148,7 @@ fn reseal_and_sync(
     }
 
     let base = daemon::sync::cloud_base_url();
-    match daemon::sync::sync_signed_slots(&db, &config.agent_id, &base) {
+    match daemon::sync::sync_signed_slots(&db, &config.agent_id, &base, Some(&signer)) {
         Ok(uploaded) => {
             println!("Uploaded {uploaded} slot(s) to {base}.");
             if let Ok(head) = db.get_latest_slot_hash() {
