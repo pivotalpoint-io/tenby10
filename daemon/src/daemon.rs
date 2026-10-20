@@ -717,8 +717,17 @@ pub fn generate_pending_summaries(db: &Database) {
         .unwrap_or_default()
         .as_secs() as i64;
 
+    let signer = if config.public_key.is_empty() || config.private_key.is_empty() {
+        None
+    } else {
+        Some(crate::db::SlotSigner {
+            public_key: &config.public_key,
+            private_key: &config.private_key,
+        })
+    };
+
     let pending = match db.days_needing_summary(now, SUMMARY_LOOKBACK_DAYS) {
-        Ok(days) => days,
+        Ok(days) => days_from_pairing(days, signer.is_some(), config.paired_at),
         Err(err) => {
             eprintln!("[Summary] Could not list days needing a note: {err:?}");
             return;
@@ -805,15 +814,6 @@ pub fn generate_pending_summaries(db: &Database) {
             continue;
         }
 
-        let signer = if config.public_key.is_empty() || config.private_key.is_empty() {
-            None
-        } else {
-            Some(crate::db::SlotSigner {
-                public_key: &config.public_key,
-                private_key: &config.private_key,
-            })
-        };
-
         match db.insert_work_summary(
             day_start,
             day_end,
@@ -829,6 +829,24 @@ pub fn generate_pending_summaries(db: &Database) {
             Err(err) => eprintln!("[Summary] Could not store the note for {day_start}: {err:?}"),
         }
     }
+}
+
+/// The days a note pass may write, given whether this device signs notes (#179).
+///
+/// Pairing starts the shared record. Before it, notes are written for this machine
+/// only. After it, the pass still fills in recent days that have no note, but not a
+/// day that ended before the device was paired: that note would be signed, and would
+/// upload a description of a day from before this device joined anything.
+///
+/// The day the device was paired is kept. A `paired_at` of 0 means the pairing time
+/// is unknown (a device paired before it was recorded), and no day is dropped.
+fn days_from_pairing(days: Vec<(i64, i64)>, signing: bool, paired_at: i64) -> Vec<(i64, i64)> {
+    if !signing || paired_at <= 0 {
+        return days;
+    }
+    days.into_iter()
+        .filter(|&(_, day_end)| day_end > paired_at)
+        .collect()
 }
 
 /// Set while a note pass runs. Process-wide, because every pass shares one database.
@@ -1366,6 +1384,35 @@ pub fn aggregate_slot(db: &Database, config: &crate::config::AgentConfig, slot_s
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_no_note_is_written_for_a_day_before_pairing() {
+        // #179: after pairing, the backfill stops at the day the device was paired.
+        let day = 86_400;
+        let days = vec![(0, day), (day, 2 * day), (2 * day, 3 * day)];
+        let paired_at = day + 3_600;
+
+        assert_eq!(
+            days_from_pairing(days.clone(), true, paired_at),
+            vec![(day, 2 * day), (2 * day, 3 * day)],
+            "the day that ended before pairing is dropped; the pairing day is kept"
+        );
+        assert_eq!(
+            days_from_pairing(days.clone(), true, day),
+            vec![(day, 2 * day), (2 * day, 3 * day)],
+            "a day ending exactly at pairing is a day before it"
+        );
+        assert_eq!(
+            days_from_pairing(days.clone(), false, paired_at),
+            days,
+            "before pairing every day gets a note for this machine"
+        );
+        assert_eq!(
+            days_from_pairing(days.clone(), true, 0),
+            days,
+            "an unknown pairing time drops nothing"
+        );
+    }
 
     #[test]
     fn test_only_one_note_pass_runs_at_a_time() {

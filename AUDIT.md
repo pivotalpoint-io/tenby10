@@ -163,9 +163,11 @@ Nothing leaves the machine until you **enroll** and sync. The complete list of o
    all** — the same query drops withdrawn notes, and the note also leaves the local chain, so the
    records after it still link to what the cloud holds (§5). Withdrawal *records* are exempt from
    the wait and upload immediately, because taking something back is useless if it queues. Unsigned
-   rows are never uploaded either, so nothing syncs before you enroll. Slots recorded before you pair
-   stay on this machine for good: pairing starts the shared record, and the first slot signed after
-   it links to genesis (#180, §5).
+   rows are never uploaded either, so nothing syncs before you enroll. **Pairing starts the shared
+   record.** Slots recorded before you pair stay on this machine for good, and the first slot signed
+   after it links to genesis (#180, §5). A note written before you pair stays on your machine too, in
+   your own dashboard only, and after pairing no note is written for a day that ended before it
+   (#179, §5).
 
    **Never sent:** raw keystrokes, and raw window titles — no payload above has a title field. The
    one thing that can carry information *derived* from a title is the work note's `summary_text`, and
@@ -399,7 +401,7 @@ a stalled note never blocks an hour from syncing or the reverse (`work_summaries
   same transaction that reads the chain head and appends (`insert_work_summary`,
   [db.rs:1179](daemon/src/db.rs#L1179); `test_second_original_for_a_day_is_not_kept`), and only one
   note pass runs at a time.
-- **Records that never left the machine can be re-linked, for two reasons.** The first: installs from
+- **Records that never left the machine can be re-linked, for three reasons.** The first: installs from
   before that check could hold a second revision 0 for a day whose first had already uploaded. The
   cloud refuses it, and since notes upload in chain order, the records behind it would wait
   indefinitely. When the cloud refuses a note for that reason, `drop_unsent_duplicate_note`
@@ -422,6 +424,22 @@ a stalled note never blocks an hour from syncing or the reverse (`work_summaries
   (`test_withdrawing_an_unsent_note_keeps_later_notes_uploading`,
   `test_withdrawing_an_unsent_correction_keeps_the_chain_whole`,
   `test_withdrawal_that_cannot_re_sign_changes_nothing`).
+- **Notes from before pairing stay outside the chain.** That is the third reason. A note written
+  before you pair is unsigned, because the key does not exist yet, and it is never uploaded. The
+  chain is made of signed records only (`ON_CHAIN`, [db.rs](daemon/src/db.rs)), so the first signed
+  note starts it. A note from before pairing is not signed later: a signature added afterwards
+  would vouch for text that nothing protected while it sat on disk. Installs from before this rule
+  can hold a signed note linked to an unsigned one, which the cloud refuses. Before each upload,
+  `relink_summary_chain` (called from `sync_work_summaries`, [sync.rs](daemon/src/sync.rs)) finds
+  the first record whose link does not match the record before it, then re-links, re-hashes and
+  re-signs that record and every one after it. It acts only if none of them has uploaded and all
+  carry the enrolled key; otherwise it changes nothing. Each record keeps its text, period and
+  `generated_at`, so its correction window is unchanged
+  (`test_notes_written_before_pairing_stay_local_and_later_notes_upload`,
+  `test_a_chain_held_up_by_a_note_from_before_pairing_recovers`,
+  `test_relinking_never_touches_what_has_uploaded`). After pairing, the note pass writes no note
+  for a day that ended before the first pairing (`paired_at`, recorded by `config_for_enrollment`
+  and kept on a re-pair; `test_no_note_is_written_for_a_day_before_pairing`).
 - **Withdrawal is its own signed record, not a mutable flag.** `withdraw_work_summary`
   ([db.rs:1317](daemon/src/db.rs#L1317)) appends a separate `kind = 'withdrawal'` row with its own
   canonical form ([db.rs:337](daemon/src/db.rs#L337)) — period and moment only, never the text. The
