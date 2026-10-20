@@ -502,6 +502,52 @@ async fn dashboard_work_notes(
         .map_err(|e| format!("Database error: {}", e))
 }
 
+/// Notes held up on their way to the verified link (#176): how many days, and the
+/// oldest. Drives the dashboard notice.
+#[derive(serde::Serialize)]
+struct NoteSyncStatus {
+    held_up_days: u32,
+    oldest_day: Option<i64>,
+}
+
+/// Whether daily notes are failing to upload. Read from the notes themselves, so it
+/// needs no record of the last sync attempt and survives a restart. A machine that is
+/// not enrolled has no link to upload to, and reports nothing held up.
+#[tauri::command]
+async fn work_note_sync_status(
+    db: tauri::State<'_, Arc<daemon::db::Database>>,
+) -> Result<NoteSyncStatus, String> {
+    let db_clone = db.inner().clone();
+    tokio::task::spawn_blocking(move || {
+        let mut config_path = daemon::env::get_app_home();
+        config_path.push("config.json");
+        let config = daemon::config::load_config(config_path).unwrap_or_default();
+        if config.agent_id.is_empty() {
+            return Ok(NoteSyncStatus {
+                held_up_days: 0,
+                oldest_day: None,
+            });
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let (held_up_days, oldest_day) = db_clone
+            .overdue_unsent_notes(
+                now,
+                daemon::sync::SUMMARY_CORRECTION_WINDOW_SECS,
+                daemon::sync::NOTE_UPLOAD_OVERDUE_SECS,
+            )
+            .map_err(|e| format!("Database error: {}", e))?;
+        Ok(NoteSyncStatus {
+            held_up_days,
+            oldest_day,
+        })
+    })
+    .await
+    .map_err(|e| format!("Task join error: {}", e))?
+}
+
 /// The private daily debriefs covering `[from, to)` (#113). Local-only data:
 /// this command is the only reader, and nothing in the sync path can reach the
 /// table it comes from.
@@ -937,6 +983,7 @@ pub fn run() {
             dashboard_pending_slots,
             dashboard_slot_details,
             dashboard_work_notes,
+            work_note_sync_status,
             dashboard_debriefs,
             debrief_set_kept,
             remove_distracting_keyword,

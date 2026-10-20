@@ -84,6 +84,38 @@ window.addEventListener("keydown", (event) => {
             }
         }
 
+        /// Says so when daily notes stop reaching the verified link (#176). Hours
+        /// upload separately and are unaffected, so the notice says that too: the
+        /// person reading it is deciding whether their client sees a gap.
+        async function fetchNoteSyncStatus() {
+            const box = document.getElementById('note-sync-notice');
+            if (!box) return;
+            try {
+                const status = await invoke('work_note_sync_status');
+                const days = status && status.held_up_days ? status.held_up_days : 0;
+                if (!days || status.oldest_day == null) {
+                    box.hidden = true;
+                    box.replaceChildren();
+                    return;
+                }
+                const since = new Date(status.oldest_day * 1000).toLocaleDateString('en-US', {
+                    weekday: 'short', month: 'short', day: 'numeric',
+                });
+                const title = document.createElement('p');
+                title.className = 'note-sync-notice-title';
+                title.textContent = 'Your daily notes are not reaching your verified link';
+                const text = document.createElement('p');
+                text.className = 'note-sync-notice-text';
+                text.textContent = days === 1
+                    ? `The note for ${since} has not uploaded yet. tenby10 keeps trying in the background. Your hours are not affected and keep uploading.`
+                    : `Notes for ${days} days, starting ${since}, have not uploaded yet. tenby10 keeps trying in the background. Your hours are not affected and keep uploading.`;
+                box.replaceChildren(title, text);
+                box.hidden = false;
+            } catch (err) {
+                console.error('Error checking note uploads', err);
+            }
+        }
+
         async function fetchDebriefs() {
             try {
                 const rows = await invoke('dashboard_debriefs', { from: 0, to: 4102444800 });
@@ -231,6 +263,7 @@ window.addEventListener("keydown", (event) => {
                 const pendingSlots = await invoke('dashboard_pending_slots');
                 await fetchWorkNotes();
                 await fetchDebriefs();
+                await fetchNoteSyncStatus();
 
                 globalSlots = slots || [];
 
