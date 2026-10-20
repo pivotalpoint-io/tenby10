@@ -677,7 +677,17 @@ fn warn_work_notes_gated_by_engine(engine_mode: &str) {
 /// beyond switching the AI on: notes exist because their AI is running, which is what
 /// the AI is for. A day is only summarized once it is over, and only once — so this is
 /// safe to call repeatedly.
+///
+/// One pass at a time (#176). The loop starts a fresh thread every minute, and a pass
+/// can outlast that: a first run writes up to [`SUMMARY_LOOKBACK_DAYS`] days, one model
+/// call each. A pass that finds another still running leaves the work to it. The
+/// insert re-checks the day as well, which also covers a second process on the same
+/// database.
 pub fn generate_pending_summaries(db: &Database) {
+    let Some(_pass) = NotePassGuard::acquire() else {
+        return;
+    };
+
     let mut config_path = crate::env::get_app_home();
     config_path.push("config.json");
     let config = crate::config::load_config(config_path).unwrap_or_default();
@@ -812,9 +822,34 @@ pub fn generate_pending_summaries(db: &Database) {
             &prompt_hash,
             signer.as_ref(),
         ) {
-            Ok(_) => println!("[Summary] {day_start}: {note}"),
+            Ok(Some(_)) => println!("[Summary] {day_start}: {note}"),
+            Ok(None) => {
+                println!("[Summary] {day_start} already has a note, so this one was not kept.")
+            }
             Err(err) => eprintln!("[Summary] Could not store the note for {day_start}: {err:?}"),
         }
+    }
+}
+
+/// Set while a note pass runs. Process-wide, because every pass shares one database.
+static NOTE_PASS_RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// Holds [`NOTE_PASS_RUNNING`] for the life of one pass and releases it on every exit,
+/// early returns and panics included.
+struct NotePassGuard;
+
+impl NotePassGuard {
+    fn acquire() -> Option<Self> {
+        NOTE_PASS_RUNNING
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| NotePassGuard)
+    }
+}
+
+impl Drop for NotePassGuard {
+    fn drop(&mut self) {
+        NOTE_PASS_RUNNING.store(false, Ordering::Release);
     }
 }
 
@@ -1320,7 +1355,7 @@ pub fn aggregate_slot(db: &Database, config: &crate::config::AgentConfig, slot_s
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as i64;
-        match crate::sync::sync_work_summaries(db, &config.agent_id, &base, now) {
+        match crate::sync::sync_work_summaries(db, &config.agent_id, &base, now, signer.as_ref()) {
             Ok(n) if n > 0 => println!("[Sync] Uploaded {n} work note(s) to the cloud."),
             Ok(_) => {}
             Err(e) => eprintln!("[Sync] {e}"),
@@ -1331,6 +1366,21 @@ pub fn aggregate_slot(db: &Database, config: &crate::config::AgentConfig, slot_s
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_only_one_note_pass_runs_at_a_time() {
+        // A pass that outlasts the minute must not be joined by the next one (#176).
+        let first = NotePassGuard::acquire().expect("nothing else is running");
+        assert!(
+            NotePassGuard::acquire().is_none(),
+            "a second pass stands aside"
+        );
+        drop(first);
+        assert!(
+            NotePassGuard::acquire().is_some(),
+            "the next pass runs once it ends"
+        );
+    }
     use crate::config::AgentConfig;
     use crate::db::Database;
     use std::path::PathBuf;

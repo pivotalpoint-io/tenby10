@@ -31,6 +31,10 @@
     </header>
 
     <main style="width: 100%; max-width: 1400px; margin: 0 auto; padding: 2.5rem; display: flex; flex-direction: column; gap: 2rem;">
+        <!-- Shown only while daily notes are held up on their way to the verified
+             link (#176). Filled by dashboard.js; empty and hidden otherwise. -->
+        <div id="note-sync-notice" class="note-sync-notice" role="status" hidden></div>
+
         <!-- Top Metrics Row -->
         <div style="display: flex; gap: 2rem; width: 100%;">
             <div class="glass-card" style="flex: 1; display: flex; justify-content: space-between; align-items: center; padding: 1.2rem 2.5rem;">

@@ -80,6 +80,9 @@ pub async fn enroll_with_cloud(
 /// a slot's effective config (#80), or a note's prompt (#147).
 const PRECONDITION_REQUIRED: u16 = 428;
 
+/// HTTP 409: the record contradicts one the cloud already holds.
+const CONFLICT: u16 = 409;
+
 /// Upload the blob for `config_hash` from the local store so the cloud can resolve a record that
 /// references it. `/api/v1/config` is a plain sha256-keyed blob store, so it carries both kinds of
 /// blob we have to make resolvable: the effective config a slot was scored under (#80) and the
@@ -197,6 +200,13 @@ pub fn sync_signed_slots(db: &Database, agent_id: &str, base_url: &str) -> Resul
 /// next — after an ordinary person has had a morning to look.
 pub const SUMMARY_CORRECTION_WINDOW_SECS: i64 = 12 * 3600;
 
+/// How long past its correction window an unsent note counts as held up (#176).
+///
+/// A note normally uploads within minutes of clearing the window. A day of slack keeps
+/// an ordinary offline evening or a closed lid from raising the dashboard notice, while
+/// still surfacing a stall the day after it starts.
+pub const NOTE_UPLOAD_OVERDUE_SECS: i64 = 24 * 3600;
+
 fn summary_payload(agent_id: &str, note: &crate::db::WorkSummary) -> serde_json::Value {
     serde_json::json!({
         "agent_id": agent_id,
@@ -236,11 +246,18 @@ fn withdrawal_payload(agent_id: &str, record: &crate::db::WorkSummary) -> serde_
 ///
 /// A note rejected because the cloud lacks its prompt (428) is retried once after uploading
 /// that prompt, so the words and the rules behind them always arrive together (#147).
+///
+/// A note refused because the cloud already holds a different note for that day and
+/// revision (409 `summary_conflict`) is a second note this machine wrote for a day it had
+/// already uploaded. With `signer` set, it is removed and the unsent records behind it are
+/// re-chained ([`Database::drop_unsent_duplicate_note`]), and they upload on the next sync
+/// (#176).
 pub fn sync_work_summaries(
     db: &Database,
     agent_id: &str,
     base_url: &str,
     now_ts: i64,
+    signer: Option<&crate::db::SlotSigner>,
 ) -> Result<usize, String> {
     if agent_id.is_empty() {
         return Ok(0);
@@ -282,6 +299,39 @@ pub fn sync_work_summaries(
                 .map_err(|e| format!("note re-upload after prompt backfill failed: {e}"))?;
         }
 
+        if resp.status().as_u16() == CONFLICT && !is_withdrawal {
+            let code = resp
+                .json::<serde_json::Value>()
+                .ok()
+                .and_then(|body| body.get("error")?.as_str().map(str::to_owned));
+            if code.as_deref() == Some("summary_conflict") {
+                return match signer.map(|s| db.drop_unsent_duplicate_note(record.id, s)) {
+                    Some(Ok(Some(rechained))) => {
+                        println!(
+                            "[Sync] The cloud already holds the note for {}, so the second \
+                             note this machine wrote for that day was removed and {rechained} \
+                             unsent record(s) behind it were re-chained. They upload next sync.",
+                            record.period_start
+                        );
+                        Ok(uploaded)
+                    }
+                    Some(Err(e)) => Err(format!(
+                        "could not re-chain the notes after {}: {e}",
+                        record.period_start
+                    )),
+                    _ => Err(format!(
+                        "work note for {} rejected: the cloud holds a different note for that \
+                         day — stopping this sync",
+                        record.period_start
+                    )),
+                };
+            }
+            return Err(format!(
+                "work note for {} rejected: HTTP 409 — stopping this sync",
+                record.period_start
+            ));
+        }
+
         if !resp.status().is_success() {
             return Err(format!(
                 "{} for {} rejected: HTTP {} — stopping this sync",
@@ -304,6 +354,120 @@ pub fn sync_work_summaries(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serve exactly one HTTP request on loopback with a fixed status and JSON body, and
+    /// return the base URL. Enough to drive one upload attempt without a cloud.
+    fn one_shot_server(status: &'static str, body: &'static str) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            // Read the whole request first, so the client never sees a reset mid-send.
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let n = stream.read(&mut chunk).unwrap();
+                buf.extend_from_slice(&chunk[..n]);
+                let text = String::from_utf8_lossy(&buf);
+                if let Some(head_end) = text.find("\r\n\r\n") {
+                    let length = text[..head_end]
+                        .lines()
+                        .find_map(|l| {
+                            let (k, v) = l.split_once(':')?;
+                            k.eq_ignore_ascii_case("content-length")
+                                .then(|| v.trim().parse::<usize>().ok())?
+                        })
+                        .unwrap_or(0);
+                    if buf.len() >= head_end + 4 + length {
+                        break;
+                    }
+                }
+                if n == 0 {
+                    break;
+                }
+            }
+            let reply = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(reply.as_bytes()).unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    #[test]
+    fn test_conflicting_duplicate_note_is_set_aside_and_the_chain_recovers() {
+        // The cloud refuses a second original for a day it already holds (#176). Sync
+        // removes that local duplicate and re-chains what was behind it, so the next sync
+        // starts from the cloud's head instead of retrying the same refusal forever.
+        let path =
+            std::env::temp_dir().join(format!("tenby10_sync_conflict_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::new(path.clone()).unwrap();
+        let keys = crate::config::generate_enrollment_keys("tok");
+        let signer = crate::db::SlotSigner {
+            public_key: &keys.public_key,
+            private_key: &keys.private_key,
+        };
+
+        let kept = db.append_note_unchecked(86_400, "Day one.", 200_000, &signer);
+        db.mark_summary_synced(kept).unwrap();
+        let duplicate = db.append_note_unchecked(86_400, "Day one, again.", 200_060, &signer);
+        db.insert_work_summary(172_800, 259_200, "Day two.", 300_000, "ph", Some(&signer))
+            .unwrap();
+
+        let base = one_shot_server(
+            "409 Conflict",
+            r#"{"error":"summary_conflict","message":"A different note already exists."}"#,
+        );
+        let now = 1_000_000;
+        let uploaded = sync_work_summaries(&db, "agent", &base, now, Some(&signer)).unwrap();
+        assert_eq!(uploaded, 0);
+
+        let queue = db.get_unsynced_summaries(now, 0, 50).unwrap();
+        assert!(
+            queue.iter().all(|n| n.id != duplicate),
+            "the duplicate is no longer queued"
+        );
+        let head_in_cloud = queue.first().map(|n| n.parent_hash.clone());
+        let kept_hash = {
+            let all = db.get_work_summaries(0, 400_000).unwrap();
+            all.iter().find(|n| n.id == kept).unwrap().hash.clone()
+        };
+        assert_eq!(
+            head_in_cloud,
+            Some(kept_hash),
+            "the next upload links to the cloud's head"
+        );
+        assert!(db.verify_summary_chain(&keys.public_key).unwrap().is_ok());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_other_conflicts_stop_the_sync_and_change_nothing() {
+        let path =
+            std::env::temp_dir().join(format!("tenby10_sync_chain_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::new(path.clone()).unwrap();
+        let keys = crate::config::generate_enrollment_keys("tok");
+        let signer = crate::db::SlotSigner {
+            public_key: &keys.public_key,
+            private_key: &keys.private_key,
+        };
+        let kept = db.append_note_unchecked(86_400, "Day one.", 200_000, &signer);
+        db.mark_summary_synced(kept).unwrap();
+        db.append_note_unchecked(86_400, "Day one, again.", 200_060, &signer);
+
+        let base = one_shot_server("409 Conflict", r#"{"error":"chain_broken"}"#);
+        let err = sync_work_summaries(&db, "agent", &base, 1_000_000, Some(&signer)).unwrap_err();
+        assert!(err.contains("409"), "{err}");
+        assert_eq!(
+            db.get_unsynced_summaries(1_000_000, 0, 50).unwrap().len(),
+            1
+        );
+        let _ = std::fs::remove_file(&path);
+    }
 
     #[test]
     fn test_cloud_url_override_is_validated_before_it_is_used() {

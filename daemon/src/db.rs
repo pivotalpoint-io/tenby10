@@ -347,6 +347,44 @@ fn canonical_withdrawal_payload(
     )
 }
 
+/// Ed25519-sign `payload` with a hex private key, hex-encoded. `None` when the key is
+/// malformed, which callers treat the way slot insertion does.
+fn sign_hex(private_key_hex: &str, payload: &str) -> Option<String> {
+    let arr: [u8; 32] = from_hex(private_key_hex)?.try_into().ok()?;
+    let sk = SigningKey::from_bytes(&arr);
+    Some(to_hex_bytes(&sk.sign(payload.as_bytes()).to_bytes()))
+}
+
+/// Head of the work-summary chain as seen by `conn`, or `""` before the first record.
+/// Takes a connection so writers can read it inside their own transaction.
+fn summary_head(conn: &Connection) -> Result<String> {
+    let mut stmt = conn.prepare("SELECT hash FROM work_summaries ORDER BY id DESC LIMIT 1")?;
+    let mut rows = stmt.query([])?;
+    match rows.next()? {
+        Some(row) => row.get(0),
+        None => Ok(String::new()),
+    }
+}
+
+/// A `work_summaries` row in the column order the note queries select.
+fn work_summary_from_row(row: &rusqlite::Row<'_>) -> Result<WorkSummary> {
+    Ok(WorkSummary {
+        id: row.get(0)?,
+        period_start: row.get(1)?,
+        period_end: row.get(2)?,
+        summary_text: row.get(3)?,
+        generated_at: row.get(4)?,
+        revision: row.get(5)?,
+        withdrawn: row.get::<_, i64>(6)? != 0,
+        hash: row.get(7)?,
+        parent_hash: row.get(8)?,
+        signature: row.get(9)?,
+        scheme_version: row.get(10).unwrap_or(SUMMARY_SCHEME_VERSION),
+        prompt_hash: row.get(11).unwrap_or_default(),
+        kind: row.get(12).unwrap_or_else(|_| "note".to_string()),
+    })
+}
+
 /// Verify an Ed25519 slot signature. `Ok(true)`/`Ok(false)` on a well-formed
 /// key+sig; `Err` when the key or signature bytes are malformed.
 fn verify_slot_signature(
@@ -1044,18 +1082,18 @@ impl Database {
     /// Head of the work-summary chain, or `""` when no summary has been written yet.
     pub fn get_latest_summary_hash(&self) -> Result<String> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT hash FROM work_summaries ORDER BY id DESC LIMIT 1")?;
-        let mut rows = stmt.query([])?;
-        if let Some(row) = rows.next()? {
-            row.get(0)
-        } else {
-            Ok(String::new())
-        }
+        summary_head(&conn)
     }
 
     /// Append a work summary for `period_start..period_end`, chained and — when enrolled —
     /// signed (ADR 0019). `revision` 0 is the original; corrections come through
     /// [`Database::revise_work_summary`], which appends rather than edits.
+    ///
+    /// Returns `None` when the period already has a note. The generator checks first,
+    /// but the check runs before a model call that can take a while, so the decision is
+    /// taken again here, inside the transaction that appends (#176). A second original
+    /// for the same day is a different text claiming the same place in the record, which
+    /// the cloud refuses, and the notes chained behind it could never upload.
     ///
     /// Like slot insertion, a malformed key leaves the row unsigned (still chained) rather
     /// than failing the write: losing the summary is worse than losing its signature.
@@ -1067,13 +1105,12 @@ impl Database {
         generated_at: i64,
         prompt_hash: &str,
         signer: Option<&SlotSigner>,
-    ) -> Result<i64> {
+    ) -> Result<Option<i64>> {
         self.append_summary_revision(
             period_start,
-            period_end,
+            Some(period_end),
             summary_text,
             generated_at,
-            0,
             prompt_hash,
             signer,
         )
@@ -1090,54 +1127,55 @@ impl Database {
         prompt_hash: &str,
         signer: Option<&SlotSigner>,
     ) -> Result<Option<i64>> {
-        let existing: Option<(i64, u32)> = {
-            let conn = self.conn.lock().unwrap();
-            let mut stmt = conn.prepare(
-                "SELECT period_end, MAX(revision) FROM work_summaries
-                 WHERE period_start = ?1 AND kind = 'note'",
-            )?;
-            let mut rows = stmt.query(params![period_start])?;
-            match rows.next()? {
-                Some(row) => {
-                    let period_end: Option<i64> = row.get(0)?;
-                    let max_revision: Option<u32> = row.get(1)?;
-                    match (period_end, max_revision) {
-                        (Some(end), Some(rev)) => Some((end, rev)),
-                        _ => None,
-                    }
-                }
-                None => None,
-            }
-        };
-
-        let Some((period_end, max_revision)) = existing else {
-            return Ok(None);
-        };
-
         self.append_summary_revision(
             period_start,
-            period_end,
+            None,
             summary_text,
             generated_at,
-            max_revision + 1,
             prompt_hash,
             signer,
         )
-        .map(Some)
     }
 
-    #[allow(clippy::too_many_arguments)]
+    /// The one writer of note rows. `period_end` set means "the original for this
+    /// period", `None` means "the next correction of the existing one".
+    ///
+    /// Everything that decides the row (whether the period has a note, its next
+    /// revision, the chain head it links to) is read inside the same `IMMEDIATE`
+    /// transaction that writes it, so two writers, in this process or another one on
+    /// the same database, can neither duplicate a revision nor fork the chain.
     fn append_summary_revision(
         &self,
         period_start: i64,
-        period_end: i64,
+        period_end: Option<i64>,
         summary_text: &str,
         generated_at: i64,
-        revision: u32,
         prompt_hash: &str,
         signer: Option<&SlotSigner>,
-    ) -> Result<i64> {
-        let parent_hash = self.get_latest_summary_hash()?;
+    ) -> Result<Option<i64>> {
+        let conn = self.conn.lock().unwrap();
+        let tx =
+            rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
+
+        let existing: Option<(i64, u32)> = tx.query_row(
+            "SELECT MAX(period_end), MAX(revision) FROM work_summaries
+             WHERE period_start = ?1 AND kind = 'note'",
+            params![period_start],
+            |row| {
+                let end: Option<i64> = row.get(0)?;
+                let rev: Option<u32> = row.get(1)?;
+                Ok(end.zip(rev))
+            },
+        )?;
+
+        let (period_end, revision) = match (period_end, existing) {
+            (Some(end), None) => (end, 0),
+            (None, Some((end, max_revision))) => (end, max_revision + 1),
+            // An original for a day that has one, or a correction for a day that has none.
+            _ => return Ok(None),
+        };
+
+        let parent_hash = summary_head(&tx)?;
         let signing_pubkey = signer.map(|s| s.public_key).unwrap_or("");
 
         let payload = canonical_summary_payload(
@@ -1153,16 +1191,10 @@ impl Database {
         );
         let hash = sha256_hex(&payload);
 
-        let signature: Option<String> = signer.and_then(|s| {
-            let bytes = from_hex(s.private_key)?;
-            let arr: [u8; 32] = bytes.try_into().ok()?;
-            let sk = SigningKey::from_bytes(&arr);
-            Some(to_hex_bytes(&sk.sign(payload.as_bytes()).to_bytes()))
-        });
+        let signature: Option<String> = signer.and_then(|s| sign_hex(s.private_key, &payload));
         let stored_pubkey: Option<&str> = signature.as_ref().map(|_| signing_pubkey);
 
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
+        tx.execute(
             "INSERT INTO work_summaries (
                 period_start, period_end, summary_text, generated_at, revision,
                 hash, parent_hash, signature, signing_pubkey, scheme_version, prompt_hash
@@ -1181,7 +1213,9 @@ impl Database {
                 prompt_hash,
             ],
         )?;
-        Ok(conn.last_insert_rowid())
+        let id = tx.last_insert_rowid();
+        tx.commit()?;
+        Ok(Some(id))
     }
 
     /// Stop sharing every revision for a period, and record that decision.
@@ -1200,18 +1234,20 @@ impl Database {
         withdrawn_at: i64,
         signer: Option<&SlotSigner>,
     ) -> Result<Option<i64>> {
-        {
-            let conn = self.conn.lock().unwrap();
-            let affected = conn.execute(
-                "UPDATE work_summaries SET withdrawn = 1 WHERE period_start = ?1 AND kind = 'note'",
-                params![period_start],
-            )?;
-            if affected == 0 {
-                return Ok(None);
-            }
+        let conn = self.conn.lock().unwrap();
+        // One transaction for the flag, the chain head and the append, for the same
+        // reason as `append_summary_revision`: the head must not move in between.
+        let tx =
+            rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
+        let affected = tx.execute(
+            "UPDATE work_summaries SET withdrawn = 1 WHERE period_start = ?1 AND kind = 'note'",
+            params![period_start],
+        )?;
+        if affected == 0 {
+            return Ok(None);
         }
 
-        let parent_hash = self.get_latest_summary_hash()?;
+        let parent_hash = summary_head(&tx)?;
         let signing_pubkey = signer.map(|s| s.public_key).unwrap_or("");
         let payload = canonical_withdrawal_payload(
             SUMMARY_SCHEME_VERSION,
@@ -1221,16 +1257,10 @@ impl Database {
             &parent_hash,
         );
         let hash = sha256_hex(&payload);
-        let signature: Option<String> = signer.and_then(|s| {
-            let bytes = from_hex(s.private_key)?;
-            let arr: [u8; 32] = bytes.try_into().ok()?;
-            let sk = SigningKey::from_bytes(&arr);
-            Some(to_hex_bytes(&sk.sign(payload.as_bytes()).to_bytes()))
-        });
+        let signature: Option<String> = signer.and_then(|s| sign_hex(s.private_key, &payload));
         let stored_pubkey: Option<&str> = signature.as_ref().map(|_| signing_pubkey);
 
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
+        tx.execute(
             "INSERT INTO work_summaries (
                 period_start, period_end, summary_text, generated_at, revision,
                 hash, parent_hash, signature, signing_pubkey, scheme_version, prompt_hash, kind
@@ -1246,7 +1276,204 @@ impl Database {
                 SUMMARY_SCHEME_VERSION,
             ],
         )?;
-        Ok(Some(conn.last_insert_rowid()))
+        let id = tx.last_insert_rowid();
+        tx.commit()?;
+        Ok(Some(id))
+    }
+
+    /// Recover a note chain held up by a second note for a day the cloud already has
+    /// (#176). Returns the number of records re-chained behind it, or `None` when the
+    /// row does not qualify and nothing was changed.
+    ///
+    /// Before inserts re-checked inside their transaction, two overlapping note passes
+    /// could each write revision 0 for the same day. The cloud keeps the first and
+    /// refuses the second as a different note for the same day and revision, and since
+    /// notes upload in chain order, nothing behind it ever uploads.
+    ///
+    /// The second note is removed and every record after it is re-linked to the record
+    /// before it, re-hashed, and re-signed with the same key. Only records that have
+    /// never left this machine are touched, so nothing the cloud holds, and nothing a
+    /// client has seen, changes. Each record keeps its own text, period and
+    /// `generated_at`; only its chain link, hash and signature are new.
+    ///
+    /// Qualifies only when all of these hold, checked in one transaction:
+    /// - the row is a note that has not been uploaded;
+    /// - this machine uploaded a note for the same day and revision (the copy the cloud
+    ///   holds, which stays);
+    /// - no record after it has been uploaded;
+    /// - every signed record after it was signed by `signer`'s key.
+    pub fn drop_unsent_duplicate_note(
+        &self,
+        id: i64,
+        signer: &SlotSigner,
+    ) -> Result<Option<usize>> {
+        let conn = self.conn.lock().unwrap();
+        let tx =
+            rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
+
+        let target: Option<(i64, u32, String)> = tx
+            .query_row(
+                "SELECT period_start, revision, parent_hash FROM work_summaries
+                 WHERE id = ?1 AND kind = 'note' AND synced = 0",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                e => Err(e),
+            })?;
+        let Some((period_start, revision, parent_before)) = target else {
+            return Ok(None);
+        };
+
+        let uploaded_twin: bool = tx.query_row(
+            "SELECT EXISTS (SELECT 1 FROM work_summaries
+                 WHERE period_start = ?1 AND revision = ?2 AND kind = 'note'
+                   AND synced = 1 AND id <> ?3)",
+            params![period_start, revision, id],
+            |r| r.get(0),
+        )?;
+        let uploaded_after: bool = tx.query_row(
+            "SELECT EXISTS (SELECT 1 FROM work_summaries WHERE id > ?1 AND synced = 1)",
+            params![id],
+            |r| r.get(0),
+        )?;
+        let foreign_key_after: bool = tx.query_row(
+            "SELECT EXISTS (SELECT 1 FROM work_summaries
+                 WHERE id > ?1 AND signature IS NOT NULL AND signing_pubkey IS NOT ?2)",
+            params![id, signer.public_key],
+            |r| r.get(0),
+        )?;
+        if !uploaded_twin || uploaded_after || foreign_key_after {
+            return Ok(None);
+        }
+
+        let rows: Vec<WorkSummary> = {
+            let mut stmt = tx.prepare(
+                "SELECT id, period_start, period_end, summary_text, generated_at, revision,
+                        withdrawn, hash, parent_hash, signature, scheme_version, prompt_hash, kind
+                 FROM work_summaries WHERE id > ?1 ORDER BY id ASC",
+            )?;
+            let mapped = stmt.query_map(params![id], work_summary_from_row)?;
+            mapped.collect::<Result<_>>()?
+        };
+
+        tx.execute("DELETE FROM work_summaries WHERE id = ?1", params![id])?;
+
+        let mut parent = parent_before;
+        for row in &rows {
+            let signed = row.signature.is_some();
+            let pubkey = if signed { signer.public_key } else { "" };
+            let payload = if row.kind == "withdrawal" {
+                canonical_withdrawal_payload(
+                    row.scheme_version,
+                    pubkey,
+                    row.period_start,
+                    row.generated_at,
+                    &parent,
+                )
+            } else {
+                canonical_summary_payload(
+                    row.scheme_version,
+                    pubkey,
+                    row.period_start,
+                    row.period_end,
+                    row.generated_at,
+                    row.revision,
+                    &row.summary_text,
+                    &row.prompt_hash,
+                    &parent,
+                )
+            };
+            let hash = sha256_hex(&payload);
+            let signature = if signed {
+                Some(sign_hex(signer.private_key, &payload).ok_or_else(|| {
+                    rusqlite::Error::InvalidParameterName(
+                        "signer private_key is not 32 bytes".into(),
+                    )
+                })?)
+            } else {
+                None
+            };
+            tx.execute(
+                "UPDATE work_summaries SET hash = ?1, parent_hash = ?2, signature = ?3
+                 WHERE id = ?4",
+                params![hash, parent, signature, row.id],
+            )?;
+            parent = hash;
+        }
+
+        tx.commit()?;
+        Ok(Some(rows.len()))
+    }
+
+    /// Append a note the way inserts worked before #176: no check for an existing note,
+    /// so a test can build the duplicate an overlapping pass used to leave behind.
+    #[cfg(test)]
+    pub(crate) fn append_note_unchecked(
+        &self,
+        period_start: i64,
+        text: &str,
+        generated_at: i64,
+        signer: &SlotSigner,
+    ) -> i64 {
+        let conn = self.conn.lock().unwrap();
+        let parent = summary_head(&conn).unwrap();
+        let payload = canonical_summary_payload(
+            SUMMARY_SCHEME_VERSION,
+            signer.public_key,
+            period_start,
+            period_start + 86_400,
+            generated_at,
+            0,
+            text,
+            "ph",
+            &parent,
+        );
+        conn.execute(
+            "INSERT INTO work_summaries (
+                period_start, period_end, summary_text, generated_at, revision,
+                hash, parent_hash, signature, signing_pubkey, scheme_version, prompt_hash
+            ) VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, ?7, ?8, ?9, 'ph')",
+            params![
+                period_start,
+                period_start + 86_400,
+                text,
+                generated_at,
+                sha256_hex(&payload),
+                parent,
+                sign_hex(signer.private_key, &payload).unwrap(),
+                signer.public_key,
+                SUMMARY_SCHEME_VERSION,
+            ],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    /// Notes that cleared the correction window more than `overdue_secs` ago and still
+    /// have not uploaded: how many, and the day of the oldest (#176).
+    ///
+    /// Read from the data rather than from the last sync attempt, so it survives a
+    /// restart and needs no state of its own. A note normally leaves within minutes of
+    /// clearing the window, so anything this old is held up, whatever the reason.
+    /// Counts what [`Database::get_unsynced_summaries`] would send, withdrawals aside.
+    pub fn overdue_unsent_notes(
+        &self,
+        now_ts: i64,
+        correction_window_secs: i64,
+        overdue_secs: i64,
+    ) -> Result<(u32, Option<i64>)> {
+        let cutoff = now_ts - correction_window_secs - overdue_secs;
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT COUNT(DISTINCT period_start), MIN(period_start) FROM work_summaries
+             WHERE kind = 'note' AND synced = 0 AND withdrawn = 0
+               AND signature IS NOT NULL AND generated_at <= ?1",
+            params![cutoff],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
     }
 
     /// The current summary for each period in `[from, to)`: highest revision, withdrawn
@@ -1265,23 +1492,7 @@ impl Database {
                                WHERE period_start = w.period_start AND kind = 'note')
              ORDER BY period_start ASC",
         )?;
-        let rows = stmt.query_map(params![from, to], |row| {
-            Ok(WorkSummary {
-                id: row.get(0)?,
-                period_start: row.get(1)?,
-                period_end: row.get(2)?,
-                summary_text: row.get(3)?,
-                generated_at: row.get(4)?,
-                revision: row.get(5)?,
-                withdrawn: row.get::<_, i64>(6)? != 0,
-                hash: row.get(7)?,
-                parent_hash: row.get(8)?,
-                signature: row.get(9)?,
-                scheme_version: row.get(10).unwrap_or(SUMMARY_SCHEME_VERSION),
-                prompt_hash: row.get(11).unwrap_or_default(),
-                kind: row.get(12).unwrap_or_else(|_| "note".to_string()),
-            })
-        })?;
+        let rows = stmt.query_map(params![from, to], work_summary_from_row)?;
         rows.collect()
     }
 
@@ -1463,23 +1674,7 @@ impl Database {
              ORDER BY id ASC
              LIMIT ?2",
         )?;
-        let rows = stmt.query_map(params![cutoff, limit], |row| {
-            Ok(WorkSummary {
-                id: row.get(0)?,
-                period_start: row.get(1)?,
-                period_end: row.get(2)?,
-                summary_text: row.get(3)?,
-                generated_at: row.get(4)?,
-                revision: row.get(5)?,
-                withdrawn: row.get::<_, i64>(6)? != 0,
-                hash: row.get(7)?,
-                parent_hash: row.get(8)?,
-                signature: row.get(9)?,
-                scheme_version: row.get(10).unwrap_or(SUMMARY_SCHEME_VERSION),
-                prompt_hash: row.get(11).unwrap_or_default(),
-                kind: row.get(12).unwrap_or_else(|_| "note".to_string()),
-            })
-        })?;
+        let rows = stmt.query_map(params![cutoff, limit], work_summary_from_row)?;
         rows.collect()
     }
 
@@ -3150,11 +3345,229 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855|CONFIGHASH|PARE
         let now = 1_786_800_000;
         let id = db
             .insert_work_summary(86_400, 172_800, "Note.", now - 86_400, "ph", Some(&signer))
+            .unwrap()
             .unwrap();
 
         assert_eq!(db.get_unsynced_summaries(now, 3600, 50).unwrap().len(), 1);
         db.mark_summary_synced(id).unwrap();
         assert!(db.get_unsynced_summaries(now, 3600, 50).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_second_original_for_a_day_is_not_kept() {
+        // Two overlapping note passes both decide a day needs a note before either has
+        // written one (#176). The insert re-checks, so only the first is kept.
+        let db = create_test_db();
+        let first = db
+            .insert_work_summary(86_400, 172_800, "First pass.", 172_900, "ph", None)
+            .unwrap();
+        let second = db
+            .insert_work_summary(86_400, 172_800, "Second pass.", 172_960, "ph", None)
+            .unwrap();
+        assert!(first.is_some());
+        assert_eq!(
+            second, None,
+            "a day that has a note does not get a second original"
+        );
+
+        let notes = db.get_work_summaries(0, 300_000).unwrap();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].summary_text, "First pass.");
+
+        // A correction is still a new revision, not a second original.
+        let revised = db
+            .revise_work_summary(86_400, "Corrected.", 173_000, "ph", None)
+            .unwrap()
+            .unwrap();
+        assert!(revised > first.unwrap());
+        assert_eq!(db.get_work_summaries(0, 300_000).unwrap()[0].revision, 1);
+        assert!(db.verify_summary_chain("").unwrap().is_ok());
+    }
+
+    fn note_row(db: &Database, id: i64) -> Option<(String, String, Option<String>, String, i64)> {
+        let conn = db.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT hash, parent_hash, signature, summary_text, generated_at
+             FROM work_summaries WHERE id = ?1",
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .ok()
+    }
+
+    #[test]
+    fn test_unsent_duplicate_is_dropped_and_the_rest_rechained() {
+        // The state an overlapping pass left behind (#176): day 1 uploaded, a second
+        // original for day 1 chained after it, and everything later chained behind that.
+        let db = create_test_db();
+        let keys = crate::config::generate_enrollment_keys("tok");
+        let signer = SlotSigner {
+            public_key: &keys.public_key,
+            private_key: &keys.private_key,
+        };
+        let day = 86_400;
+
+        let kept = db.append_note_unchecked(day, "Day one.", 200_000, &signer);
+        db.mark_summary_synced(kept).unwrap();
+        let duplicate = db.append_note_unchecked(day, "Day one, again.", 200_060, &signer);
+        let later = db
+            .insert_work_summary(2 * day, 3 * day, "Day two.", 300_000, "ph", Some(&signer))
+            .unwrap()
+            .unwrap();
+        let withdrawal = db
+            .withdraw_work_summary(2 * day, 300_100, Some(&signer))
+            .unwrap()
+            .unwrap();
+        let last = db
+            .insert_work_summary(3 * day, 4 * day, "Day three.", 400_000, "ph", Some(&signer))
+            .unwrap()
+            .unwrap();
+        assert!(db.verify_summary_chain(&keys.public_key).unwrap().is_ok());
+
+        let kept_before = note_row(&db, kept).unwrap();
+        let later_before = note_row(&db, later).unwrap();
+
+        let rechained = db.drop_unsent_duplicate_note(duplicate, &signer).unwrap();
+        assert_eq!(
+            rechained,
+            Some(3),
+            "every record behind the duplicate is re-linked"
+        );
+
+        assert_eq!(note_row(&db, duplicate), None, "the duplicate is gone");
+        assert_eq!(
+            note_row(&db, kept).unwrap(),
+            kept_before,
+            "the uploaded note is untouched"
+        );
+        let later_after = note_row(&db, later).unwrap();
+        assert_eq!(
+            later_after.1, kept_before.0,
+            "the next record links to the uploaded note"
+        );
+        assert_ne!(
+            later_after.0, later_before.0,
+            "and is re-hashed for its new link"
+        );
+        assert!(later_after.2.is_some(), "and re-signed");
+        assert_eq!(
+            (later_after.3, later_after.4),
+            (later_before.3, later_before.4),
+            "its text and moment are unchanged"
+        );
+        assert!(note_row(&db, withdrawal).is_some() && note_row(&db, last).is_some());
+        assert!(
+            db.verify_summary_chain(&keys.public_key).unwrap().is_ok(),
+            "the re-chained ledger verifies under the same key"
+        );
+    }
+
+    #[test]
+    fn test_duplicate_recovery_refuses_what_it_cannot_prove_safe() {
+        let keys = crate::config::generate_enrollment_keys("tok");
+        let signer = SlotSigner {
+            public_key: &keys.public_key,
+            private_key: &keys.private_key,
+        };
+
+        // Neither copy has been uploaded: nothing says which one the cloud will keep.
+        let db = create_test_db();
+        db.append_note_unchecked(86_400, "One.", 200_000, &signer);
+        let dup = db.append_note_unchecked(86_400, "Two.", 200_060, &signer);
+        assert_eq!(db.drop_unsent_duplicate_note(dup, &signer).unwrap(), None);
+        assert!(note_row(&db, dup).is_some());
+
+        // A record after it has already left the machine: rewriting would change it.
+        let db = create_test_db();
+        let a = db.append_note_unchecked(86_400, "One.", 200_000, &signer);
+        db.mark_summary_synced(a).unwrap();
+        let dup = db.append_note_unchecked(86_400, "Two.", 200_060, &signer);
+        let b = db
+            .insert_work_summary(172_800, 259_200, "Next.", 300_000, "ph", Some(&signer))
+            .unwrap()
+            .unwrap();
+        db.mark_summary_synced(b).unwrap();
+        assert_eq!(db.drop_unsent_duplicate_note(dup, &signer).unwrap(), None);
+        assert!(note_row(&db, dup).is_some());
+
+        // A different key than the one the records behind it were signed with.
+        let db = create_test_db();
+        let a = db.append_note_unchecked(86_400, "One.", 200_000, &signer);
+        db.mark_summary_synced(a).unwrap();
+        let dup = db.append_note_unchecked(86_400, "Two.", 200_060, &signer);
+        db.insert_work_summary(172_800, 259_200, "Next.", 300_000, "ph", Some(&signer))
+            .unwrap();
+        let other = crate::config::generate_enrollment_keys("tok2");
+        let other_signer = SlotSigner {
+            public_key: &other.public_key,
+            private_key: &other.private_key,
+        };
+        assert_eq!(
+            db.drop_unsent_duplicate_note(dup, &other_signer).unwrap(),
+            None
+        );
+
+        // Not a duplicate at all.
+        let db = create_test_db();
+        let only = db.append_note_unchecked(86_400, "One.", 200_000, &signer);
+        assert_eq!(db.drop_unsent_duplicate_note(only, &signer).unwrap(), None);
+    }
+
+    #[test]
+    fn test_overdue_unsent_notes_counts_only_notes_held_up() {
+        let db = create_test_db();
+        let keys = crate::config::generate_enrollment_keys("tok");
+        let signer = SlotSigner {
+            public_key: &keys.public_key,
+            private_key: &keys.private_key,
+        };
+        let now = 1_786_800_000;
+        let window = 12 * 3600;
+        let overdue = 24 * 3600;
+
+        // Uploaded: not held up.
+        let sent = db
+            .insert_work_summary(
+                86_400,
+                172_800,
+                "Sent.",
+                now - 10 * 86_400,
+                "ph",
+                Some(&signer),
+            )
+            .unwrap()
+            .unwrap();
+        db.mark_summary_synced(sent).unwrap();
+        // Unsent and long past the window: held up.
+        db.insert_work_summary(
+            172_800,
+            259_200,
+            "Stuck.",
+            now - 5 * 86_400,
+            "ph",
+            Some(&signer),
+        )
+        .unwrap();
+        db.insert_work_summary(
+            259_200,
+            345_600,
+            "Stuck too.",
+            now - 3 * 86_400,
+            "ph",
+            Some(&signer),
+        )
+        .unwrap();
+        // Still inside the window: on schedule.
+        db.insert_work_summary(345_600, 432_000, "Fresh.", now - 3600, "ph", Some(&signer))
+            .unwrap();
+        // Unsigned: never meant to upload.
+        db.insert_work_summary(432_000, 518_400, "Unsigned.", now - 5 * 86_400, "ph", None)
+            .unwrap();
+
+        assert_eq!(
+            db.overdue_unsent_notes(now, window, overdue).unwrap(),
+            (2, Some(172_800))
+        );
     }
 
     #[test]

@@ -884,6 +884,28 @@
             color: var(--text-muted);
         }
 
+        /* Notes are held up on the way to the verified link (#176). Something is
+           wrong here, unlike the empty states below, so it reads as a warning. */
+        .note-sync-notice {
+            background: rgba(245, 158, 11, 0.08);
+            border: 1px solid rgba(245, 158, 11, 0.3);
+            border-radius: 12px;
+            padding: 1rem 1.4rem;
+        }
+
+        .note-sync-notice-title {
+            font-weight: 600;
+            color: var(--accent-yellow);
+            margin: 0 0 0.35rem 0;
+        }
+
+        .note-sync-notice-text {
+            font-size: 0.9rem;
+            line-height: 1.5;
+            color: var(--text-muted);
+            margin: 0;
+        }
+
         /* No AI configured: an invitation, not a warning. Nothing is broken. */
         .work-note-empty {
             background: rgba(255, 255, 255, 0.03);
