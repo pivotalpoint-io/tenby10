@@ -355,10 +355,78 @@ fn sign_hex(private_key_hex: &str, payload: &str) -> Option<String> {
     Some(to_hex_bytes(&sk.sign(payload.as_bytes()).to_bytes()))
 }
 
+/// Re-link every chain record after row `after_id`, oldest first, starting from
+/// `parent`: each is re-hashed for its new link and, if it was signed, re-signed with
+/// `signer`. Each record keeps its own text, period and `generated_at`. Returns how
+/// many were re-linked. Callers check first that none of them has left this machine.
+fn rechain_summaries(
+    conn: &Connection,
+    after_id: i64,
+    mut parent: String,
+    signer: Option<&SlotSigner>,
+) -> Result<usize> {
+    let rows = on_chain_summaries_after(conn, after_id)?;
+    for row in &rows {
+        let signer = match (row.signature.is_some(), signer) {
+            (true, Some(s)) => Some(s),
+            (true, None) => {
+                return Err(rusqlite::Error::InvalidParameterName(
+                    "a signed record cannot be re-chained without the signing key".into(),
+                ));
+            }
+            (false, _) => None,
+        };
+        let pubkey = signer.map(|s| s.public_key).unwrap_or("");
+        let payload = if row.kind == "withdrawal" {
+            canonical_withdrawal_payload(
+                row.scheme_version,
+                pubkey,
+                row.period_start,
+                row.generated_at,
+                &parent,
+            )
+        } else {
+            canonical_summary_payload(
+                row.scheme_version,
+                pubkey,
+                row.period_start,
+                row.period_end,
+                row.generated_at,
+                row.revision,
+                &row.summary_text,
+                &row.prompt_hash,
+                &parent,
+            )
+        };
+        let hash = sha256_hex(&payload);
+        let signature = match signer {
+            Some(s) => Some(sign_hex(s.private_key, &payload).ok_or_else(|| {
+                rusqlite::Error::InvalidParameterName("signer private_key is not 32 bytes".into())
+            })?),
+            None => None,
+        };
+        conn.execute(
+            "UPDATE work_summaries SET hash = ?1, parent_hash = ?2, signature = ?3
+             WHERE id = ?4",
+            params![hash, parent, signature, row.id],
+        )?;
+        parent = hash;
+    }
+    Ok(rows.len())
+}
+
+/// The `work_summaries` rows that form the chain: every row except a note withdrawn
+/// before it uploaded (#178). That note never travels, so nothing the cloud holds can
+/// link to it. It stays on disk with its own hash and signature, outside the chain.
+/// A withdrawn note never uploads afterwards, so a row cannot move back in.
+const ON_CHAIN: &str = "NOT (kind = 'note' AND withdrawn = 1 AND synced = 0)";
+
 /// Head of the work-summary chain as seen by `conn`, or `""` before the first record.
 /// Takes a connection so writers can read it inside their own transaction.
 fn summary_head(conn: &Connection) -> Result<String> {
-    let mut stmt = conn.prepare("SELECT hash FROM work_summaries ORDER BY id DESC LIMIT 1")?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT hash FROM work_summaries WHERE {ON_CHAIN} ORDER BY id DESC LIMIT 1"
+    ))?;
     let mut rows = stmt.query([])?;
     match rows.next()? {
         Some(row) => row.get(0),
@@ -383,6 +451,17 @@ fn work_summary_from_row(row: &rusqlite::Row<'_>) -> Result<WorkSummary> {
         prompt_hash: row.get(11).unwrap_or_default(),
         kind: row.get(12).unwrap_or_else(|_| "note".to_string()),
     })
+}
+
+/// The chain's records after row `id`, oldest first.
+fn on_chain_summaries_after(conn: &Connection, id: i64) -> Result<Vec<WorkSummary>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT id, period_start, period_end, summary_text, generated_at, revision,
+                withdrawn, hash, parent_hash, signature, scheme_version, prompt_hash, kind
+         FROM work_summaries WHERE id > ?1 AND {ON_CHAIN} ORDER BY id ASC"
+    ))?;
+    let rows = stmt.query_map(params![id], work_summary_from_row)?;
+    rows.collect()
 }
 
 /// Verify an Ed25519 slot signature. `Ok(true)`/`Ok(false)` on a well-formed
@@ -1227,6 +1306,13 @@ impl Database {
     /// what lets the cloud act on it: a flag on its own would be an instruction anyone
     /// could send about anyone's note.
     ///
+    /// A revision that has not uploaded yet never will, and it also leaves the chain
+    /// (#178): the cloud never receives it, so a record linked to it could never upload,
+    /// and nor could anything behind that. The records after it, none of which has left
+    /// this machine either, are re-linked, re-hashed and re-signed with `signer`, and the
+    /// withdrawal links to what is then the head. Fails, changing nothing, when a signed
+    /// record would need re-signing and `signer` is `None`.
+    ///
     /// Returns the id of the withdrawal record, or `None` when the period has no note.
     pub fn withdraw_work_summary(
         &self,
@@ -1239,12 +1325,45 @@ impl Database {
         // reason as `append_summary_revision`: the head must not move in between.
         let tx =
             rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
+
+        // The first revision this withdrawal takes out of the chain, and the link it had.
+        let leaving: Option<(i64, String)> = tx
+            .query_row(
+                "SELECT id, parent_hash FROM work_summaries
+                 WHERE period_start = ?1 AND kind = 'note' AND synced = 0 AND withdrawn = 0
+                 ORDER BY id ASC LIMIT 1",
+                params![period_start],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                e => Err(e),
+            })?;
+
         let affected = tx.execute(
             "UPDATE work_summaries SET withdrawn = 1 WHERE period_start = ?1 AND kind = 'note'",
             params![period_start],
         )?;
         if affected == 0 {
             return Ok(None);
+        }
+
+        if let Some((first_id, parent_before)) = leaving {
+            // The cloud cannot have accepted anything linked to a record it never
+            // received, so nothing behind it has uploaded. Checked anyway, so a rewrite
+            // can never touch a record that left this machine.
+            let uploaded_after: bool = tx.query_row(
+                "SELECT EXISTS (SELECT 1 FROM work_summaries WHERE id > ?1 AND synced = 1)",
+                params![first_id],
+                |r| r.get(0),
+            )?;
+            if uploaded_after {
+                return Err(rusqlite::Error::InvalidParameterName(
+                    "a record after the withdrawn note has already uploaded".into(),
+                ));
+            }
+            rechain_summaries(&tx, first_id, parent_before, signer)?;
         }
 
         let parent_hash = summary_head(&tx)?;
@@ -1314,7 +1433,7 @@ impl Database {
         let target: Option<(i64, u32, String)> = tx
             .query_row(
                 "SELECT period_start, revision, parent_hash FROM work_summaries
-                 WHERE id = ?1 AND kind = 'note' AND synced = 0",
+                 WHERE id = ?1 AND kind = 'note' AND synced = 0 AND withdrawn = 0",
                 params![id],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
@@ -1340,8 +1459,11 @@ impl Database {
             |r| r.get(0),
         )?;
         let foreign_key_after: bool = tx.query_row(
-            "SELECT EXISTS (SELECT 1 FROM work_summaries
-                 WHERE id > ?1 AND signature IS NOT NULL AND signing_pubkey IS NOT ?2)",
+            &format!(
+                "SELECT EXISTS (SELECT 1 FROM work_summaries
+                     WHERE id > ?1 AND {ON_CHAIN}
+                       AND signature IS NOT NULL AND signing_pubkey IS NOT ?2)"
+            ),
             params![id, signer.public_key],
             |r| r.get(0),
         )?;
@@ -1349,63 +1471,11 @@ impl Database {
             return Ok(None);
         }
 
-        let rows: Vec<WorkSummary> = {
-            let mut stmt = tx.prepare(
-                "SELECT id, period_start, period_end, summary_text, generated_at, revision,
-                        withdrawn, hash, parent_hash, signature, scheme_version, prompt_hash, kind
-                 FROM work_summaries WHERE id > ?1 ORDER BY id ASC",
-            )?;
-            let mapped = stmt.query_map(params![id], work_summary_from_row)?;
-            mapped.collect::<Result<_>>()?
-        };
-
         tx.execute("DELETE FROM work_summaries WHERE id = ?1", params![id])?;
-
-        let mut parent = parent_before;
-        for row in &rows {
-            let signed = row.signature.is_some();
-            let pubkey = if signed { signer.public_key } else { "" };
-            let payload = if row.kind == "withdrawal" {
-                canonical_withdrawal_payload(
-                    row.scheme_version,
-                    pubkey,
-                    row.period_start,
-                    row.generated_at,
-                    &parent,
-                )
-            } else {
-                canonical_summary_payload(
-                    row.scheme_version,
-                    pubkey,
-                    row.period_start,
-                    row.period_end,
-                    row.generated_at,
-                    row.revision,
-                    &row.summary_text,
-                    &row.prompt_hash,
-                    &parent,
-                )
-            };
-            let hash = sha256_hex(&payload);
-            let signature = if signed {
-                Some(sign_hex(signer.private_key, &payload).ok_or_else(|| {
-                    rusqlite::Error::InvalidParameterName(
-                        "signer private_key is not 32 bytes".into(),
-                    )
-                })?)
-            } else {
-                None
-            };
-            tx.execute(
-                "UPDATE work_summaries SET hash = ?1, parent_hash = ?2, signature = ?3
-                 WHERE id = ?4",
-                params![hash, parent, signature, row.id],
-            )?;
-            parent = hash;
-        }
+        let rechained = rechain_summaries(&tx, id, parent_before, Some(signer))?;
 
         tx.commit()?;
-        Ok(Some(rows.len()))
+        Ok(Some(rechained))
     }
 
     /// Append a note the way inserts worked before #176: no check for an existing note,
@@ -1883,9 +1953,12 @@ impl Database {
     pub fn verify_summary_chain(&self, expected_pubkey: &str) -> Result<Result<(), String>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, period_start, period_end, summary_text, generated_at, revision,
-                    hash, parent_hash, signature, signing_pubkey, scheme_version, prompt_hash, kind
-             FROM work_summaries ORDER BY id ASC",
+            &format!(
+                "SELECT id, period_start, period_end, summary_text, generated_at, revision,
+                        hash, parent_hash, signature, signing_pubkey, scheme_version, prompt_hash, kind,
+                        {ON_CHAIN}
+                 FROM work_summaries ORDER BY id ASC"
+            ),
         )?;
         let mut rows = stmt.query([])?;
 
@@ -1905,8 +1978,12 @@ impl Database {
             let scheme_version: u32 = row.get(10).unwrap_or(SUMMARY_SCHEME_VERSION);
             let prompt_hash: String = row.get(11).unwrap_or_default();
             let kind: String = row.get(12).unwrap_or_else(|_| "note".to_string());
+            // A note withdrawn before it uploaded sits outside the chain (#178): its own
+            // hash and signature are still checked below, against the link it was written
+            // with, but nothing links to it.
+            let on_chain: bool = row.get(13)?;
 
-            if parent_hash != expected_parent_hash {
+            if on_chain && parent_hash != expected_parent_hash {
                 return Ok(Err(format!(
                     "Summary chain link broken at row {}. Expected parent hash '{}', found '{}'.",
                     id, expected_parent_hash, parent_hash
@@ -1969,7 +2046,9 @@ impl Database {
                 }
             }
 
-            expected_parent_hash = hash;
+            if on_chain {
+                expected_parent_hash = hash;
+            }
         }
 
         Ok(Ok(()))
@@ -3410,28 +3489,35 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855|CONFIGHASH|PARE
         let kept = db.append_note_unchecked(day, "Day one.", 200_000, &signer);
         db.mark_summary_synced(kept).unwrap();
         let duplicate = db.append_note_unchecked(day, "Day one, again.", 200_060, &signer);
-        let later = db
+        let next = db
             .insert_work_summary(2 * day, 3 * day, "Day two.", 300_000, "ph", Some(&signer))
             .unwrap()
             .unwrap();
+        // Day three is written and then withdrawn before it uploads, so it sits outside
+        // the chain (#178) and recovery must leave it alone.
+        let withdrawn = db
+            .insert_work_summary(3 * day, 4 * day, "Day three.", 400_000, "ph", Some(&signer))
+            .unwrap()
+            .unwrap();
         let withdrawal = db
-            .withdraw_work_summary(2 * day, 300_100, Some(&signer))
+            .withdraw_work_summary(3 * day, 400_100, Some(&signer))
             .unwrap()
             .unwrap();
         let last = db
-            .insert_work_summary(3 * day, 4 * day, "Day three.", 400_000, "ph", Some(&signer))
+            .insert_work_summary(4 * day, 5 * day, "Day four.", 500_000, "ph", Some(&signer))
             .unwrap()
             .unwrap();
         assert!(db.verify_summary_chain(&keys.public_key).unwrap().is_ok());
 
         let kept_before = note_row(&db, kept).unwrap();
-        let later_before = note_row(&db, later).unwrap();
+        let next_before = note_row(&db, next).unwrap();
+        let withdrawn_before = note_row(&db, withdrawn).unwrap();
 
         let rechained = db.drop_unsent_duplicate_note(duplicate, &signer).unwrap();
         assert_eq!(
             rechained,
             Some(3),
-            "every record behind the duplicate is re-linked"
+            "every record in the chain behind the duplicate is re-linked"
         );
 
         assert_eq!(note_row(&db, duplicate), None, "the duplicate is gone");
@@ -3440,26 +3526,219 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855|CONFIGHASH|PARE
             kept_before,
             "the uploaded note is untouched"
         );
-        let later_after = note_row(&db, later).unwrap();
+        let next_after = note_row(&db, next).unwrap();
         assert_eq!(
-            later_after.1, kept_before.0,
+            next_after.1, kept_before.0,
             "the next record links to the uploaded note"
         );
         assert_ne!(
-            later_after.0, later_before.0,
+            next_after.0, next_before.0,
             "and is re-hashed for its new link"
         );
-        assert!(later_after.2.is_some(), "and re-signed");
+        assert!(next_after.2.is_some(), "and re-signed");
         assert_eq!(
-            (later_after.3, later_after.4),
-            (later_before.3, later_before.4),
+            (next_after.3, next_after.4),
+            (next_before.3, next_before.4),
             "its text and moment are unchanged"
         );
-        assert!(note_row(&db, withdrawal).is_some() && note_row(&db, last).is_some());
+        assert_eq!(
+            note_row(&db, withdrawn).unwrap(),
+            withdrawn_before,
+            "a note outside the chain is not rewritten"
+        );
+        assert_eq!(
+            note_row(&db, withdrawal).unwrap().1,
+            next_after.0,
+            "the withdrawal links to the note before it in the chain"
+        );
+        assert!(note_row(&db, last).is_some());
         assert!(
             db.verify_summary_chain(&keys.public_key).unwrap().is_ok(),
             "the re-chained ledger verifies under the same key"
         );
+    }
+
+    /// Upload what `get_unsynced_summaries` offers the way the cloud takes it: each
+    /// record must link to the head the cloud holds, and the first that does not stops
+    /// the pass, as in `sync_work_summaries`. Returns the cloud's head and how many
+    /// offered records it refused.
+    fn upload_like_the_cloud(db: &Database, mut head: String, now: i64) -> (String, usize) {
+        let offered = db.get_unsynced_summaries(now, 12 * 3600, 50).unwrap();
+        for (i, record) in offered.iter().enumerate() {
+            if record.parent_hash != head {
+                return (head, offered.len() - i);
+            }
+            db.mark_summary_synced(record.id).unwrap();
+            head = record.hash.clone();
+        }
+        (head, 0)
+    }
+
+    #[test]
+    fn test_withdrawing_an_unsent_note_keeps_later_notes_uploading() {
+        // #178: a note withdrawn inside its window never uploads, so nothing uploaded
+        // may link to it. Before, the withdrawal and the next day's note both did, the
+        // cloud refused them, and no note uploaded again.
+        let db = create_test_db();
+        let keys = crate::config::generate_enrollment_keys("tok");
+        let signer = SlotSigner {
+            public_key: &keys.public_key,
+            private_key: &keys.private_key,
+        };
+        let day = 86_400;
+        let window = 12 * 3600;
+        let t0 = 1_786_800_000;
+
+        db.insert_work_summary(day, 2 * day, "Day one.", t0, "ph", Some(&signer))
+            .unwrap();
+        let (head, refused) = upload_like_the_cloud(&db, String::new(), t0 + window);
+        assert_eq!(refused, 0);
+
+        // Day two is written, then withdrawn inside its window. Day three follows.
+        let t1 = t0 + day;
+        let withdrawn = db
+            .insert_work_summary(2 * day, 3 * day, "Day two.", t1, "ph", Some(&signer))
+            .unwrap()
+            .unwrap();
+        let withdrawn_before = note_row(&db, withdrawn).unwrap();
+        db.withdraw_work_summary(2 * day, t1 + 60, Some(&signer))
+            .unwrap()
+            .unwrap();
+        let t2 = t1 + day;
+        db.insert_work_summary(3 * day, 4 * day, "Day three.", t2, "ph", Some(&signer))
+            .unwrap();
+
+        let offered = db.get_unsynced_summaries(t2 + window, window, 50).unwrap();
+        assert_eq!(
+            offered
+                .iter()
+                .map(|r| (r.kind.as_str(), r.period_start))
+                .collect::<Vec<_>>(),
+            vec![("withdrawal", 2 * day), ("note", 3 * day)],
+            "the withdrawn note itself is never offered"
+        );
+        let (_, refused) = upload_like_the_cloud(&db, head, t2 + window);
+        assert_eq!(refused, 0, "every record links to what the cloud holds");
+
+        assert_eq!(
+            note_row(&db, withdrawn).unwrap(),
+            withdrawn_before,
+            "the withdrawn note stays on this machine as it was written"
+        );
+        assert!(
+            db.has_work_summary(2 * day).unwrap(),
+            "the generator does not write that day again"
+        );
+        assert!(db.verify_summary_chain(&keys.public_key).unwrap().is_ok());
+    }
+
+    #[test]
+    fn test_withdrawing_an_unsent_correction_keeps_the_chain_whole() {
+        // Revision 0 has uploaded; the correction behind it has not. Withdrawing the
+        // day must still reach the cloud, and must not link to the correction.
+        let db = create_test_db();
+        let keys = crate::config::generate_enrollment_keys("tok");
+        let signer = SlotSigner {
+            public_key: &keys.public_key,
+            private_key: &keys.private_key,
+        };
+        let day = 86_400;
+        let window = 12 * 3600;
+        let t0 = 1_786_800_000;
+
+        db.insert_work_summary(day, 2 * day, "Day one.", t0, "ph", Some(&signer))
+            .unwrap();
+        let (head, _) = upload_like_the_cloud(&db, String::new(), t0 + window);
+        db.revise_work_summary(
+            day,
+            "Day one, corrected.",
+            t0 + window + 60,
+            "ph",
+            Some(&signer),
+        )
+        .unwrap()
+        .unwrap();
+        db.withdraw_work_summary(day, t0 + window + 120, Some(&signer))
+            .unwrap()
+            .unwrap();
+
+        let offered = db
+            .get_unsynced_summaries(t0 + 2 * window + 120, window, 50)
+            .unwrap();
+        assert_eq!(offered.len(), 1);
+        assert_eq!(
+            offered[0].kind, "withdrawal",
+            "the correction never travels"
+        );
+        let (_, refused) = upload_like_the_cloud(&db, head, t0 + 2 * window + 120);
+        assert_eq!(refused, 0, "the withdrawal links to the uploaded revision");
+        assert!(db.verify_summary_chain(&keys.public_key).unwrap().is_ok());
+    }
+
+    #[test]
+    fn test_withdrawing_an_uploaded_note_rewrites_nothing() {
+        // The note already left this machine, so it stays in the chain and so does
+        // everything behind it, unchanged.
+        let db = create_test_db();
+        let keys = crate::config::generate_enrollment_keys("tok");
+        let signer = SlotSigner {
+            public_key: &keys.public_key,
+            private_key: &keys.private_key,
+        };
+        let day = 86_400;
+        let window = 12 * 3600;
+        let t0 = 1_786_800_000;
+
+        db.insert_work_summary(day, 2 * day, "Day one.", t0, "ph", Some(&signer))
+            .unwrap();
+        let (head, _) = upload_like_the_cloud(&db, String::new(), t0 + window);
+        let next = db
+            .insert_work_summary(2 * day, 3 * day, "Day two.", t0 + day, "ph", Some(&signer))
+            .unwrap()
+            .unwrap();
+        let next_before = note_row(&db, next).unwrap();
+        let withdrawal = db
+            .withdraw_work_summary(day, t0 + day + 60, Some(&signer))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(note_row(&db, next).unwrap(), next_before);
+        assert_eq!(note_row(&db, withdrawal).unwrap().1, next_before.0);
+        let (_, refused) = upload_like_the_cloud(&db, head, t0 + day + window);
+        assert_eq!(refused, 0);
+        assert!(db.verify_summary_chain(&keys.public_key).unwrap().is_ok());
+    }
+
+    #[test]
+    fn test_withdrawal_that_cannot_re_sign_changes_nothing() {
+        // Records behind the note are signed; without the key they cannot be re-signed,
+        // so the withdrawal fails as a whole rather than leaving a broken chain.
+        let db = create_test_db();
+        let keys = crate::config::generate_enrollment_keys("tok");
+        let signer = SlotSigner {
+            public_key: &keys.public_key,
+            private_key: &keys.private_key,
+        };
+        let day = 86_400;
+        let note = db
+            .insert_work_summary(day, 2 * day, "Day one.", 200_000, "ph", Some(&signer))
+            .unwrap()
+            .unwrap();
+        let next = db
+            .insert_work_summary(2 * day, 3 * day, "Day two.", 300_000, "ph", Some(&signer))
+            .unwrap()
+            .unwrap();
+        let next_before = note_row(&db, next).unwrap();
+
+        assert!(db.withdraw_work_summary(day, 300_100, None).is_err());
+        assert_eq!(note_row(&db, next).unwrap(), next_before);
+        assert_eq!(
+            db.get_work_summaries(0, 10 * day).unwrap().len(),
+            2,
+            "nothing was withdrawn"
+        );
+        assert!(note_row(&db, note).is_some());
+        assert!(db.verify_summary_chain(&keys.public_key).unwrap().is_ok());
     }
 
     #[test]

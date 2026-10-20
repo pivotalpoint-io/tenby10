@@ -158,11 +158,12 @@ Nothing leaves the machine until you **enroll** and sync. The complete list of o
    **Timing, and how a note can be stopped.** A note does not go up when it is written. It waits out
    a 12-hour correction window (`SUMMARY_CORRECTION_WINDOW_SECS`,
    [sync.rs:166](daemon/src/sync.rs#L166)) on your machine, visible in your own dashboard first:
-   `get_unsynced_summaries` ([db.rs:1656](daemon/src/db.rs#L1656)) will not return a note until
+   `get_unsynced_summaries` ([db.rs:1726](daemon/src/db.rs#L1726)) will not return a note until
    `generated_at` is older than that. **Withdraw it before the window closes and it never travels at
-   all** — the same query drops withdrawn notes. Withdrawal *records* are exempt from the wait and
-   upload immediately, because taking something back is useless if it queues. Unsigned rows are never
-   uploaded either, so nothing syncs before you enroll.
+   all** — the same query drops withdrawn notes, and the note also leaves the local chain, so the
+   records after it still link to what the cloud holds (§5). Withdrawal *records* are exempt from
+   the wait and upload immediately, because taking something back is useless if it queues. Unsigned
+   rows are never uploaded either, so nothing syncs before you enroll.
 
    **Never sent:** raw keystrokes, and raw window titles — no payload above has a title field. The
    one thing that can carry information *derived* from a title is the work note's `summary_text`, and
@@ -358,7 +359,7 @@ Run them with `cd daemon && cargo test`.
 Daily work notes (§2) are the one record type whose *text* leaves the machine, so they get the same
 construction as slots — hash-chained and, once enrolled, Ed25519-signed — on a **separate** chain, so
 a stalled note never blocks an hour from syncing or the reverse (`work_summaries` table,
-[db.rs:503](daemon/src/db.rs#L503); locked by `test_summary_chain_is_independent_of_slots`).
+[db.rs:582](daemon/src/db.rs#L582); locked by `test_summary_chain_is_independent_of_slots`).
 
 - **The text is inside the signature.** `canonical_summary_payload`
   ([db.rs:288](daemon/src/db.rs#L288)) folds `summary_text` to a SHA-256 and signs that, so the
@@ -376,17 +377,17 @@ a stalled note never blocks an hour from syncing or the reverse (`work_summaries
   words. That is what makes the limit in row 9 checkable rather than merely asserted — it evidences
   the instruction, not the model's obedience to it.
 - **Corrections append, never edit.** A revision is a new row with a higher `revision` for the same
-  period (`revise_work_summary`, [db.rs:1122](daemon/src/db.rs#L1122)); the earlier revision stays in
+  period (`revise_work_summary`, [db.rs:1201](daemon/src/db.rs#L1201)); the earlier revision stays in
   the ledger and stays signed. Readers take the highest revision.
 - **One original per day.** A day has at most one revision 0. The insert decides that inside the
   same transaction that reads the chain head and appends (`insert_work_summary`,
-  [db.rs:1100](daemon/src/db.rs#L1100); `test_second_original_for_a_day_is_not_kept`), and only one
+  [db.rs:1179](daemon/src/db.rs#L1179); `test_second_original_for_a_day_is_not_kept`), and only one
   note pass runs at a time.
-- **Records that never left the machine can be re-linked, once, for one reason.** Installs from
+- **Records that never left the machine can be re-linked, for two reasons.** The first: installs from
   before that check could hold a second revision 0 for a day whose first had already uploaded. The
   cloud refuses it, and since notes upload in chain order, the records behind it would wait
   indefinitely. When the cloud refuses a note for that reason, `drop_unsent_duplicate_note`
-  ([db.rs:1305](daemon/src/db.rs#L1305), called from `sync_work_summaries`,
+  ([db.rs:1424](daemon/src/db.rs#L1424), called from `sync_work_summaries`,
   [sync.rs:255](daemon/src/sync.rs#L255)) removes the second copy and re-links, re-hashes and
   re-signs every record after it with the same key. It acts only if this machine uploaded a note for
   that day and revision, nothing after the duplicate has uploaded, and every signed record after it
@@ -395,17 +396,29 @@ a stalled note never blocks an hour from syncing or the reverse (`work_summaries
   (`test_unsent_duplicate_is_dropped_and_the_rest_rechained`,
   `test_duplicate_recovery_refuses_what_it_cannot_prove_safe`). The dashboard says when notes are
   more than a day past their correction window and still have not uploaded.
+- **A note withdrawn before it uploads leaves the chain.** That is the second reason. The note never
+  travels, so nothing the cloud holds can link to it. `withdraw_work_summary` takes every revision of
+  that day that has not uploaded out of the chain and, in the same transaction, re-links, re-hashes
+  and re-signs the records after it, none of which has left the machine either. The withdrawal then
+  links to the new head. The withdrawn note stays on disk with its text and its own signature. If a
+  record after it has uploaded, or a signed record would need re-signing without the key, the
+  withdrawal changes nothing and returns an error
+  (`test_withdrawing_an_unsent_note_keeps_later_notes_uploading`,
+  `test_withdrawing_an_unsent_correction_keeps_the_chain_whole`,
+  `test_withdrawal_that_cannot_re_sign_changes_nothing`).
 - **Withdrawal is its own signed record, not a mutable flag.** `withdraw_work_summary`
-  ([db.rs:1231](daemon/src/db.rs#L1231)) appends a separate `kind = 'withdrawal'` row with its own
+  ([db.rs:1317](daemon/src/db.rs#L1317)) appends a separate `kind = 'withdrawal'` row with its own
   canonical form ([db.rs:337](daemon/src/db.rs#L337)) — period and moment only, never the text. The
   local `withdrawn` column is deliberately **outside** the signed payload: withdrawing is a decision
   about sharing from now on, not an assertion about the past, and the past is what a signature
   covers. A flag on its own would be an instruction anyone could send about anyone's note; the
   signature is what lets the cloud act on it. Locked by
   `test_withdrawal_is_a_signed_record_on_the_same_chain` and `test_forged_withdrawal_fails_verification`.
-- `verify_summary_chain` ([db.rs:1883](daemon/src/db.rs#L1883)) walks the chain the way an auditor
+- `verify_summary_chain` ([db.rs:1953](daemon/src/db.rs#L1953)) walks the chain the way an auditor
   would — every link, every hash, every signature — re-deriving each row under its own kind, so a
-  withdrawal that tried to pass as a note (or the reverse) fails there.
+  withdrawal that tried to pass as a note (or the reverse) fails there. A note withdrawn before it
+  uploaded is outside the chain, so nothing has to link to it, but its own hash and signature are
+  still checked against the link it was written with.
 - **Honest scope, same as above, plus one more limit.** This is still a ledger you sign with your own
   key: it evidences integrity and authorship, not that the sentence is true. And withdrawal is a
   signed *request* travelling upstream — the client can stop sending a note, and can tell the cloud
