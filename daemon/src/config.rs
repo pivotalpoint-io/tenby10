@@ -234,6 +234,11 @@ pub struct AgentConfig {
     /// legit auto-typer could otherwise flag a real user.
     #[serde(default)]
     pub enforce_synthetic_detection: bool,
+    /// When this device was first paired, in unix seconds; 0 before pairing, and on a
+    /// device paired before this was recorded. Pairing starts the shared record, so the
+    /// note pass does not write a note for a day that ended before it (#179).
+    #[serde(default)]
+    pub paired_at: i64,
 }
 
 /// The scoring configuration that actually determines a slot's score — the
@@ -373,6 +378,7 @@ impl Default for AgentConfig {
             disable_work_summaries: false,
             dashboard_port: None,
             enforce_synthetic_detection: false,
+            paired_at: 0,
         }
     }
 }
@@ -676,6 +682,7 @@ pub fn generate_enrollment_keys(enrollment_token: &str) -> AgentConfig {
         disable_work_summaries: false,
         dashboard_port: None,
         enforce_synthetic_detection: false,
+        paired_at: 0,
     }
 }
 
@@ -684,15 +691,25 @@ pub fn generate_enrollment_keys(enrollment_token: &str) -> AgentConfig {
 /// so rotating the key on every re-pair would orphan the signed ledger; keeping one stable
 /// signing identity across re-pairs avoids that. A fresh keypair is generated only on first
 /// enrollment (no key stored yet). The caller fills `agent_id` from the enrollment response.
+///
+/// `paired_at` is set on the first pair only and kept across re-pairs: the record starts
+/// when the device was first paired (#179).
 pub fn config_for_enrollment(config_path: PathBuf, enrollment_token: &str) -> AgentConfig {
-    match load_config(config_path) {
+    let mut config = match load_config(config_path) {
         Ok(existing) if !existing.private_key.is_empty() && !existing.public_key.is_empty() => {
             let mut config = existing;
             config.enrollment_token = enrollment_token.to_string();
             config
         }
         _ => generate_enrollment_keys(enrollment_token),
+    };
+    if config.paired_at <= 0 {
+        config.paired_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
     }
+    config
 }
 
 #[cfg(test)]
@@ -1252,6 +1269,31 @@ mod tests {
         assert!(!config.public_key.is_empty());
         assert!(!config.private_key.is_empty());
         assert_eq!(config.enrollment_token, "tok");
+        assert!(
+            config.paired_at > 0,
+            "the first pair records when it happened"
+        );
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_re_pair_keeps_the_first_pairing_time() {
+        // The record starts at the first pair (#179). A re-pair must not move that
+        // moment forward, or days between the two pairs would lose their notes.
+        let _keychain = keychain();
+        let path = temp_config_path();
+        let existing = r#"{
+            "agent_id": "agent_old",
+            "enrollment_token": "first_token",
+            "public_key": "aabbccdd_pub",
+            "private_key": "aabbccdd_priv",
+            "paired_at": 1786800000
+        }"#;
+        fs::write(&path, existing).unwrap();
+
+        let repair = config_for_enrollment(path.clone(), "second_token");
+        assert_eq!(repair.paired_at, 1_786_800_000);
 
         let _ = fs::remove_file(&path);
     }
