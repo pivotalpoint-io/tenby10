@@ -148,9 +148,25 @@ fn slot_payload(agent_id: &str, slot: &crate::db::SignedSlot) -> serde_json::Val
 /// that config from the local store and retry the slot once (#80). Config presence is therefore
 /// guaranteed before a slot lands — a verified link can never reference a rubric/version the cloud
 /// can't resolve — with no speculative pre-upload and no local "already sent" cache to go stale.
-pub fn sync_signed_slots(db: &Database, agent_id: &str, base_url: &str) -> Result<usize, String> {
+///
+/// With `signer`, unsent slots that still link to a slot recorded before pairing are first
+/// re-linked onto the shared record ([`Database::relink_unsent_slots`], #180), so the first
+/// upload starts where the cloud's record for the key starts.
+pub fn sync_signed_slots(
+    db: &Database,
+    agent_id: &str,
+    base_url: &str,
+    signer: Option<&crate::db::SlotSigner>,
+) -> Result<usize, String> {
     if agent_id.is_empty() {
         return Ok(0);
+    }
+    if let Some(signer) = signer {
+        match db.relink_unsent_slots(signer) {
+            Ok(n) if n > 0 => println!("[Sync] Re-linked {n} unsent slot(s) to the shared record."),
+            Ok(_) => {}
+            Err(e) => eprintln!("[Sync] could not re-link unsent slots: {e}"),
+        }
     }
     let slots = db
         .get_unsynced_signed_slots(100)
@@ -355,45 +371,111 @@ pub fn sync_work_summaries(
 mod tests {
     use super::*;
 
+    /// Read one whole HTTP request and return its body, so the client never sees a reset
+    /// mid-send.
+    fn read_request(stream: &mut std::net::TcpStream) -> String {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let n = stream.read(&mut chunk).unwrap();
+            buf.extend_from_slice(&chunk[..n]);
+            let text = String::from_utf8_lossy(&buf);
+            if let Some(head_end) = text.find("\r\n\r\n") {
+                let length = text[..head_end]
+                    .lines()
+                    .find_map(|l| {
+                        let (k, v) = l.split_once(':')?;
+                        k.eq_ignore_ascii_case("content-length")
+                            .then(|| v.trim().parse::<usize>().ok())?
+                    })
+                    .unwrap_or(0);
+                if buf.len() >= head_end + 4 + length {
+                    return text[head_end + 4..].to_string();
+                }
+            }
+            if n == 0 {
+                return String::new();
+            }
+        }
+    }
+
+    fn reply(stream: &mut std::net::TcpStream, status: &str, body: &str) {
+        use std::io::Write;
+        let reply = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(reply.as_bytes()).unwrap();
+    }
+
     /// Serve exactly one HTTP request on loopback with a fixed status and JSON body, and
     /// return the base URL. Enough to drive one upload attempt without a cloud.
     fn one_shot_server(status: &'static str, body: &'static str) -> String {
-        use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            // Read the whole request first, so the client never sees a reset mid-send.
-            let mut buf = Vec::new();
-            let mut chunk = [0u8; 4096];
-            loop {
-                let n = stream.read(&mut chunk).unwrap();
-                buf.extend_from_slice(&chunk[..n]);
-                let text = String::from_utf8_lossy(&buf);
-                if let Some(head_end) = text.find("\r\n\r\n") {
-                    let length = text[..head_end]
-                        .lines()
-                        .find_map(|l| {
-                            let (k, v) = l.split_once(':')?;
-                            k.eq_ignore_ascii_case("content-length")
-                                .then(|| v.trim().parse::<usize>().ok())?
-                        })
-                        .unwrap_or(0);
-                    if buf.len() >= head_end + 4 + length {
-                        break;
-                    }
-                }
-                if n == 0 {
-                    break;
-                }
-            }
-            let reply = format!(
-                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            stream.write_all(reply.as_bytes()).unwrap();
+            read_request(&mut stream);
+            reply(&mut stream, status, body);
         });
         format!("http://{addr}")
+    }
+
+    /// Stand in for the cloud's slot ledger for a newly paired key: accept a slot only when
+    /// its parent is the current head, which starts at genesis, as `ingestSlot` does.
+    /// Serves `requests` uploads and returns the base URL.
+    fn ledger_server(requests: usize) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let mut head = String::new();
+            for _ in 0..requests {
+                let (mut stream, _) = listener.accept().unwrap();
+                let slot: serde_json::Value =
+                    serde_json::from_str(&read_request(&mut stream)).unwrap();
+                if slot["ledger"]["parent_hash"] == head.as_str() {
+                    head = slot["ledger"]["hash"].as_str().unwrap().to_string();
+                    reply(&mut stream, "200 OK", r#"{"accepted":true}"#);
+                } else {
+                    reply(&mut stream, "409 Conflict", r#"{"error":"chain_broken"}"#);
+                }
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[test]
+    fn test_hours_tracked_before_pairing_do_not_hold_up_hours_after_pairing() {
+        // Tracking runs before pairing (#180). A database from the previous build has its
+        // first signed slot linked to one of those slots, and one new slot is signed under
+        // this build. Sync re-links the unsent slots, and the cloud accepts all of them.
+        let path =
+            std::env::temp_dir().join(format!("tenby10_sync_pairing_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::new(path.clone()).unwrap();
+        let keys = crate::config::generate_enrollment_keys("tok");
+        let signer = crate::db::SlotSigner {
+            public_key: &keys.public_key,
+            private_key: &keys.private_key,
+        };
+        db.insert_slot_summary(1000, 70, 7, 3, 50, 5, "{}", None, "cfg", None)
+            .unwrap();
+        db.insert_signed_slot_linked_to_latest(1600, 80, &signer);
+        db.insert_signed_slot_linked_to_latest(2200, 90, &signer);
+        db.insert_slot_summary(2800, 85, 8, 2, 90, 9, "{}", None, "cfg", Some(&signer))
+            .unwrap();
+
+        let base = ledger_server(3);
+        let uploaded = sync_signed_slots(&db, "agent", &base, Some(&signer)).unwrap();
+        assert_eq!(uploaded, 3, "every hour signed after pairing uploads");
+        assert!(db.get_unsynced_signed_slots(100).unwrap().is_empty());
+        assert!(
+            db.verify_ledger_integrity(&keys.public_key)
+                .unwrap()
+                .is_ok()
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

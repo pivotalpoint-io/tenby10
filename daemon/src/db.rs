@@ -434,6 +434,29 @@ fn summary_head(conn: &Connection) -> Result<String> {
     }
 }
 
+/// Which chain a slot row belongs to: the key that signed it, or `""` for an unsigned row.
+///
+/// Pairing starts the shared record (#180). The cloud keeps one chain per enrolled key,
+/// starting at genesis, so each signed slot links to the previous slot signed by the same
+/// key. Slots recorded before pairing are unsigned, stay on this machine, and form their
+/// own local chain.
+const SLOT_CHAIN_KEY: &str =
+    "COALESCE(CASE WHEN signature IS NOT NULL THEN signing_pubkey END, '')";
+
+/// Head of the slot chain for `chain_key` (see [`SLOT_CHAIN_KEY`]), or `""` before its
+/// first slot. Takes a connection so writers can read it inside their own transaction.
+fn slot_chain_head(conn: &Connection, chain_key: &str) -> Result<String> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT hash FROM slot_summaries WHERE {SLOT_CHAIN_KEY} = ?1
+         ORDER BY slot_start DESC LIMIT 1"
+    ))?;
+    let mut rows = stmt.query(params![chain_key])?;
+    match rows.next()? {
+        Some(row) => row.get(0),
+        None => Ok(String::new()),
+    }
+}
+
 /// A `work_summaries` row in the column order the note queries select.
 fn work_summary_from_row(row: &rusqlite::Row<'_>) -> Result<WorkSummary> {
     Ok(WorkSummary {
@@ -884,6 +907,182 @@ impl Database {
         Ok(rows.len())
     }
 
+    /// Re-link signed slots that have not been uploaded yet onto their own chain (#180).
+    /// Returns the number of slots re-linked; `0` when the chain is already in order or
+    /// when it does not qualify, and then nothing is changed.
+    ///
+    /// Before #180 every slot linked to the previous slot of any kind, so on a device
+    /// that tracked time before pairing, the first signed slot linked to an unsigned one.
+    /// The cloud's record for a key starts at genesis and refuses that link, and since
+    /// slots upload in order, the slots after it wait too.
+    ///
+    /// Walks the slots signed by `signer`'s key in order. From the first one whose parent
+    /// is not the previous slot on that chain, each slot is re-linked, re-hashed and
+    /// re-signed with the same key. Hours, scores, timestamps and the scoring rules they
+    /// name are unchanged; only the chain link, hash and signature are new.
+    ///
+    /// Qualifies only when, checked in one transaction, every slot from that point on:
+    /// - has never been uploaded, so nothing the cloud holds changes; and
+    /// - still matches its stored hash and signature, so a slot edited on disk is never
+    ///   given a fresh signature.
+    pub fn relink_unsent_slots(&self, signer: &SlotSigner) -> Result<usize> {
+        let sk_bytes: [u8; 32] = from_hex(signer.private_key)
+            .and_then(|b| b.try_into().ok())
+            .ok_or_else(|| {
+                rusqlite::Error::InvalidParameterName("signer private_key is not 32 bytes".into())
+            })?;
+        let sk = SigningKey::from_bytes(&sk_bytes);
+
+        let conn = self.conn.lock().unwrap();
+        let tx =
+            rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
+
+        // (row, parent_hash, hash, signature, synced), in chain order.
+        let rows: Vec<(StoredSlotRow, String, String, String, bool)> = {
+            let mut stmt = tx.prepare(
+                "SELECT slot_start, focus_score, active_segments, idle_segments, total_keystrokes,
+                        total_clicks, app_categories, llm_reasoning, config_hash, scheme_version,
+                        screenshot_count, parent_hash, hash, signature, synced
+                 FROM slot_summaries
+                 WHERE signature IS NOT NULL AND signing_pubkey = ?1
+                 ORDER BY slot_start ASC",
+            )?;
+            let mapped = stmt.query_map(params![signer.public_key], |r| {
+                Ok((
+                    StoredSlotRow {
+                        slot_start: r.get(0)?,
+                        focus_score: r.get(1)?,
+                        active_segments: r.get(2)?,
+                        idle_segments: r.get(3)?,
+                        total_keystrokes: r.get(4)?,
+                        total_clicks: r.get(5)?,
+                        app_categories: r.get(6)?,
+                        llm_reasoning: r.get(7)?,
+                        config_hash: r.get(8)?,
+                        scheme_version: r.get(9)?,
+                        screenshot_count: r.get(10)?,
+                    },
+                    r.get(11)?,
+                    r.get(12)?,
+                    r.get(13)?,
+                    r.get::<_, i64>(14)? != 0,
+                ))
+            })?;
+            mapped.collect::<Result<_>>()?
+        };
+
+        // A link to genesis is a deliberate restart (`reseal_from`), never this break, which
+        // always points at an unsigned slot, so it is left as it is.
+        let mut expected = String::new();
+        let mut first_break = None;
+        for (i, (_, parent_hash, hash, _, _)) in rows.iter().enumerate() {
+            if *parent_hash != expected && !parent_hash.is_empty() {
+                first_break = Some(i);
+                break;
+            }
+            expected = hash.clone();
+        }
+        let Some(first_break) = first_break else {
+            return Ok(0);
+        };
+
+        let payload_for = |row: &StoredSlotRow, parent: &str| {
+            canonical_slot_payload(
+                row.scheme_version,
+                row.slot_start,
+                row.focus_score,
+                row.active_segments,
+                row.idle_segments,
+                row.total_keystrokes,
+                row.total_clicks,
+                &row.app_categories,
+                row.llm_reasoning.as_deref(),
+                parent,
+                signer.public_key,
+                &row.config_hash,
+                row.screenshot_count,
+            )
+        };
+
+        let to_relink = &rows[first_break..];
+        let qualifies = to_relink
+            .iter()
+            .all(|(row, parent_hash, hash, sig, synced)| {
+                let payload = payload_for(row, parent_hash);
+                !synced
+                    && sha256_hex(&payload) == *hash
+                    && matches!(
+                        verify_slot_signature(&payload, sig, signer.public_key),
+                        Ok(true)
+                    )
+            });
+        if !qualifies {
+            return Ok(0);
+        }
+
+        let mut parent = expected;
+        for (row, _, _, _, _) in to_relink {
+            let payload = payload_for(row, &parent);
+            let hash = sha256_hex(&payload);
+            let signature = to_hex_bytes(&sk.sign(payload.as_bytes()).to_bytes());
+            tx.execute(
+                "UPDATE slot_summaries SET hash = ?1, parent_hash = ?2, signature = ?3
+                 WHERE slot_start = ?4",
+                params![hash, parent, signature, row.slot_start],
+            )?;
+            parent = hash;
+        }
+
+        tx.commit()?;
+        Ok(to_relink.len())
+    }
+
+    /// Write a signed slot the way inserts worked before #180: linked to the latest slot
+    /// of any kind, so a test can build the chain a device that tracked before pairing
+    /// was left with.
+    #[cfg(test)]
+    pub(crate) fn insert_signed_slot_linked_to_latest(
+        &self,
+        slot_start: i64,
+        focus_score: u32,
+        signer: &SlotSigner,
+    ) {
+        let parent = self.get_latest_slot_hash().unwrap();
+        let payload = canonical_slot_payload(
+            LEDGER_SCHEME_VERSION,
+            slot_start,
+            focus_score,
+            8,
+            2,
+            100,
+            10,
+            "{}",
+            None,
+            &parent,
+            signer.public_key,
+            "cfg",
+            0,
+        );
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO slot_summaries (
+                slot_start, focus_score, active_segments, idle_segments, total_keystrokes,
+                total_clicks, app_categories, hash, parent_hash, llm_reasoning, signature,
+                signing_pubkey, scheme_version, config_hash, screenshot_count
+            ) VALUES (?1, ?2, 8, 2, 100, 10, '{}', ?3, ?4, NULL, ?5, ?6, ?7, 'cfg', 0)",
+            params![
+                slot_start,
+                focus_score,
+                sha256_hex(&payload),
+                parent,
+                sign_hex(signer.private_key, &payload).unwrap(),
+                signer.public_key,
+                LEDGER_SCHEME_VERSION,
+            ],
+        )
+        .unwrap();
+    }
+
     /// Mark a slot as uploaded so it is not sent again.
     pub fn mark_slot_synced(&self, slot_start: i64) -> Result<()> {
         let conn = self.conn.lock().unwrap();
@@ -910,6 +1109,12 @@ impl Database {
     /// chain hash, and — when `signer` is present — an Ed25519 self-signature over
     /// the canonical payload (ADR 0014). The hash now covers **every** stored
     /// field, so editing any of them breaks the chain.
+    ///
+    /// The parent is the head of the chain this row joins (#180): the previous slot
+    /// signed by the same key, or the previous unsigned slot. So the first slot signed
+    /// after pairing links to genesis, which is where the cloud's record for the key
+    /// starts. Whether the row is signed is decided before the parent is chosen, and the
+    /// head is read inside the transaction that writes the row.
     #[allow(clippy::too_many_arguments)]
     pub fn insert_slot_summary(
         &self,
@@ -924,13 +1129,22 @@ impl Database {
         config_hash: &str,
         signer: Option<&SlotSigner>,
     ) -> Result<()> {
-        let parent_hash = self.get_latest_slot_hash()?;
-
-        let signing_pubkey = signer.map(|s| s.public_key).unwrap_or("");
+        // Self-sign when enrolled. A malformed key leaves the row unsigned
+        // (tamper-evident via the hash chain only) rather than failing the write.
+        let signing: Option<(SigningKey, &str)> = signer.and_then(|s| {
+            let arr: [u8; 32] = from_hex(s.private_key)?.try_into().ok()?;
+            Some((SigningKey::from_bytes(&arr), s.public_key))
+        });
+        let signing_pubkey = signing.as_ref().map(|(_, pk)| *pk).unwrap_or("");
 
         // v4 carries no screenshot count (ADR 0018); the column stays 0 on new rows
         // and keeps its historical value on v3 rows so those still verify.
         let screenshot_count = 0u32;
+
+        let conn = self.conn.lock().unwrap();
+        let tx =
+            rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
+        let parent_hash = slot_chain_head(&tx, signing_pubkey)?;
 
         let payload = canonical_slot_payload(
             LEDGER_SCHEME_VERSION,
@@ -949,20 +1163,13 @@ impl Database {
         );
 
         let hash = sha256_hex(&payload);
-
-        // Self-sign when enrolled. A malformed key leaves the row unsigned
-        // (tamper-evident via the hash chain only) rather than failing the write.
-        let signature: Option<String> = signer.and_then(|s| {
-            let bytes = from_hex(s.private_key)?;
-            let arr: [u8; 32] = bytes.try_into().ok()?;
-            let sk = SigningKey::from_bytes(&arr);
-            Some(to_hex_bytes(&sk.sign(payload.as_bytes()).to_bytes()))
-        });
+        let signature: Option<String> = signing
+            .as_ref()
+            .map(|(sk, _)| to_hex_bytes(&sk.sign(payload.as_bytes()).to_bytes()));
         // Only record the signing key when we actually produced a signature.
         let stored_pubkey: Option<&str> = signature.as_ref().map(|_| signing_pubkey);
 
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
+        tx.execute(
             "INSERT OR REPLACE INTO slot_summaries (
                 slot_start, focus_score, active_segments, idle_segments, total_keystrokes, total_clicks, app_categories, hash, parent_hash, llm_reasoning, signature, signing_pubkey, scheme_version, config_hash, screenshot_count
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
@@ -984,7 +1191,7 @@ impl Database {
                 screenshot_count
             ],
         )?;
-        Ok(())
+        tx.commit()
     }
 
     /// Aggregate today's (local time) metrics as a slot-countable model: focus is
@@ -1051,7 +1258,8 @@ impl Database {
     }
 
     /// Verify the slot ledger (ADR 0014). Checks, per slot in order:
-    /// 1. the parent link is intact,
+    /// 1. the parent link is intact: each slot links to the previous slot on its own
+    ///    chain, signed by the same key or unsigned like it (#180),
     /// 2. the full-payload SHA-256 recomputes (covers every stored field), and
     /// 3. any self-signature verifies — and, when `expected_pubkey` is non-empty,
     ///    was produced by that exact enrolled key (blocks a third party without
@@ -1072,7 +1280,8 @@ impl Database {
         )?;
         let mut rows = stmt.query([])?;
 
-        let mut expected_parent_hash = String::new();
+        // Head of each chain seen so far, keyed like `SLOT_CHAIN_KEY`.
+        let mut heads: std::collections::HashMap<String, String> = std::collections::HashMap::new();
 
         while let Some(row) = rows.next()? {
             let slot_start: i64 = row.get(0)?;
@@ -1093,6 +1302,11 @@ impl Database {
             let screenshot_count: u32 = row.get(14).unwrap_or(0);
 
             // 1. Verify parent_hash links correctly
+            let chain_key = match signature {
+                Some(_) => signing_pubkey.clone().unwrap_or_default(),
+                None => String::new(),
+            };
+            let expected_parent_hash = heads.get(&chain_key).cloned().unwrap_or_default();
             if parent_hash != expected_parent_hash {
                 return Ok(Err(format!(
                     "Hash chain link broken at slot {}. Expected parent hash '{}', found '{}'.",
@@ -1152,7 +1366,7 @@ impl Database {
             }
 
             // Move the chain forward
-            expected_parent_hash = hash;
+            heads.insert(chain_key, hash);
         }
 
         Ok(Ok(()))
@@ -3152,6 +3366,211 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855|CONFIGHASH|PARE
             verify_slot_signature(&canonical, &sig2000, &key.public_key).unwrap(),
             "resealed signature verifies under the current key"
         );
+    }
+
+    // --- Pairing starts the shared record (#180) ---
+
+    /// The cloud's continuity rule for a key's first uploads: the first slot links to
+    /// genesis and each next one to the slot before it.
+    fn links_from_genesis(slots: &[SignedSlot]) -> bool {
+        let mut head = String::new();
+        for slot in slots {
+            if slot.parent_hash != head {
+                return false;
+            }
+            head = slot.hash.clone();
+        }
+        true
+    }
+
+    #[test]
+    fn test_hours_tracked_before_pairing_do_not_hold_up_hours_after_pairing() {
+        let db = create_test_db();
+        // Tracking runs from first launch: two slots before the device is paired.
+        db.insert_slot_summary(1000, 70, 7, 3, 50, 5, "{}", None, "cfg", None)
+            .unwrap();
+        db.insert_slot_summary(1600, 75, 8, 2, 60, 6, "{}", None, "cfg", None)
+            .unwrap();
+
+        // Paired: from here on slots are signed.
+        let keys = crate::config::generate_enrollment_keys("tok");
+        let signer = SlotSigner {
+            public_key: &keys.public_key,
+            private_key: &keys.private_key,
+        };
+        db.insert_slot_summary(2200, 80, 8, 2, 100, 10, "{}", None, "cfg", Some(&signer))
+            .unwrap();
+        db.insert_slot_summary(2800, 90, 9, 1, 120, 12, "{}", None, "cfg", Some(&signer))
+            .unwrap();
+
+        let queue = db.get_unsynced_signed_slots(100).unwrap();
+        assert_eq!(
+            queue.iter().map(|s| s.slot_start).collect::<Vec<_>>(),
+            vec![2200, 2800],
+            "only slots signed after pairing are offered for upload"
+        );
+        assert!(
+            links_from_genesis(&queue),
+            "the first slot after pairing starts the shared record"
+        );
+
+        // The slots from before pairing stay on this machine, on their own local chain.
+        let (p1000, h1000, sig1000, _, _) = slot_chain_cols(&db, 1000);
+        let (p1600, _, sig1600, _, _) = slot_chain_cols(&db, 1600);
+        assert_eq!((p1000.as_str(), p1600), ("", h1000));
+        assert!(sig1000.is_empty() && sig1600.is_empty());
+
+        assert!(
+            db.verify_ledger_integrity(&keys.public_key)
+                .unwrap()
+                .is_ok()
+        );
+        assert_eq!(
+            db.relink_unsent_slots(&signer).unwrap(),
+            0,
+            "nothing to repair"
+        );
+    }
+
+    #[test]
+    fn test_unsent_slots_signed_behind_pre_pairing_slots_are_relinked() {
+        let db = create_test_db();
+        let keys = crate::config::generate_enrollment_keys("tok");
+        let signer = SlotSigner {
+            public_key: &keys.public_key,
+            private_key: &keys.private_key,
+        };
+        // A database written by the previous build: the first signed slot links to an
+        // unsigned slot from before pairing.
+        db.insert_slot_summary(1000, 70, 7, 3, 50, 5, "{}", None, "cfg", None)
+            .unwrap();
+        db.insert_signed_slot_linked_to_latest(1600, 80, &signer);
+        db.insert_signed_slot_linked_to_latest(2200, 90, &signer);
+        assert!(!links_from_genesis(
+            &db.get_unsynced_signed_slots(100).unwrap()
+        ));
+        let (_, unsigned_hash, _, _, _) = slot_chain_cols(&db, 1000);
+
+        assert_eq!(db.relink_unsent_slots(&signer).unwrap(), 2);
+
+        let queue = db.get_unsynced_signed_slots(100).unwrap();
+        assert!(
+            links_from_genesis(&queue),
+            "the upload now starts at genesis"
+        );
+        assert_eq!(
+            queue.iter().map(|s| s.focus_score).collect::<Vec<_>>(),
+            vec![80, 90],
+            "hours and scores are unchanged"
+        );
+        assert_eq!(
+            slot_chain_cols(&db, 1000).1,
+            unsigned_hash,
+            "local slot untouched"
+        );
+        assert!(
+            db.verify_ledger_integrity(&keys.public_key)
+                .unwrap()
+                .is_ok()
+        );
+        assert_eq!(db.relink_unsent_slots(&signer).unwrap(), 0, "runs once");
+
+        // New slots carry on from the re-linked head.
+        db.insert_slot_summary(2800, 85, 8, 2, 90, 9, "{}", None, "cfg", Some(&signer))
+            .unwrap();
+        assert!(links_from_genesis(
+            &db.get_unsynced_signed_slots(100).unwrap()
+        ));
+    }
+
+    #[test]
+    fn test_relink_leaves_uploaded_slots_alone() {
+        let db = create_test_db();
+        let keys = crate::config::generate_enrollment_keys("tok");
+        let signer = SlotSigner {
+            public_key: &keys.public_key,
+            private_key: &keys.private_key,
+        };
+        db.insert_slot_summary(1000, 70, 7, 3, 50, 5, "{}", None, "cfg", None)
+            .unwrap();
+        db.insert_signed_slot_linked_to_latest(1600, 80, &signer);
+        db.insert_signed_slot_linked_to_latest(2200, 90, &signer);
+        db.mark_slot_synced(1600).unwrap();
+        let before = (slot_chain_cols(&db, 1600), slot_chain_cols(&db, 2200));
+
+        assert_eq!(db.relink_unsent_slots(&signer).unwrap(), 0);
+        assert_eq!(
+            (slot_chain_cols(&db, 1600), slot_chain_cols(&db, 2200)),
+            before
+        );
+    }
+
+    #[test]
+    fn test_relink_never_re_signs_a_slot_edited_on_disk() {
+        let db = create_test_db();
+        let keys = crate::config::generate_enrollment_keys("tok");
+        let signer = SlotSigner {
+            public_key: &keys.public_key,
+            private_key: &keys.private_key,
+        };
+        db.insert_slot_summary(1000, 70, 7, 3, 50, 5, "{}", None, "cfg", None)
+            .unwrap();
+        db.insert_signed_slot_linked_to_latest(1600, 80, &signer);
+        db.insert_signed_slot_linked_to_latest(2200, 40, &signer);
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE slot_summaries SET focus_score = 95 WHERE slot_start = 2200",
+                [],
+            )
+            .unwrap();
+        let before = slot_chain_cols(&db, 2200);
+
+        assert_eq!(db.relink_unsent_slots(&signer).unwrap(), 0);
+        assert_eq!(slot_chain_cols(&db, 2200), before);
+        assert!(
+            db.verify_ledger_integrity(&keys.public_key)
+                .unwrap()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_relink_leaves_a_resealed_ledger_as_it_is() {
+        let db = create_test_db();
+        let keys = crate::config::generate_enrollment_keys("tok");
+        let signer = SlotSigner {
+            public_key: &keys.public_key,
+            private_key: &keys.private_key,
+        };
+        db.insert_slot_summary(1000, 70, 7, 3, 50, 5, "{}", None, "cfg", None)
+            .unwrap();
+        db.insert_signed_slot_linked_to_latest(1600, 80, &signer);
+        db.reseal_from(1600, &signer).unwrap();
+        let before = slot_chain_cols(&db, 1600);
+
+        assert_eq!(db.relink_unsent_slots(&signer).unwrap(), 0);
+        assert_eq!(slot_chain_cols(&db, 1600), before);
+        assert!(
+            db.verify_ledger_integrity(&keys.public_key)
+                .unwrap()
+                .is_ok()
+        );
+
+        // A reseal that restarts the chain after slots signed by the same key: the restart
+        // at genesis is kept, not linked back onto the abandoned prefix.
+        let db = create_test_db();
+        db.insert_slot_summary(1000, 70, 7, 3, 50, 5, "{}", None, "cfg", Some(&signer))
+            .unwrap();
+        db.insert_slot_summary(1600, 80, 8, 2, 60, 6, "{}", None, "cfg", Some(&signer))
+            .unwrap();
+        db.reseal_from(1600, &signer).unwrap();
+        let before = slot_chain_cols(&db, 1600);
+        assert_eq!(before.0, "");
+
+        assert_eq!(db.relink_unsent_slots(&signer).unwrap(), 0);
+        assert_eq!(slot_chain_cols(&db, 1600), before);
     }
 
     // --- Work summaries (ADR 0019) ---

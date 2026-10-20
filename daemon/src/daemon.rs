@@ -1343,7 +1343,7 @@ pub fn aggregate_slot(db: &Database, config: &crate::config::AgentConfig, slot_s
     // pre-upload, no local "already sent" cache to go stale.
     if !config.agent_id.is_empty() {
         let base = crate::sync::cloud_base_url();
-        match crate::sync::sync_signed_slots(db, &config.agent_id, &base) {
+        match crate::sync::sync_signed_slots(db, &config.agent_id, &base, signer.as_ref()) {
             Ok(n) if n > 0 => println!("[Sync] Uploaded {n} slot(s) to the cloud."),
             Ok(_) => {}
             Err(e) => eprintln!("[Sync] {e}"),
