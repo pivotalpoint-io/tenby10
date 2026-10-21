@@ -536,9 +536,10 @@ real mismatches to close:
 ## 7. What someone you share a link with sees
 
 A verified link is the only way anyone else sees your record, whether you send it to a client or to
-a manager. There is one kind of link, so a manager sees exactly what a client would. The page is
-rendered by the tenby10 cloud, which is not part of this repository, so this section describes that
-page as of 2026-09-15. What bounds it is §2: a link can only show what your machine uploaded, and
+a manager. There is one kind of page, so a manager sees exactly what a client would. A team link
+([below](#if-you-join-a-team)) is that page with three settings fixed. The page is rendered by the
+tenby10 cloud, which is not part of this repository, so this section describes that page as of
+2026-10-21. What bounds it is §2: a link can only show what your machine uploaded, and
 commands 3 to 5 in [How to verify](#how-to-verify) prove what that is.
 
 **What the page shows**, for the period set when the link was created:
@@ -571,7 +572,8 @@ are in every signed slot so the record can be checked, and the page does not dis
 **When new hours appear.** Each ten-minute interval is uploaded as soon as it closes:
 `aggregate_slot` ([daemon.rs:1015](daemon/src/daemon.rs#L1015)) saves the slot, then calls
 `sync_signed_slots` ([daemon.rs:1311](daemon/src/daemon.rs#L1311)). So a link whose period includes
-today shows today's intervals shortly after they end. Nothing on the page says whether you are at
+today shows today's intervals shortly after they end. A team link waits for the day to end
+([below](#if-you-join-a-team)). Nothing on the page says whether you are at
 your machine right now, and nobody is alerted when you start, stop or go idle. Work notes are the
 exception: each waits 12 hours on your machine before it uploads (§2).
 
@@ -579,15 +581,39 @@ exception: each waits 12 hours on your machine before it uploads (§2).
 
 - **A weekly summary email**, if you switch one on for a link: the address you choose gets that
   week's hours and notes by email, and can unsubscribe with one click.
-- **A weekly report of a team's hours**, if tenby10 prepares one from your link: it uses what the
-  link shows, plus when each interval reached tenby10, and everyone on the team gets the same report.
-- **A weekly email to a team's client**, if tenby10 prepares one from that report: your active time
-  and days worked that week, your link, and a line if any of those hours failed the signature check.
-  The report's questions are not in it.
+- **A weekly report of a team's hours**, if you are on a team: tenby10 prepares it from your team
+  links, using what they show plus when each interval reached tenby10, and everyone on the team gets
+  the same report.
+- **A weekly email to a team's client**, which the team page builds from your team links and your
+  manager copies and sends: your active time and days worked that week, your link, and a line if
+  any of those hours failed the signature check. The report's questions are not in it.
 
 **What you keep.** You can revoke a link at any time, and it then shows only that it was withdrawn.
 You can withdraw any work note, and it disappears from every link. Someone viewing a link can narrow
 it to a shorter period, but never widen it.
+
+### If you join a team
+
+A manager can start a team pilot and send their team one invite link. Joining shares your hours, so
+the invite page lists what it shares, and what nobody gets, before you accept.
+
+- **One team link per computer.** Each computer you pair, before or after you join, gets its own
+  team link, under the name you typed when you joined. Your manager can open it, and may send it to
+  the team's client. You open the same link from your dashboard.
+- **Three settings are fixed.** A team link starts the moment you joined. It shows complete days
+  only, through the end of yesterday in your time zone, so nothing on it changes while you work.
+  Focus averages are hidden. Everything else is the page described above, including your daily
+  notes and how many intervals counted.
+- **The team page.** Your manager's page lists people by name, with when each joined, how many
+  computers they share, their active time and days worked this week and last, and their team links.
+  It shows no focus figure, no team average and no ranking. Your dashboard shows you your own row,
+  the same one your manager sees.
+- **Leaving.** You can leave from your dashboard at any time, and your manager can remove you.
+  Either way your team links stop showing hours at once, and say only that you are no longer on the
+  team. When the pilot ends, they say that instead. Your records stay in your account, and the app's
+  copy stays on your machine.
+- **The app works the same.** Joining a team changes nothing the app records or sends (§2). The
+  tenby10 cloud builds team links from the intervals your machine already uploads.
 
 ---
 
