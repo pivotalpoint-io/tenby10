@@ -644,6 +644,14 @@ impl Database {
             "ALTER TABLE slot_summaries ADD COLUMN screenshot_count INTEGER NOT NULL DEFAULT 0",
             [],
         );
+        // The AI's per-minute verdicts for a slot scored in AI mode (#186), as JSON
+        // {minute timestamp: category}. Local display data for the drill-down: the signed
+        // record is the tally they produced in `app_categories`, and this column is never
+        // synced. NULL for rule-scored slots.
+        let _ = conn.execute(
+            "ALTER TABLE slot_summaries ADD COLUMN minute_verdicts TEXT",
+            [],
+        );
         // The effective-config blob for every hash we've scored a slot under, so any slot can be
         // backfilled to the cloud on demand — even after the config later changes (#80). The cloud
         // rejects a slot whose config it lacks; we look the blob up here and upload it, then retry.
@@ -1088,6 +1096,38 @@ impl Database {
             ],
         )
         .unwrap();
+    }
+
+    /// Record the AI's per-minute verdicts for a slot just written (#186), for the
+    /// drill-down. Written after the slot because they are not part of what it signs;
+    /// rewriting the slot (`INSERT OR REPLACE`) clears them.
+    pub fn set_slot_minute_verdicts(
+        &self,
+        slot_start: i64,
+        verdicts: &std::collections::BTreeMap<i64, &str>,
+    ) -> Result<()> {
+        let json = serde_json::to_string(verdicts).unwrap_or_default();
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE slot_summaries SET minute_verdicts = ?1 WHERE slot_start = ?2",
+            params![json, slot_start],
+        )?;
+        Ok(())
+    }
+
+    /// The AI's per-minute verdicts for a slot, keyed by minute timestamp; empty for
+    /// a rule-scored slot.
+    fn slot_minute_verdicts(&self, slot_start: i64) -> std::collections::HashMap<i64, String> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT minute_verdicts FROM slot_summaries WHERE slot_start = ?1",
+            params![slot_start],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .ok()
+        .flatten()
+        .and_then(|json| serde_json::from_str(&json).ok())
+        .unwrap_or_default()
     }
 
     /// Mark a slot as uploaded so it is not sent again.
@@ -2477,8 +2517,11 @@ impl Database {
 
     /// Fetch the minute-by-minute logs for a slot and classify each one into a
     /// display `state`, mirroring the evaluator used by the aggregation pipeline.
+    /// A slot scored in AI mode shows the verdict each minute was counted under
+    /// instead (#186), so the drill-down agrees with the slot's breakdown.
     pub fn get_slot_minute_details(&self, slot_start: i64) -> Result<Vec<SlotMinuteDetailView>> {
         let raw = self.get_minute_logs_for_slot(slot_start)?;
+        let verdicts = self.slot_minute_verdicts(slot_start);
 
         let mut config_path = crate::env::get_app_home();
         config_path.push("config.json");
@@ -2536,6 +2579,10 @@ impl Database {
                 crate::evaluator::ActivityClassification::Idle => "Inactive",
                 crate::evaluator::ActivityClassification::Tampered => "Tampered",
             };
+            let state = verdicts
+                .get(&item.timestamp)
+                .map(String::as_str)
+                .unwrap_or(state);
             list.push(SlotMinuteDetailView {
                 timestamp: item.timestamp,
                 keystroke_count: item.keystroke_count,
@@ -3322,6 +3369,74 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855|CONFIGHASH|PARE
         assert_eq!(details[0].active_app_name, "Code");
         assert_eq!(details[0].state, "Productive");
         assert_eq!(details[1].state, "Inactive");
+    }
+
+    /// A slot scored in AI mode shows the verdict each minute was counted under
+    /// (#186); rewriting the slot clears them, so a rule-scored rewrite shows rules.
+    #[test]
+    fn test_get_slot_minute_details_shows_ai_verdicts() {
+        let db = create_test_db();
+        let slot_start = 600;
+        db.insert_minute_log(
+            slot_start + 60,
+            120,
+            5,
+            2,
+            300.0,
+            "Chrome",
+            "Headlines",
+            false,
+        )
+        .unwrap();
+        db.insert_minute_log(
+            slot_start + 120,
+            30,
+            0,
+            9,
+            80.0,
+            "Chrome",
+            "Pull request",
+            false,
+        )
+        .unwrap();
+        db.insert_slot_summary(
+            slot_start,
+            10,
+            2,
+            0,
+            150,
+            5,
+            "{\"Waste\":1,\"Productive\":1}",
+            Some("News, then a review."),
+            "",
+            None,
+        )
+        .unwrap();
+        let verdicts = std::collections::BTreeMap::from([
+            (slot_start + 60, "Waste"),
+            (slot_start + 120, "Productive"),
+        ]);
+        db.set_slot_minute_verdicts(slot_start, &verdicts).unwrap();
+
+        let details = db.get_slot_minute_details(slot_start).unwrap();
+        assert_eq!(details[0].state, "Waste");
+        assert_eq!(details[1].state, "Productive");
+
+        db.insert_slot_summary(
+            slot_start,
+            20,
+            2,
+            0,
+            150,
+            5,
+            "{\"Productive\":2}",
+            None,
+            "",
+            None,
+        )
+        .unwrap();
+        let details = db.get_slot_minute_details(slot_start).unwrap();
+        assert_eq!(details[0].state, "Productive");
     }
 
     #[test]

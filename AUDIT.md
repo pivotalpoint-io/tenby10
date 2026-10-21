@@ -190,7 +190,14 @@ Nothing leaves the machine until you **enroll** and sync. The complete list of o
      ([daemon.rs:896](daemon/src/daemon.rs#L896)). Payload: one line per minute of the slot with its
      local wall-clock time (HH:MM), the app name, the **window title**, key/click/scroll counts,
      cursor travel in pixels, and the daemon's own rule-based state for that minute (#111). All of
-     it goes to the provider *you* configured; nothing new is sent to tenby10.
+     it goes to the provider *you* configured; nothing new is sent to tenby10. The reply is a
+     score, a short reasoning, and a one-word verdict for each minute (`MINUTE_VERDICTS_RULE`,
+     [llm.rs](daemon/src/llm.rs), appended after any scoring prompt, #186). When the reply has a
+     verdict for every minute, the slot's category counts are tallied from those verdicts, so the
+     breakdown and the score come from the same judge; flagged minutes and meeting minutes past
+     the silence cap keep their rule-based state (`tally_from_verdicts`,
+     [daemon.rs](daemon/src/daemon.rs)). Otherwise the counts stay rule-based. The per-minute
+     verdicts themselves are kept locally for the slot drill-down and are not uploaded.
    - **Daily work note** — whenever a provider is configured and you have not opted out
      (`disable_work_summaries`, [daemon.rs:454-470](daemon/src/daemon.rs#L454)). Note this is **not**
      gated on `engine_mode`: connecting an AI is enough, by design (ADR 0019 — "setup once, then
@@ -291,7 +298,8 @@ capture loop (ADR 0002). A minute is sorted into exactly one state by a fixed pr
    `MEETING_NO_INPUT_STREAK_CAP_STRONG` on strong evidence, where the spoof the bound exists to stop
    is not available. The streak resets on any real input (see `aggregate_slot` in
    [daemon.rs](daemon/src/daemon.rs)). The bound also holds in LLM mode: demoted minutes are removed
-   from the ceiling the LLM score may claim (`meeting_creditable_ceiling`).
+   from the ceiling the LLM score may claim (`meeting_creditable_ceiling`), and the LLM's
+   per-minute verdict cannot count them as meeting or productive time (`tally_from_verdicts`).
 
    None of this proves a human was present in the call. It establishes that a meeting window was
    frontmost, which is what the signals available without capturing audio or pixels can show.
@@ -543,7 +551,8 @@ commands 3 to 5 in [How to verify](#how-to-verify) prove what that is.
   with averages hidden
 - every logged ten-minute interval, with fully idle ones left out: its start time, its focus score
   (how much of the ten minutes was active work), whether it counted, and its minutes by category:
-  productive, meetings, reading, distracting, idle, flagged or other
+  productive, meetings, reading, distracting, idle, flagged or other (with AI scoring on, as your AI
+  judged each minute, §2)
 - your daily work notes, if you turned them on and haven't withdrawn them, marked when one was
   written more than two days late or corrected
 - the rules that scored the intervals, the most recent ones if they changed during the period: your

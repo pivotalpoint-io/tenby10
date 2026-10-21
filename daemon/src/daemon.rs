@@ -1,5 +1,5 @@
 use crate::db::Database;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -946,6 +946,54 @@ fn meeting_creditable_ceiling(total_minutes: u32, demoted_meeting_minutes: u32) 
     ((creditable * 100) / 10).min(100)
 }
 
+/// The category a minute is counted under for each verdict word the auditor may
+/// return (`llm::MINUTE_VERDICTS_RULE`). The names are the rule engine's own, so a
+/// slot's tally reads the same downstream whichever judge filled it.
+fn verdict_category(verdict: &str) -> Option<&'static str> {
+    match verdict.trim().to_ascii_lowercase().as_str() {
+        "productive" => Some("Productive"),
+        "meeting" => Some("Meeting"),
+        "distracted" => Some("Waste"),
+        "idle" => Some("Inactive"),
+        _ => None,
+    }
+}
+
+/// A slot's minutes by category, and each minute's category by its timestamp.
+type VerdictTally = (HashMap<String, u32>, BTreeMap<i64, &'static str>);
+
+/// Re-tally a slot from the auditor's per-minute verdicts (#186): the minutes by
+/// category, and each minute's category keyed by its timestamp for the drill-down.
+///
+/// All or nothing. `None` unless every minute has a verdict, keyed by the HH:MM its
+/// activity line carried, in a word [`verdict_category`] knows: a breakdown that is
+/// part AI and part rules would read as one judge's and be neither.
+///
+/// A held minute keeps its rule category whatever the verdict: a flagged minute
+/// stays `Tampered`, and a meeting minute past the silence cap stays `Inactive`, as
+/// [`meeting_creditable_ceiling`] already holds the score to.
+fn tally_from_verdicts(
+    logs: &[crate::db::MinuteLogData],
+    rule_categories: &[&'static str],
+    held_minutes: &[bool],
+    verdicts: &HashMap<String, String>,
+) -> Option<VerdictTally> {
+    let by_time: HashMap<&str, &str> = verdicts
+        .iter()
+        .map(|(time, verdict)| (time.trim().trim_matches(['[', ']']), verdict.as_str()))
+        .collect();
+
+    let mut tally = HashMap::<String, u32>::new();
+    let mut per_minute = BTreeMap::new();
+    for ((log, rule_category), held) in logs.iter().zip(rule_categories).zip(held_minutes) {
+        let verdict = verdict_category(by_time.get(minute_label(log.timestamp).as_str())?)?;
+        let category = if *held { *rule_category } else { verdict };
+        *tally.entry(category.to_string()).or_insert(0) += 1;
+        per_minute.insert(log.timestamp, category);
+    }
+    Some((tally, per_minute))
+}
+
 /// Unkept debriefs expire after this many days (#113). A debrief is regenerable
 /// from the minute logs while they exist, so expiry deletes convenience, not
 /// evidence — and a candid document should not accumulate indefinitely by mere
@@ -1099,6 +1147,11 @@ pub fn aggregate_slot(db: &Database, config: &crate::config::AgentConfig, slot_s
     // engine already classified every minute, and making the model re-derive that
     // from raw counts produced vaguer reasoning, not independent judgment.
     let mut minute_states: Vec<&'static str> = Vec::with_capacity(logs.len());
+    // Each minute's category under the rules, and whether the auditor may re-judge
+    // it (#186), in log order. A flagged minute and a meeting minute past the silence
+    // cap keep the rule verdict whatever the AI says.
+    let mut rule_categories: Vec<&'static str> = Vec::with_capacity(logs.len());
+    let mut held_minutes: Vec<bool> = Vec::with_capacity(logs.len());
     let evaluator = crate::evaluator::ActivityEvaluator::new();
 
     for log in &logs {
@@ -1131,17 +1184,21 @@ pub fn aggregate_slot(db: &Database, config: &crate::config::AgentConfig, slot_s
         // silence. Beyond the cap for the evidence at hand, demote to `Idle` so a
         // spoofed, zero-input "meeting" cannot bill a slot; any real input resets
         // the streak.
+        let mut demoted = false;
         if classification == crate::evaluator::ActivityClassification::Meeting {
             consecutive_silent_meeting += 1;
             if consecutive_silent_meeting > meeting_streak_cap(meeting_confidence) {
                 classification = crate::evaluator::ActivityClassification::Idle;
                 demoted_meeting_minutes += 1;
+                demoted = true;
             }
         } else {
             consecutive_silent_meeting = 0;
         }
 
         minute_states.push(state_name(classification));
+        held_minutes
+            .push(demoted || classification == crate::evaluator::ActivityClassification::Tampered);
 
         let is_active = classification == crate::evaluator::ActivityClassification::Active
             || classification == crate::evaluator::ActivityClassification::PassiveReview
@@ -1164,6 +1221,7 @@ pub fn aggregate_slot(db: &Database, config: &crate::config::AgentConfig, slot_s
             crate::evaluator::ActivityClassification::Idle => "Inactive",
             crate::evaluator::ActivityClassification::Tampered => "Tampered",
         };
+        rule_categories.push(category);
         *slot_app_categories.entry(category.to_string()).or_insert(0) += 1;
     }
 
@@ -1233,6 +1291,7 @@ pub fn aggregate_slot(db: &Database, config: &crate::config::AgentConfig, slot_s
         final_focus_score = 100;
     }
     let mut final_reasoning: Option<String> = None;
+    let mut minute_verdicts: Option<BTreeMap<i64, &'static str>> = None;
 
     if config.engine_mode == "llm" {
         let purely_idle =
@@ -1268,17 +1327,18 @@ pub fn aggregate_slot(db: &Database, config: &crate::config::AgentConfig, slot_s
                     - Productive Apps: {}\n\
                     - Meeting Apps: {}\n\
                     - Distracting Apps: {}\n\
-                    \n{}",
+                    \n{}\n\n{}",
                     config.productive_apps,
                     config.meeting_apps,
                     config.distracting_apps,
-                    base_prompt
+                    base_prompt,
+                    crate::llm::MINUTE_VERDICTS_RULE
                 );
 
                 match provider.evaluate_slot(&system_prompt, &activity_text) {
-                    Ok((score, reasoning)) => {
+                    Ok(evaluation) => {
                         // Scale LLM score by logged segments / 10 (ADR 0006)
-                        final_focus_score = (score * (logs.len() as u32)) / 10;
+                        final_focus_score = (evaluation.score * (logs.len() as u32)) / 10;
                         if final_focus_score > 100 {
                             final_focus_score = 100;
                         }
@@ -1296,7 +1356,27 @@ pub fn aggregate_slot(db: &Database, config: &crate::config::AgentConfig, slot_s
                         // this is the last point before the text is stored and signed
                         // (#95). `sanitize_reasoning` is idempotent, so applying it twice
                         // costs a scan and changes nothing.
-                        final_reasoning = Some(crate::llm::sanitize_reasoning(&reasoning));
+                        final_reasoning =
+                            Some(crate::llm::sanitize_reasoning(&evaluation.reasoning));
+
+                        // The breakdown shown beside the score comes from the same judge
+                        // as the score (#186). A reply that misses a minute leaves the
+                        // rule-based breakdown in place rather than a partial one.
+                        match tally_from_verdicts(
+                            &logs,
+                            &rule_categories,
+                            &held_minutes,
+                            &evaluation.minutes,
+                        ) {
+                            Some((tally, verdicts)) => {
+                                slot_app_categories = tally;
+                                minute_verdicts = Some(verdicts);
+                            }
+                            None => println!(
+                                "[LLM] Reply carried no usable verdict for every minute of slot {}; its breakdown stays rule-based.",
+                                slot_start
+                            ),
+                        }
                     }
                     Err(e) => {
                         eprintln!("[LLM] Slot evaluation failed: {}", e);
@@ -1353,6 +1433,11 @@ pub fn aggregate_slot(db: &Database, config: &crate::config::AgentConfig, slot_s
             "[Aggregation] Slot summary successfully compiled for slot {}. Focus Score: {}% | Active/Idle: {}/{}",
             slot_start, final_focus_score, slot_active_segments, slot_idle_segments
         );
+        if let Some(verdicts) = &minute_verdicts
+            && let Err(e) = db.set_slot_minute_verdicts(slot_start, verdicts)
+        {
+            eprintln!("[Aggregation] could not store minute verdicts for slot {slot_start}: {e}");
+        }
     }
 
     // Upload any not-yet-synced signed slots (best-effort; #115). Skips when not enrolled. Each
@@ -2327,6 +2412,76 @@ mod tests {
         assert_eq!(meeting_creditable_ceiling(10, 10), 0);
         // Saturating: never underflows.
         assert_eq!(meeting_creditable_ceiling(3, 5), 0);
+    }
+
+    /// In AI mode the breakdown beside the score comes from the auditor's verdicts
+    /// (#186), except for minutes the rules hold, and only when every minute has one.
+    #[test]
+    fn test_tally_from_verdicts() {
+        let minute = |timestamp: i64, keys: u32| crate::db::MinuteLogData {
+            timestamp,
+            keystroke_count: keys,
+            mouse_click_count: 0,
+            scroll_event_count: 0,
+            active_app_name: "Google Chrome".into(),
+            active_window_title: "Morning headlines".into(),
+            low_entropy: false,
+            mouse_movement_distance: 0.0,
+        };
+        let logs = vec![
+            minute(1_756_363_200, 40),
+            minute(1_756_363_260, 12),
+            minute(1_756_363_320, 0),
+            minute(1_756_363_380, 0),
+        ];
+        // The rules call the input minutes productive; the third minute is flagged
+        // and the fourth is a meeting minute past the silence cap.
+        let rule_categories = ["Productive", "Productive", "Tampered", "Inactive"];
+        let held = [false, false, true, true];
+        let reply = |words: [&str; 4]| -> HashMap<String, String> {
+            logs.iter()
+                .zip(words)
+                .map(|(log, word)| (minute_label(log.timestamp), word.to_string()))
+                .collect()
+        };
+
+        let (tally, per_minute) = tally_from_verdicts(
+            &logs,
+            &rule_categories,
+            &held,
+            &reply(["distracted", "Productive", "productive", "meeting"]),
+        )
+        .expect("every minute has a verdict");
+        assert_eq!(tally.get("Waste"), Some(&1));
+        assert_eq!(tally.get("Productive"), Some(&1));
+        // Held minutes keep the rule verdict whatever the auditor said.
+        assert_eq!(tally.get("Tampered"), Some(&1));
+        assert_eq!(tally.get("Inactive"), Some(&1));
+        assert_eq!(tally.get("Meeting"), None);
+        assert_eq!(per_minute[&1_756_363_200], "Waste");
+        assert_eq!(per_minute[&1_756_363_320], "Tampered");
+
+        // The model echoing the line's brackets is still the same minute.
+        let bracketed: HashMap<String, String> = reply(["idle", "idle", "idle", "idle"])
+            .into_iter()
+            .map(|(time, word)| (format!("[{time}]"), word))
+            .collect();
+        assert!(tally_from_verdicts(&logs, &rule_categories, &held, &bracketed).is_some());
+
+        // A missing minute or an unknown word leaves the rule breakdown in place.
+        let mut partial = reply(["idle", "idle", "idle", "idle"]);
+        partial.remove(&minute_label(logs[1].timestamp));
+        assert!(tally_from_verdicts(&logs, &rule_categories, &held, &partial).is_none());
+        assert!(
+            tally_from_verdicts(
+                &logs,
+                &rule_categories,
+                &held,
+                &reply(["idle", "reading", "idle", "idle"])
+            )
+            .is_none()
+        );
+        assert!(tally_from_verdicts(&logs, &rule_categories, &held, &HashMap::new()).is_none());
     }
 
     // --- (A) End-to-end: cheating does not pay. ---
