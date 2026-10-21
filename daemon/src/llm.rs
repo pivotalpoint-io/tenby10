@@ -1,6 +1,7 @@
 use crate::config::AgentConfig;
 use reqwest::blocking::Client;
 use serde_json::Value;
+use std::collections::HashMap;
 
 /// Per-provider defaults for `llm_base_url` / `llm_model`.
 ///
@@ -88,7 +89,7 @@ pub trait LlmProvider {
         &self,
         system_prompt: &str,
         activity_text: &str,
-    ) -> Result<(u32, String), String>;
+    ) -> Result<SlotEvaluation, String>;
 
     /// Write the daily work note (ADR 0019). Same provider and key as scoring, but the
     /// reply is prose rather than JSON, because this text is what a client reads.
@@ -209,6 +210,47 @@ pub fn sanitize_reasoning(raw: &str) -> String {
     crate::untrusted::bound_chars(&text, MAX_REASONING_CHARS)
 }
 
+/// The reply-format rule the daemon appends to every scoring prompt, built-in or
+/// custom (#186). A slot's minutes by category are shown beside its score, so in AI
+/// mode both have to come from the same judge. A rewritten rubric still gets this rule,
+/// because the rubric decides what counts, not what the reply carries.
+pub const MINUTE_VERDICTS_RULE: &str = "Whatever the instructions above say about the \
+    reply's fields, the JSON object must also carry 'minutes': an object with one entry for \
+    every line of the activity log, keyed by that line's time exactly as written (e.g. \
+    '14:05'), whose value is one word: 'productive', 'meeting', 'distracted' or 'idle'. It is \
+    your verdict on that minute under the rules above, shown as the slot's breakdown beside \
+    your score, so the two must agree. A line's State is the rule engine's guess, not a \
+    constraint.";
+
+/// What the auditor returned for one slot.
+pub struct SlotEvaluation {
+    pub score: u32,
+    /// Already contained by [`sanitize_reasoning`].
+    pub reasoning: String,
+    /// The reply's `minutes` field as given: HH:MM → verdict word. Not trusted here:
+    /// the slot uses it only if it covers every minute with a word the daemon knows.
+    /// Empty when the reply carried none.
+    pub minutes: HashMap<String, String>,
+}
+
+/// Read a parsed scoring reply. Every provider goes through this, so they cannot
+/// drift on what a reply means.
+fn slot_evaluation(parsed: &Value) -> SlotEvaluation {
+    let minutes = parsed["minutes"]
+        .as_object()
+        .map(|m| {
+            m.iter()
+                .filter_map(|(time, verdict)| Some((time.clone(), verdict.as_str()?.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
+    SlotEvaluation {
+        score: parsed["score"].as_u64().unwrap_or(0) as u32,
+        reasoning: sanitize_reasoning(parsed["reasoning"].as_str().unwrap_or("")),
+        minutes,
+    }
+}
+
 pub struct OpenAiProvider {
     api_key: String,
     base_url: String,
@@ -221,7 +263,7 @@ impl LlmProvider for OpenAiProvider {
         &self,
         system_prompt: &str,
         activity_text: &str,
-    ) -> Result<(u32, String), String> {
+    ) -> Result<SlotEvaluation, String> {
         let payload = serde_json::json!({
             "model": self.model,
             "messages": [
@@ -244,9 +286,7 @@ impl LlmProvider for OpenAiProvider {
         if let Some(content) = json["choices"][0]["message"]["content"].as_str() {
             let parsed_res = serde_json::from_str::<Value>(content);
             if let Ok(parsed) = parsed_res {
-                let score = parsed["score"].as_u64().unwrap_or(0) as u32;
-                let reasoning = sanitize_reasoning(parsed["reasoning"].as_str().unwrap_or(""));
-                return Ok((score, reasoning));
+                return Ok(slot_evaluation(&parsed));
             }
         }
 
@@ -303,7 +343,7 @@ impl LlmProvider for AnthropicProvider {
         &self,
         system_prompt: &str,
         activity_text: &str,
-    ) -> Result<(u32, String), String> {
+    ) -> Result<SlotEvaluation, String> {
         let payload = serde_json::json!({
             "model": self.model,
             // Current Claude models think by default, and `max_tokens` caps
@@ -352,9 +392,7 @@ impl LlmProvider for AnthropicProvider {
                 .trim();
 
             if let Ok(parsed) = serde_json::from_str::<Value>(clean_content) {
-                let score = parsed["score"].as_u64().unwrap_or(0) as u32;
-                let reasoning = sanitize_reasoning(parsed["reasoning"].as_str().unwrap_or(""));
-                return Ok((score, reasoning));
+                return Ok(slot_evaluation(&parsed));
             }
         }
 
@@ -424,7 +462,7 @@ impl LlmProvider for GeminiProvider {
         &self,
         system_prompt: &str,
         activity_text: &str,
-    ) -> Result<(u32, String), String> {
+    ) -> Result<SlotEvaluation, String> {
         let payload = serde_json::json!({
             "systemInstruction": {
                 "parts": [{ "text": system_prompt }]
@@ -457,9 +495,7 @@ impl LlmProvider for GeminiProvider {
         if let Some(content) = json["candidates"][0]["content"]["parts"][0]["text"].as_str() {
             let parsed_res = serde_json::from_str::<Value>(content);
             if let Ok(parsed) = parsed_res {
-                let score = parsed["score"].as_u64().unwrap_or(0) as u32;
-                let reasoning = sanitize_reasoning(parsed["reasoning"].as_str().unwrap_or(""));
-                return Ok((score, reasoning));
+                return Ok(slot_evaluation(&parsed));
             }
         }
 
@@ -659,6 +695,32 @@ mod tests {
         assert_eq!(sanitize_reasoning(REASONING_WITHHELD), REASONING_WITHHELD);
         let bounded = sanitize_reasoning(&"x".repeat(MAX_REASONING_CHARS + 500));
         assert_eq!(sanitize_reasoning(&bounded), bounded, "idempotent");
+    }
+
+    #[test]
+    fn test_slot_evaluation_reads_score_reasoning_and_minute_verdicts() {
+        let reply = serde_json::json!({
+            "score": 38,
+            "reasoning": "News browsing\nwith a short edit at 14:02.",
+            "minutes": { "14:00": "distracted", "14:01": "idle", "14:02": "productive", "14:03": 7 }
+        });
+        let evaluation = slot_evaluation(&reply);
+        assert_eq!(evaluation.score, 38);
+        assert_eq!(
+            evaluation.reasoning,
+            "News browsing with a short edit at 14:02."
+        );
+        // Verdicts pass through as given, to be judged against the slot's own minutes
+        // later; a value that is not a string is dropped here.
+        assert_eq!(evaluation.minutes.len(), 3);
+        assert_eq!(evaluation.minutes["14:00"], "distracted");
+
+        // A reply in the old two-field shape still scores; it just carries no verdicts.
+        let old = slot_evaluation(&serde_json::json!({ "score": 90, "reasoning": "Editing." }));
+        assert_eq!(old.score, 90);
+        assert!(old.minutes.is_empty());
+        let odd = slot_evaluation(&serde_json::json!({ "score": 90, "minutes": ["productive"] }));
+        assert!(odd.minutes.is_empty());
     }
 
     #[test]
