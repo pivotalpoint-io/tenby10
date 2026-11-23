@@ -11,7 +11,9 @@ raw window titles are not, and no screen images exist to upload (§2, §3). That
 your own AI writes *from* your window titles, so it is the one place where title-*derived* text
 travels to tenby10; read rows 4 and 9 before you rely on that boundary. The other egress is opt-in
 BYOK inference: activity text (window titles included) sent directly to the LLM provider *you*
-configure (row 5) — fully on-device with local Ollama.
+configure (row 5) — fully on-device with local Ollama. Separately, the desktop app asks GitHub once
+a day whether a newer release exists, sending nothing that identifies you or the device (row 11);
+one switch turns it off.
 
 This guide maps each of those claims to the exact source that proves (or, honestly, does **not** yet
 prove) it. Every reference is `file:line` and is meant to be opened and read directly — do not take
@@ -40,12 +42,13 @@ auditable; the cloud portal is not part of this repository.
 | 2 | Only counts/metadata are stored per minute | ✅ Verified | [daemon.rs:414](daemon/src/daemon.rs#L414), [db.rs schema](daemon/src/db.rs) |
 | 3 | No screen capture exists at all | ✅ Verified | No capture code in the client (ADR 0018) — §3 has the grep and names the two lookalike symbols it deliberately excludes |
 | 4 | Raw keystrokes never leave the machine; **raw** window titles never reach tenby10 | ⚠️ Verified, but narrowed on 2026-08-14 | Still true of raw titles: no upload payload has a title field ([sync.rs:85](daemon/src/sync.rs#L85), [sync.rs:168](daemon/src/sync.rs#L168), [sync.rs:185](daemon/src/sync.rs#L185)). What changed: a title-*derived* sentence now does reach tenby10, in the daily work note (§2) — row 9 is what constrains it. Raw titles still go only to your own BYOK provider (row 5) |
-| 5 | Cloud sync (when enrolled) is count/category summaries + hashes + config + your daily work notes; your BYOK provider is the only other destination | ✅ Verified, scope corrected | Five endpoints, all inventoried in §2 — [sync.rs](daemon/src/sync.rs). BYOK calls live in [llm.rs](daemon/src/llm.rs), reached from slot scoring, note writing, and debrief writing (`generate_pending_debriefs`, [daemon.rs](daemon/src/daemon.rs)); the debrief's output stays local (§1a) |
+| 5 | Cloud sync (when enrolled) is count/category summaries + hashes + config + your daily work notes; your BYOK provider is the only other destination for your data | ✅ Verified, scope corrected | Five endpoints, all inventoried in §2 — [sync.rs](daemon/src/sync.rs). BYOK calls live in [llm.rs](daemon/src/llm.rs), reached from slot scoring, note writing, and debrief writing (`generate_pending_debriefs`, [daemon.rs](daemon/src/daemon.rs)); the debrief's output stays local (§1a) |
 | 6 | No image is sent to your LLM provider, ever | ✅ Verified structurally | The provider trait takes text only ([llm.rs](daemon/src/llm.rs)); nothing in the client can produce an image to send |
 | 7 | Focus-scoring rules are deterministic and inspectable | ✅ Verified | [evaluator.rs](daemon/src/evaluator.rs), [entropy.rs](daemon/src/entropy.rs) |
 | 8 | Local logs are tamper-evident (full-payload hash chain) + self-signed when enrolled | ✅ Verified | [db.rs `insert_slot_summary`/`verify_ledger_integrity`](daemon/src/db.rs) — work notes have their own chain, same construction (§5). Slots recorded before pairing keep a local chain of their own; the shared chain starts at the first signed slot (#180) |
 | 9 | Your daily work note names the work in its own words — never a verbatim window title, never a person | ⚠️ Mechanism-enforced for verbatim titles; prompt-steered for the rest | The default prompt ([config.rs:60](daemon/src/config.rs#L60)) instructs the model to name the project, document, or feature in its own words, and to reproduce no window title, file path, or URL verbatim and no person's name (ADR 0019 §4). The verbatim rule does not rest on the model: before a note is signed, `note_quotes_a_title` ([untrusted.rs](daemon/src/untrusted.rs), called from [daemon.rs:594](daemon/src/daemon.rs#L594)) refuses a note that echoes a ≥32-normalized-character run of any title captured that day, and `sanitize_note` ([llm.rs:108](daemon/src/llm.rs#L108)) rejects empty or essay-length replies. Short names (a repo, a product) pass the echo check by design. The person-name rule and the naming instruction remain prompt-steered; the prompt's SHA-256 is bound into the signed record so a reader can check which rules applied |
 | 10 | Anyone you share a link with, a client or a manager, sees only what you uploaded: never your screen, window titles, URLs or what you typed | ✅ Bounded by §2; the page itself is rendered by the cloud | §7 lists what the page shows and when new hours appear; commands 3 to 5 in How to verify prove the bound |
+| 11 | The update check sends nothing that identifies you or this device, installs nothing, and can be turned off | ✅ Verified | One unauthenticated `GET` of GitHub's public latest-release API, at most once a day, with a fixed `User-Agent` and no query, cookies, device ID or installed version ([update_check.rs](desktop/src-tauri/src/update_check.rs)). The version comparison happens locally; a newer release only shows a banner and a tray item that open the release page. Off when `disable_update_check` is set (Settings → Connect → Check for updates). §2 item 4 |
 | — | Secrets stored in OS keychain, and the signing key never reaches the app window | ✅ Verified | [config.rs `save_config`/`load_config`](daemon/src/config.rs) — `private_key` & `llm_api_key` kept in the OS keychain via the `keyring` crate. Since #94 the settings UI is sent a redacted config with no `private_key` and no API key value ([lib.rs](desktop/src-tauri/src/lib.rs)); the API key is write-only and the app runs under a `default-src 'self'` CSP — see G2 |
 | — | Local dashboard makes no third-party calls | ✅ Verified | [dashboard.rs](daemon/src/dashboard.rs) — Outfit font embedded as a data URI; no CDN `<link>` |
 | — | The installed app opens **no listening port** | ✅ Verified | The dashboard renders in-app over Tauri IPC. The loopback HTTP server is a debug-only escape hatch for the standalone `daemon` binary, off unless `TENBY10_DEBUG_HTTP` is set — [env.rs `debug_http_enabled`](daemon/src/env.rs) |
@@ -119,7 +122,9 @@ only reader is the dashboard. Rows expire after 30 days unless explicitly kept
 
 ## 2. What leaves your machine (network egress inventory)
 
-Nothing leaves the machine until you **enroll** and sync. The complete list of outbound calls:
+None of your data leaves the machine until you **enroll** and sync. The only request made before
+that is the once-a-day update check (item 4), which carries no data of yours. The complete list of
+outbound calls:
 
 1. **tenby10 cloud sync — only when enrolled.** Once you pair a device,
    [sync.rs](daemon/src/sync.rs) uploads to the tenby10 cloud (`cloud_base_url()`,
@@ -222,6 +227,26 @@ Nothing leaves the machine until you **enroll** and sync. The complete list of o
    ([dashboard.rs](daemon/src/dashboard.rs)); opening the local dashboard makes **no** third-party
    requests.
 
+4. **Update check — on by default, one switch turns it off.** The desktop app asks GitHub whether a
+   newer release exists ([update_check.rs](desktop/src-tauri/src/update_check.rs)).
+   - **What is contacted:** `GET https://api.github.com/repos/pivotalpoint-io/tenby10/releases/latest`
+     (`RELEASES_API`), GitHub's public API for this repository. No tenby10 server is involved.
+   - **How often:** at most once every 24 hours, the first look two minutes after launch. The time of
+     the last check is kept in `~/.tenby10/update_check.json`, so restarting the app does not check
+     again. Development builds never check.
+   - **What is sent:** the request line, `User-Agent: tenby10-update-check` and an `Accept` header.
+     No query string, no cookies, no account, no device ID, no key, and not even the installed
+     version: the reply's `tag_name` is compared with the running version on this machine. Like any
+     request, it shows GitHub your IP address and the time.
+   - **What it does with the answer:** nothing is downloaded or installed. A newer release shows a
+     banner in the app and a "Get tenby10 x.y.z" item in the tray menu, both of which open the
+     release page. That link is built from the version number, never taken from the reply, and a
+     tag that is not a plain `x.y.z` is ignored.
+   - **How to turn it off:** Settings → Connect → **Check for updates**, which sets
+     `disable_update_check: true` in `~/.tenby10/config.json`. The setting is read before every
+     check, so it applies without a restart.
+
+Apart from the update check, which sends nothing of yours, that is every request the client makes.
 What the cloud receives is category- and count-level summaries, hashes, your config, and — once you
 connect an AI — three or four sentences per day describing the work. It never receives the raw
 keystrokes, screens, or window titles behind any of it.
@@ -629,6 +654,9 @@ grep -rn "KeyPress" daemon/src/
 # 2. Full outbound-network inventory. Expect llm.rs (your BYOK provider) and sync.rs (tenby10 cloud
 #    sync, only when enrolled). The dashboard font is inlined, so the dashboard makes no requests.
 grep -rniE "reqwest|\.post\(|\.get\(|https?://" daemon/src/
+#    The desktop shell adds one request, the update check (§2 item 4). Expect hits in update_check.rs
+#    only (its URLs, its one `.get(` and its tests); lib.rs shows only comments and a test's map lookup.
+grep -rnE "reqwest|\.post\(|\.get\(|https://" desktop/src-tauri/src/
 
 # 3. Every tenby10 endpoint the client can reach. §2 inventories exactly five; this must print those
 #    five and nothing more. A path listed here that §2 does not name means the egress inventory is
@@ -700,4 +728,4 @@ as the source you can read above. It is a supply-chain control, not a behavioura
 scoring rule, update the relevant row here in the same PR. Adding an endpoint without touching §2 is
 how this guide last went stale (#84) — command 3 in "How to verify" now catches that.*
 
-*Last checked line-by-line against the code on 2026-08-19; §7 added and checked on 2026-09-15, and updated on 2026-09-16.*
+*Last checked line-by-line against the code on 2026-08-19; §7 added and checked on 2026-09-15, and updated on 2026-09-16; §2 item 4 (update check) added on 2026-11-23.*

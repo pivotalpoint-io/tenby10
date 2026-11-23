@@ -5,6 +5,9 @@ use tauri::{Emitter, Manager};
 
 struct TrayState {
     toggle_item: tauri::menu::MenuItem<tauri::Wry>,
+    menu: tauri::menu::Menu<tauri::Wry>,
+    /// Added to the top of `menu` once a newer release is found (see `update_check`).
+    update_item: std::sync::Mutex<Option<tauri::menu::MenuItem<tauri::Wry>>>,
 }
 
 #[derive(serde::Serialize)]
@@ -42,6 +45,7 @@ struct CaptureHealth {
 }
 
 mod platform;
+mod update_check;
 
 #[derive(serde::Serialize)]
 struct TodayMetrics {
@@ -710,6 +714,7 @@ struct RedactedAgentConfig {
     summary_prompt: String,
     disable_work_summaries: bool,
     enforce_synthetic_detection: bool,
+    disable_update_check: bool,
 }
 
 impl From<&daemon::config::AgentConfig> for RedactedAgentConfig {
@@ -729,6 +734,7 @@ impl From<&daemon::config::AgentConfig> for RedactedAgentConfig {
             summary_prompt: config.summary_prompt.clone(),
             disable_work_summaries: config.disable_work_summaries,
             enforce_synthetic_detection: config.enforce_synthetic_detection,
+            disable_update_check: config.disable_update_check,
         }
     }
 }
@@ -852,6 +858,35 @@ async fn save_agent_config(new_config: AgentConfigUpdate) -> Result<(), String> 
     save_agent_config_at(agent_config_path(), new_config)
 }
 
+/// The newer release found by the update check, if any, for the in-app banner.
+#[tauri::command]
+fn get_available_update(
+    state: tauri::State<'_, update_check::UpdateState>,
+) -> Option<update_check::AvailableUpdate> {
+    state.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// Opens the release page of the update found. The URL is the one the app built
+/// from the version, never one passed in from the window.
+#[tauri::command]
+fn open_update_page(app: tauri::AppHandle) -> Result<(), String> {
+    update_check::open_release_page(&app)
+}
+
+/// The "Check for updates" switch. Saved on its own, so it takes effect without the
+/// rest of the settings form.
+#[tauri::command]
+async fn set_update_check_enabled(enabled: bool) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || {
+        let path = agent_config_path();
+        let mut config = daemon::config::load_config(path.clone())?;
+        config.disable_update_check = !enabled;
+        daemon::config::save_config(path, &config)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 #[tauri::command]
 async fn check_permissions() -> Result<PermissionsStatus, String> {
     platform::check_permissions()
@@ -973,6 +1008,7 @@ pub fn run() {
         .manage(state.clone())
         .manage(db.clone())
         .manage(DashboardWindow::default())
+        .manage(update_check::UpdateState::default())
         .invoke_handler(tauri::generate_handler![
             enroll_agent,
             toggle_tracking,
@@ -993,6 +1029,9 @@ pub fn run() {
             save_agent_config,
             get_llm_provider_defaults,
             get_max_prompt_bytes,
+            get_available_update,
+            open_update_page,
+            set_update_check_enabled,
             check_permissions,
             get_capture_health,
             open_accessibility_settings,
@@ -1071,6 +1110,8 @@ pub fn run() {
 
             app.manage(TrayState {
                 toggle_item: toggle_item.clone(),
+                menu: tray_menu.clone(),
+                update_item: std::sync::Mutex::new(None),
             });
 
             let _tray = tauri::tray::TrayIconBuilder::with_id("main_tray")
@@ -1082,12 +1123,20 @@ pub fn run() {
                         let _ = perform_toggle_tracking(app);
                     }
                     "show_window" => show_main_window(app),
+                    update_check::TRAY_ITEM_ID => {
+                        let _ = update_check::open_release_page(app);
+                    }
                     "exit" => {
                         app.exit(0);
                     }
                     _ => {}
                 })
                 .build(app)?;
+
+            tauri::async_runtime::spawn(update_check::run(
+                app.handle().clone(),
+                agent_config_path(),
+            ));
 
             Ok(())
         })
