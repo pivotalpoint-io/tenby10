@@ -193,11 +193,7 @@ pub fn is_mouse_jiggler(positions: &[(f64, f64, i64)]) -> bool {
     } else {
         total_length
     };
-    if tortuosity < 1.05 && total_length > 200.0 && velocity_cov < JIGGLER_MAX_VELOCITY_COV {
-        return true;
-    }
-
-    false
+    tortuosity < 1.05 && total_length > 200.0 && velocity_cov < JIGGLER_MAX_VELOCITY_COV
 }
 
 #[cfg(test)]
