@@ -240,8 +240,9 @@ outbound calls:
      request, it shows GitHub your IP address and the time.
    - **What it does with the answer:** nothing is downloaded or installed. A newer release shows a
      banner in the app and a "Get tenby10 x.y.z" item in the tray menu, both of which open the
-     release page. That link is built from the version number, never taken from the reply, and a
-     tag that is not a plain `x.y.z` is ignored.
+     newest release on GitHub, `https://github.com/pivotalpoint-io/tenby10/releases/latest`
+     (`RELEASE_PAGE`). That address is fixed in the code, never taken from the reply, and a tag
+     that is not a plain `x.y.z` is ignored.
    - **How to turn it off:** Settings → Connect → **Check for updates**, which sets
      `disable_update_check: true` in `~/.tenby10/config.json`. The setting is read before every
      check, so it applies without a restart.
