@@ -20,8 +20,9 @@ use tauri::{Emitter, Manager};
 /// The one URL this module requests. `releases/latest` skips drafts and pre-releases.
 pub const RELEASES_API: &str =
     "https://api.github.com/repos/pivotalpoint-io/tenby10/releases/latest";
-/// The release page a found update links to: this prefix plus the release tag.
-const RELEASE_PAGE_PREFIX: &str = "https://github.com/pivotalpoint-io/tenby10/releases/tag/";
+/// The page a found update links to: GitHub's redirect to the newest final release.
+/// A fixed address, so nothing in the reply can change where the link goes.
+pub const RELEASE_PAGE: &str = "https://github.com/pivotalpoint-io/tenby10/releases/latest";
 /// Sent as the `User-Agent`, which GitHub's API requires. Deliberately carries no version.
 const USER_AGENT: &str = "tenby10-update-check";
 
@@ -40,7 +41,7 @@ pub const TRAY_ITEM_ID: &str = "open_update";
 pub struct AvailableUpdate {
     /// The version, without the leading `v` (e.g. `0.9.1`).
     pub version: String,
-    /// The release page. Built here from the tag, never taken from the response.
+    /// Always [`RELEASE_PAGE`], never taken from the response.
     pub url: String,
 }
 
@@ -77,7 +78,7 @@ pub fn newer_release(current: &str, latest_tag: &str) -> Option<AvailableUpdate>
     }
     let version = format!("{}.{}.{}", latest.0, latest.1, latest.2);
     Some(AvailableUpdate {
-        url: format!("{RELEASE_PAGE_PREFIX}v{version}"),
+        url: RELEASE_PAGE.to_string(),
         version,
     })
 }
@@ -278,7 +279,7 @@ mod tests {
             newer_release("0.9.0", "v0.9.1"),
             Some(AvailableUpdate {
                 version: "0.9.1".into(),
-                url: "https://github.com/pivotalpoint-io/tenby10/releases/tag/v0.9.1".into(),
+                url: "https://github.com/pivotalpoint-io/tenby10/releases/latest".into(),
             })
         );
         assert!(newer_release("0.9.0", "v0.10.0").is_some());
@@ -290,8 +291,12 @@ mod tests {
     }
 
     #[test]
-    fn the_link_is_built_from_the_version_not_the_response() {
-        // A tag that is not a plain version never yields a link at all.
+    fn the_link_is_fixed_whatever_the_reply_says() {
+        // Every update links to the same address, whatever the tag.
+        for tag in ["v0.9.1", "v1.0.0", "v12.3.4"] {
+            assert_eq!(newer_release("0.9.0", tag).unwrap().url, RELEASE_PAGE);
+        }
+        // A tag that is not a plain version is not offered at all.
         assert_eq!(
             newer_release("0.9.0", "v1.0.0/../../evil?x=https://example.com"),
             None
