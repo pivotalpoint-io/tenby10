@@ -896,6 +896,13 @@ input:checked + .slider:before {
   box-shadow: 0 4px 12px rgba(249, 115, 22, 0.1);
 }
 
+.alert-banner.info {
+  background: rgba(16, 185, 129, 0.08);
+  border: 1px solid rgba(16, 185, 129, 0.25);
+  color: #d1fae5;
+  box-shadow: 0 4px 12px rgba(16, 185, 129, 0.1);
+}
+
 .alert-icon {
   font-size: 1.1rem;
   flex-shrink: 0;

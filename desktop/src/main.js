@@ -507,6 +507,10 @@ async function loadAgentConfig() {
     if (summaryToggle) {
       summaryToggle.checked = !currentConfig.disable_work_summaries;
     }
+    const updateToggle = document.getElementById("update-check-toggle");
+    if (updateToggle) {
+      updateToggle.checked = !currentConfig.disable_update_check;
+    }
     const summaryPrompt = document.getElementById("summary-prompt");
     if (summaryPrompt) {
       summaryPrompt.value = currentConfig.summary_prompt || "";
@@ -1013,6 +1017,48 @@ function refreshOnFocus() {
 // Native OS focus event from Rust (fires reliably on app reactivation, where the DOM
 // `focus` event below is unreliable — e.g. Cmd-Tab or clicking the title bar).
 listen("window-focused", refreshOnFocus);
+
+// Update check (notify only). The backend checks once a day and keeps what it found;
+// the banner shows it with a link to the release page. Nothing installs on its own.
+let updateBannerDismissed = false;
+
+function showUpdateBanner(update) {
+  const banner = document.getElementById("update-banner");
+  const message = document.getElementById("update-banner-message");
+  if (!banner || !update || updateBannerDismissed) return;
+  if (message) message.innerText = `tenby10 ${update.version} is out.`;
+  banner.style.display = "flex";
+}
+
+listen("update-available", (event) => {
+  updateBannerDismissed = false;
+  showUpdateBanner(event.payload);
+});
+
+invoke("get_available_update")
+  .then(showUpdateBanner)
+  .catch((err) => console.error("Failed to read update state:", err));
+
+document.getElementById("update-get-btn")?.addEventListener("click", () => {
+  invoke("open_update_page").catch((err) => console.error("Failed to open release page:", err));
+});
+
+document.getElementById("update-dismiss-btn")?.addEventListener("click", () => {
+  updateBannerDismissed = true;
+  document.getElementById("update-banner").style.display = "none";
+});
+
+document.getElementById("update-check-toggle")?.addEventListener("change", async (event) => {
+  const toggle = event.target;
+  const enabled = toggle.checked;
+  try {
+    await invoke("set_update_check_enabled", { enabled });
+    if (!enabled) document.getElementById("update-banner").style.display = "none";
+  } catch (err) {
+    console.error("Failed to save update setting:", err);
+    toggle.checked = !enabled;
+  }
+});
 window.addEventListener("focus", refreshOnFocus);
 
 // Refresh metrics and permissions loop

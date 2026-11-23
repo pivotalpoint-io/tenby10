@@ -246,6 +246,10 @@ pub struct AgentConfig {
     /// setup step (ADR 0019: setup once, then invisible).
     #[serde(default)]
     pub disable_work_summaries: bool,
+    /// Turns off the desktop app's once-a-day check for a newer release (AUDIT.md §2).
+    /// On by default; the check sends nothing that identifies the device.
+    #[serde(default)]
+    pub disable_update_check: bool,
     #[serde(default)]
     pub dashboard_port: Option<u16>,
     /// Enforce synthetic-input detection: mark a minute tampered when its input
@@ -397,6 +401,7 @@ impl Default for AgentConfig {
             llm_prompt: default_llm_prompt(),
             summary_prompt: default_summary_prompt(),
             disable_work_summaries: false,
+            disable_update_check: false,
             dashboard_port: None,
             enforce_synthetic_detection: false,
             paired_at: 0,
@@ -701,6 +706,7 @@ pub fn generate_enrollment_keys(enrollment_token: &str) -> AgentConfig {
         llm_prompt: default_llm_prompt(),
         summary_prompt: default_summary_prompt(),
         disable_work_summaries: false,
+        disable_update_check: false,
         dashboard_port: None,
         enforce_synthetic_detection: false,
         paired_at: 0,
