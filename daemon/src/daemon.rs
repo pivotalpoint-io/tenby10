@@ -959,6 +959,17 @@ fn verdict_category(verdict: &str) -> Option<&'static str> {
     }
 }
 
+/// A slot's focus score from its minutes by category: credited minutes (productive
+/// and meeting) out of a fixed ten (ADR 0006), which is what rules mode computes from
+/// its active segments. In AI mode this is the whole score (#190).
+fn credited_score(tally: &HashMap<String, u32>) -> u32 {
+    let credited = ["Productive", "Meeting"]
+        .iter()
+        .map(|category| tally.get(*category).copied().unwrap_or(0))
+        .sum::<u32>();
+    (credited * 10).min(100)
+}
+
 /// A slot's minutes by category, and each minute's category by its timestamp.
 type VerdictTally = (HashMap<String, u32>, BTreeMap<i64, &'static str>);
 
@@ -1310,7 +1321,7 @@ pub fn aggregate_slot(db: &Database, config: &crate::config::AgentConfig, slot_s
                     // Appended after the closing marker on purpose: this sentence is
                     // the daemon speaking, and a fence is only worth having if what
                     // is inside it and what we said ourselves stay separable.
-                    activity_text.push_str(&format!("\n\n[FUTURE CONTEXT]: The user paused for {} minutes at the end of this slot, but resumed working shortly after. This was a continuous Reading/Thinking session, so these minutes should not penalize the score.", forgiven_idle));
+                    activity_text.push_str(&format!("\n\n[FUTURE CONTEXT]: The user paused for {} minutes at the end of this slot, but resumed working shortly after. This was a continuous Reading/Thinking session, so judge these minutes as part of the work around them rather than as idle.", forgiven_idle));
                 }
 
                 let default_prompt = crate::config::default_llm_prompt();
@@ -1336,48 +1347,41 @@ pub fn aggregate_slot(db: &Database, config: &crate::config::AgentConfig, slot_s
                 );
 
                 match provider.evaluate_slot(&system_prompt, &activity_text) {
-                    Ok(evaluation) => {
-                        // Scale LLM score by logged segments / 10 (ADR 0006)
-                        final_focus_score = (evaluation.score * (logs.len() as u32)) / 10;
-                        if final_focus_score > 100 {
-                            final_focus_score = 100;
+                    // The auditor judges each minute; the score is arithmetic on those
+                    // verdicts (#190), the same as rules mode on its own, so the score
+                    // and the breakdown beside it cannot disagree. A reply that misses
+                    // a minute is treated like a failed one: score, breakdown and
+                    // reasoning all stay rule-based, rather than mixing two judges.
+                    Ok(evaluation) => match tally_from_verdicts(
+                        &logs,
+                        &rule_categories,
+                        &held_minutes,
+                        &evaluation.minutes,
+                    ) {
+                        Some((tally, verdicts)) => {
+                            // ADR 0002 addendum: the no-input meeting cap must hold in
+                            // LLM mode too. Demoted minutes are held as `Inactive`, so
+                            // the tally already respects it; the ceiling is the backstop.
+                            let ceiling = meeting_creditable_ceiling(
+                                logs.len() as u32,
+                                demoted_meeting_minutes,
+                            );
+                            final_focus_score = credited_score(&tally).min(ceiling);
+                            slot_app_categories = tally;
+                            minute_verdicts = Some(verdicts);
+                            // Every built-in provider already contains its reply, so this
+                            // is the backstop, not the fix: `LlmProvider` is a public trait
+                            // and this is the last point before the text is stored and
+                            // signed (#95). `sanitize_reasoning` is idempotent, so applying
+                            // it twice costs a scan and changes nothing.
+                            final_reasoning =
+                                Some(crate::llm::sanitize_reasoning(&evaluation.reasoning));
                         }
-                        // ADR 0002 addendum: the no-input meeting cap must hold in
-                        // LLM mode too — the LLM cannot credit minutes demoted for
-                        // exceeding the streak cap, so a spoofed silent "meeting"
-                        // can't be re-inflated by turning on BYOK scoring.
-                        let ceiling =
-                            meeting_creditable_ceiling(logs.len() as u32, demoted_meeting_minutes);
-                        if final_focus_score > ceiling {
-                            final_focus_score = ceiling;
-                        }
-                        // Every built-in provider already contains its reply, so this is
-                        // the backstop, not the fix: `LlmProvider` is a public trait and
-                        // this is the last point before the text is stored and signed
-                        // (#95). `sanitize_reasoning` is idempotent, so applying it twice
-                        // costs a scan and changes nothing.
-                        final_reasoning =
-                            Some(crate::llm::sanitize_reasoning(&evaluation.reasoning));
-
-                        // The breakdown shown beside the score comes from the same judge
-                        // as the score (#186). A reply that misses a minute leaves the
-                        // rule-based breakdown in place rather than a partial one.
-                        match tally_from_verdicts(
-                            &logs,
-                            &rule_categories,
-                            &held_minutes,
-                            &evaluation.minutes,
-                        ) {
-                            Some((tally, verdicts)) => {
-                                slot_app_categories = tally;
-                                minute_verdicts = Some(verdicts);
-                            }
-                            None => println!(
-                                "[LLM] Reply carried no usable verdict for every minute of slot {}; its breakdown stays rule-based.",
-                                slot_start
-                            ),
-                        }
-                    }
+                        None => println!(
+                            "[LLM] Reply carried no usable verdict for every minute of slot {}; it stays rule-scored.",
+                            slot_start
+                        ),
+                    },
                     Err(e) => {
                         eprintln!("[LLM] Slot evaluation failed: {}", e);
                     }
@@ -2412,6 +2416,123 @@ mod tests {
         assert_eq!(meeting_creditable_ceiling(10, 10), 0);
         // Saturating: never underflows.
         assert_eq!(meeting_creditable_ceiling(3, 5), 0);
+    }
+
+    /// A loopback OpenAI-compatible auditor that serves one scoring request. It gives
+    /// the slot's minutes `verdicts` in order (a shorter list leaves the rest without
+    /// one) and a `score` of 100, which the daemon must not read (#190).
+    fn auditor_server(verdicts: &'static [&'static str]) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{BufRead, Read, Write};
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse().unwrap();
+                }
+            }
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).unwrap();
+            let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let minutes: serde_json::Map<String, serde_json::Value> =
+                request["messages"][1]["content"]
+                    .as_str()
+                    .unwrap()
+                    .lines()
+                    .filter(|line| line.starts_with('[') && line.as_bytes().get(6) == Some(&b']'))
+                    .zip(verdicts)
+                    .map(|(line, verdict)| (line[1..6].to_string(), serde_json::json!(verdict)))
+                    .collect();
+            let content = serde_json::json!({
+                "score": 100,
+                "reasoning": "Stand-in auditor.",
+                "minutes": minutes,
+            })
+            .to_string();
+            let reply = serde_json::json!({ "choices": [{ "message": { "content": content } }] })
+                .to_string();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                reply.len()
+            )
+            .unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    /// Ten minutes of steady input in a browser, which the rules alone score 100,
+    /// aggregated in AI mode against [`auditor_server`].
+    fn ai_scored_browser_slot(verdicts: &'static [&'static str]) -> crate::db::SlotSummaryView {
+        let db = create_test_db();
+        for i in 0..10 {
+            db.insert_minute_log(
+                600 + i * 60,
+                40,
+                3,
+                6,
+                500.0,
+                "Google Chrome",
+                "Headlines",
+                false,
+            )
+            .unwrap();
+        }
+        let config = AgentConfig {
+            engine_mode: "llm".to_string(),
+            llm_provider: "openai".to_string(),
+            llm_base_url: auditor_server(verdicts),
+            llm_model: "stand-in".to_string(),
+            ..Default::default()
+        };
+        aggregate_slot(&db, &config, 600);
+        db.get_recent_slot_summaries(1).unwrap().remove(0)
+    }
+
+    /// In AI mode the score is arithmetic on the auditor's verdicts (#190): ten points
+    /// per productive or meeting minute, whatever number the reply puts in `score`.
+    #[test]
+    fn test_ai_mode_score_is_computed_from_the_verdicts() {
+        let slot = ai_scored_browser_slot(&[
+            "productive",
+            "productive",
+            "meeting",
+            "distracted",
+            "distracted",
+            "distracted",
+            "distracted",
+            "distracted",
+            "distracted",
+            "idle",
+        ]);
+        assert_eq!(
+            slot.focus_score, 30,
+            "3 credited minutes, not the reply's 100"
+        );
+        assert_eq!(slot.app_categories["Productive"], 2);
+        assert_eq!(slot.app_categories["Meeting"], 1);
+        assert_eq!(slot.app_categories["Waste"], 6);
+        assert_eq!(slot.app_categories["Inactive"], 1);
+        assert_eq!(slot.llm_reasoning.as_deref(), Some("Stand-in auditor."));
+    }
+
+    /// A reply that misses a minute is treated like a failed one (#190): the slot is
+    /// scored by the rules, with the rule breakdown and no AI reasoning beside it.
+    #[test]
+    fn test_ai_mode_without_every_verdict_stays_rule_scored() {
+        let slot = ai_scored_browser_slot(&["distracted", "distracted", "distracted"]);
+        assert_eq!(slot.focus_score, 100);
+        assert_eq!(slot.app_categories["Productive"], 10);
+        assert_eq!(slot.app_categories.get("Waste"), None);
+        assert_eq!(slot.llm_reasoning, None);
     }
 
     /// In AI mode the breakdown beside the score comes from the auditor's verdicts

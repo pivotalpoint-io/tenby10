@@ -31,16 +31,16 @@ pub fn default_llm_prompt() -> String {
         Review the following 10-minute activity log. Each line is one minute: local time, app, \
         window title, keystroke/click/scroll counts, mouse travel in pixels, and the daemon's own \
         rule-based state for that minute. \
-        Evaluate the user's focus on a scale of 0 to 100. \
-        - Engineering, designing, writing, and active research are highly productive (80-100). \
-        - Social media, entertainment, and casual browsing are distracted (0-30). \
-        - A meeting with genuine engagement (e.g. Zoom, Teams) is productive; do NOT grant full focus to a completely inactive window merely because its title mentions a meeting app. \
+        Judge what the user spent each minute on. \
+        - Engineering, designing, writing, and active research are productive. \
+        - Social media, entertainment, and casual browsing are distracted. \
+        - A meeting with genuine engagement (e.g. Zoom, Teams) is a meeting; do NOT count a completely inactive window as a meeting merely because its title mentions a meeting app. \
         - Scrolling or mouse travel without keystrokes usually means reading; no input and no travel means absence. \
         {} \
-        Output ONLY a JSON object, with 'score' (integer) and 'reasoning' (1-2 sentences). \
+        Output ONLY a JSON object, with 'reasoning' (1-2 sentences). \
         The reasoning is stored as this slot's explanation, so be concrete: name the work the \
         titles show (project, document, or page) in your own words, and cite minute times for \
-        whatever moved the score (e.g. 'idle 08:42-08:47'). Never pad with generic filler like \
+        whatever was not productive (e.g. 'idle 08:42-08:47'). Never pad with generic filler like \
         'focused work with brief idle moments'.",
         crate::untrusted::PROMPT_RULE
     )
@@ -110,7 +110,7 @@ pub fn debrief_prompt() -> String {
 /// prompt-upgrade check (see the comment there). When `default_llm_prompt` changes,
 /// append the exact text it replaced here, or installs that saved settings under it
 /// keep scoring by the old rubric forever.
-fn retired_llm_prompts() -> [String; 3] {
+fn retired_llm_prompts() -> [String; 4] {
     [
         // v1, initial import — before the untrusted-data rule existed (#83).
         "You are an AI productivity auditor. \
@@ -149,6 +149,27 @@ fn retired_llm_prompts() -> [String; 3] {
             - Scrolling or mouse travel without keystrokes usually means reading; no input and no travel means absence. \
             {} \
             Output ONLY a JSON object with two fields: 'score' (integer) and 'reasoning' (1-2 sentences). \
+            The reasoning is stored as this slot's explanation, so be concrete: name the work the \
+            titles show (project, document, or page) in your own words, and cite minute times for \
+            whatever moved the score (e.g. 'idle 08:42-08:47'). Never pad with generic filler like \
+            'focused work with brief idle moments'.",
+            crate::untrusted::PROMPT_RULE
+        ),
+        // v4, #186..#190 — the reply also carries per-minute verdicts, and the score
+        // field was still the model's own 0-100 number; since #190 the score is computed
+        // from the verdicts, so the rubric asks for a judgment of each minute.
+        format!(
+            "You are an AI productivity auditor. \
+            Review the following 10-minute activity log. Each line is one minute: local time, app, \
+            window title, keystroke/click/scroll counts, mouse travel in pixels, and the daemon's own \
+            rule-based state for that minute. \
+            Evaluate the user's focus on a scale of 0 to 100. \
+            - Engineering, designing, writing, and active research are highly productive (80-100). \
+            - Social media, entertainment, and casual browsing are distracted (0-30). \
+            - A meeting with genuine engagement (e.g. Zoom, Teams) is productive; do NOT grant full focus to a completely inactive window merely because its title mentions a meeting app. \
+            - Scrolling or mouse travel without keystrokes usually means reading; no input and no travel means absence. \
+            {} \
+            Output ONLY a JSON object, with 'score' (integer) and 'reasoning' (1-2 sentences). \
             The reasoning is stored as this slot's explanation, so be concrete: name the work the \
             titles show (project, document, or page) in your own words, and cite minute times for \
             whatever moved the score (e.g. 'idle 08:42-08:47'). Never pad with generic filler like \
