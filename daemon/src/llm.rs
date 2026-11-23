@@ -211,20 +211,22 @@ pub fn sanitize_reasoning(raw: &str) -> String {
 }
 
 /// The reply-format rule the daemon appends to every scoring prompt, built-in or
-/// custom (#186). A slot's minutes by category are shown beside its score, so in AI
-/// mode both have to come from the same judge. A rewritten rubric still gets this rule,
-/// because the rubric decides what counts, not what the reply carries.
+/// custom (#186). In AI mode the slot's breakdown is tallied from these verdicts and its
+/// score is computed from that tally (#190), so this is the part of the reply the slot
+/// is built on. A rewritten rubric still gets this rule, because the rubric decides what
+/// counts, not what the reply carries.
 pub const MINUTE_VERDICTS_RULE: &str = "Whatever the instructions above say about the \
     reply's fields, the JSON object must also carry 'minutes': an object with one entry for \
     every line of the activity log, keyed by that line's time exactly as written (e.g. \
     '14:05'), whose value is one word: 'productive', 'meeting', 'distracted' or 'idle'. It is \
-    your verdict on that minute under the rules above, shown as the slot's breakdown beside \
-    your score, so the two must agree. A line's State is the rule engine's guess, not a \
-    constraint.";
+    your verdict on that minute under the rules above. The slot's score is computed from \
+    these verdicts, ten points for each 'productive' or 'meeting' minute, so a minute you \
+    would not penalize, such as a short reading pause inside the work, is 'productive'. A \
+    line's State is the rule engine's guess, not a constraint.";
 
-/// What the auditor returned for one slot.
+/// What the auditor returned for one slot. A `score` field in the reply is not read:
+/// the slot's score is computed from the verdicts (#190).
 pub struct SlotEvaluation {
-    pub score: u32,
     /// Already contained by [`sanitize_reasoning`].
     pub reasoning: String,
     /// The reply's `minutes` field as given: HH:MM → verdict word. Not trusted here:
@@ -245,7 +247,6 @@ fn slot_evaluation(parsed: &Value) -> SlotEvaluation {
         })
         .unwrap_or_default();
     SlotEvaluation {
-        score: parsed["score"].as_u64().unwrap_or(0) as u32,
         reasoning: sanitize_reasoning(parsed["reasoning"].as_str().unwrap_or("")),
         minutes,
     }
@@ -698,14 +699,13 @@ mod tests {
     }
 
     #[test]
-    fn test_slot_evaluation_reads_score_reasoning_and_minute_verdicts() {
+    fn test_slot_evaluation_reads_reasoning_and_minute_verdicts() {
         let reply = serde_json::json!({
             "score": 38,
             "reasoning": "News browsing\nwith a short edit at 14:02.",
             "minutes": { "14:00": "distracted", "14:01": "idle", "14:02": "productive", "14:03": 7 }
         });
         let evaluation = slot_evaluation(&reply);
-        assert_eq!(evaluation.score, 38);
         assert_eq!(
             evaluation.reasoning,
             "News browsing with a short edit at 14:02."
@@ -715,9 +715,10 @@ mod tests {
         assert_eq!(evaluation.minutes.len(), 3);
         assert_eq!(evaluation.minutes["14:00"], "distracted");
 
-        // A reply in the old two-field shape still scores; it just carries no verdicts.
+        // A reply in the old two-field shape parses; it carries no verdicts, so the
+        // slot stays rule-scored.
         let old = slot_evaluation(&serde_json::json!({ "score": 90, "reasoning": "Editing." }));
-        assert_eq!(old.score, 90);
+        assert_eq!(old.reasoning, "Editing.");
         assert!(old.minutes.is_empty());
         let odd = slot_evaluation(&serde_json::json!({ "score": 90, "minutes": ["productive"] }));
         assert!(odd.minutes.is_empty());

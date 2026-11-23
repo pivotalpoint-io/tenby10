@@ -196,13 +196,19 @@ outbound calls:
      local wall-clock time (HH:MM), the app name, the **window title**, key/click/scroll counts,
      cursor travel in pixels, and the daemon's own rule-based state for that minute (#111). All of
      it goes to the provider *you* configured; nothing new is sent to tenby10. The reply is a
-     score, a short reasoning, and a one-word verdict for each minute (`MINUTE_VERDICTS_RULE`,
+     short reasoning and a one-word verdict for each minute (`MINUTE_VERDICTS_RULE`,
      [llm.rs](daemon/src/llm.rs), appended after any scoring prompt, #186). When the reply has a
-     verdict for every minute, the slot's category counts are tallied from those verdicts, so the
-     breakdown and the score come from the same judge; flagged minutes and meeting minutes past
-     the silence cap keep their rule-based state (`tally_from_verdicts`,
-     [daemon.rs](daemon/src/daemon.rs)). Otherwise the counts stay rule-based. The per-minute
-     verdicts themselves are kept locally for the slot drill-down and are not uploaded.
+     verdict for every minute, the slot's category counts are tallied from those verdicts, and its
+     focus score is computed from that tally: ten points per productive or meeting minute, the same
+     arithmetic rules mode uses (`credited_score`, #190). The model judges the minutes; it does not
+     choose the number, and any score it writes is ignored. Flagged minutes and meeting minutes
+     past the silence cap keep their rule-based state (`tally_from_verdicts`,
+     [daemon.rs](daemon/src/daemon.rs)). A reply without a verdict for every minute is treated as
+     failed, and the slot is scored by the rules alone. A model can judge the same minutes
+     differently on another run, so an AI-scored slot records what the model said, not a result
+     anyone can recompute; the rule engine's active and idle segment counts are signed beside it.
+     The per-minute verdicts themselves are kept locally for the slot drill-down and are not
+     uploaded.
    - **Daily work note** — whenever a provider is configured and you have not opted out
      (`disable_work_summaries`, [daemon.rs:454-470](daemon/src/daemon.rs#L454)). Note this is **not**
      gated on `engine_mode`: connecting an AI is enough, by design (ADR 0019 — "setup once, then
